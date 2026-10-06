@@ -8,7 +8,7 @@
 Celeste is a GUI file synchronization client that can connect to virtually any cloud provider.
 
 - Backed by [rclone](https://rclone.org/), giving you a reliable and battle-tested way to sync your files anywhere
-- Written with GTK4 and Libadwaita, giving Celeste a native look and feel on your desktop
+- A Qt Quick interface in the same style as the other desktop apps, with a system tray icon that keeps syncing when the window is closed
 - Written in Rust, making Celeste ***blazingly fast*** to use
 
 ![](/assets/main-window.png)

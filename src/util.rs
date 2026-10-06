@@ -1,35 +1,64 @@
-use adw::glib::{self, MainContext};
 use futures::future::Future;
 use std::path::PathBuf;
 
-/// The ID of the app.
+/// The ID of the app. Kept stable so existing desktop entries and the tray
+/// item stay the same item the session already knows.
 pub static APP_ID: &str = "com.hunterwittenborn.Celeste";
+
+pub static APP_NAME: &str = "Celeste";
 
 /// Get the value out of a future.
 pub fn await_future<F: Future>(future: F) -> F::Output {
     futures::executor::block_on(future)
 }
 
-/// Run a closure in the background so that the UI can keep running.
-pub fn run_in_background<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(f: F) -> T {
-    MainContext::default().block_on(blocking::unblock(f))
+/// Run a closure away from the GUI thread.
+///
+/// Callers of rclone already run on the sync worker. The closure runs inline
+/// there so librclone stays on that one thread.
+pub fn run_in_background<T, F: FnOnce() -> T>(f: F) -> T {
+    f()
+}
+
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_default()
 }
 
 /// Format a directory with the user's home directory replaced with '~'.
 pub fn fmt_home(dir: &str) -> String {
-    let home_dir = glib::home_dir().into_os_string().into_string().unwrap();
-
+    let home_dir = home_dir();
     match dir.strip_prefix(&home_dir) {
-        Some(string) => "~".to_string() + string,
-        None => dir.to_string(),
+        Some(string) if !home_dir.is_empty() => "~".to_string() + string,
+        _ => dir.to_string(),
     }
 }
 
-/// Get the user's config directory.
+/// Celeste's config directory (`$XDG_CONFIG_HOME/celeste`, usually
+/// `~/.config/celeste`). `CELESTE_CONFIG_DIR` overrides it for tests.
 pub fn get_config_dir() -> PathBuf {
-    let mut config_dir = glib::user_config_dir();
-    config_dir.push("celeste");
-    config_dir
+    if let Some(dir) = std::env::var_os("CELESTE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(base).join("celeste");
+    }
+    PathBuf::from(home_dir()).join(".config").join("celeste")
+}
+
+/// `$XDG_RUNTIME_DIR/celeste` for the single-instance socket.
+pub fn runtime_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", uid())));
+    base.join("celeste")
+}
+
+fn uid() -> u32 {
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
 }
 
 /// Map a remote item onto the local sync directory.

@@ -19,9 +19,10 @@ impl MigrationTrait for Migration {
         .await?;
 
         for item in sync_items {
-            if let Some(item_str) = item["remote_path"].as_str()
-                && item_str.starts_with('/')
-            {
+            if let Some(item_str) = item["remote_path"].as_str() {
+                if !item_str.starts_with('/') {
+                    continue;
+                }
                 db.execute(Statement::from_string(
                     backend,
                     format!(r#"DELETE FROM sync_items where remote_path = "{item_str}""#),

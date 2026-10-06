@@ -1,6 +1,5 @@
 //! Structs and functions for use with Rclone RPC calls.
 use crate::util;
-use adw::glib;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -10,11 +9,9 @@ use time::OffsetDateTime;
 pub fn get_remote<T: ToString>(remote: T) -> Option<Remote> {
     let remote = remote.to_string();
 
-    let config_str = util::run_in_background(
-        glib::clone!(@strong remote => move || librclone::rpc("config/get", json!({
-            "name": remote
-        }).to_string()).unwrap()),
-    );
+    let config_str = util::run_in_background(|| {
+        librclone::rpc("config/get", json!({ "name": remote }).to_string()).unwrap()
+    });
     let config: HashMap<String, String> = serde_json::from_str(&config_str).unwrap();
 
     match config["type"].as_str() {
@@ -65,7 +62,7 @@ pub fn get_remotes() -> Vec<Remote> {
     });
     let configs = {
         let config: HashMap<String, Vec<String>> = serde_json::from_str(&configs_str).unwrap();
-        config.get(&"remotes".to_string()).unwrap().to_owned()
+        config.get("remotes").unwrap().to_owned()
     };
     let mut celeste_configs = vec![];
 
@@ -165,16 +162,15 @@ pub enum WebDavVendors {
     WebDav,
 }
 
-impl ToString for WebDavVendors {
-    fn to_string(&self) -> String {
-        match self {
+impl std::fmt::Display for WebDavVendors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
             Self::Nextcloud => "Nextcloud",
             Self::Owncloud => "Owncloud",
             Self::GDrive => "Google Drive",
             Self::PCloud => "pCloud",
             Self::WebDav => "WebDav",
-        }
-        .to_string()
+        })
     }
 }
 
