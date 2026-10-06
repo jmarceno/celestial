@@ -43,6 +43,30 @@ use std::{
 // The location for file ignore lists.
 static FILE_IGNORE_NAME: &str = ".sync-exclude.lst";
 
+/// Read `.sync-exclude.lst`. A directory at that path makes `FileLock` return
+/// `IsADirectory`; that used to abort the whole sync.
+fn load_ignore_globs(ignore_file: &Path) -> Vec<glob::Pattern> {
+    if !ignore_file.is_file() {
+        return Vec::new();
+    }
+
+    let Ok(_lock) = FileLock::lock(
+        ignore_file,
+        true,
+        FileOptions::new().read(true).write(true),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(content) = fs::read_to_string(ignore_file) else {
+        return Vec::new();
+    };
+
+    content
+        .lines()
+        .filter_map(|line| glob::Pattern::new(line).ok())
+        .collect()
+}
+
 // A [`HashMap`] containing the status and progress for a directory sync label.
 // This is done here because if we try to get the child from a `Box` or
 // something we just get a generic gtk `Widget`, which we can't use.
@@ -1715,27 +1739,7 @@ pub fn launch(app: &Application, background: bool) {
                     // Get the list of ignore globs.
                     let ignore_file_string =
                         format!("{}/{}", sync_dir.local_path, FILE_IGNORE_NAME);
-                    let ignore_file_path = Path::new(&ignore_file_string);
-                    let ignore_globs = if ignore_file_path.exists() {
-                        let _lock = FileLock::lock(
-                            &ignore_file_string,
-                            true,
-                            FileOptions::new().write(true).read(true),
-                        )
-                        .unwrap();
-                        let file_content = fs::read_to_string(ignore_file_path).unwrap();
-                        let mut globs = vec![];
-
-                        for line in file_content.lines() {
-                            if let Ok(pattern) = glob::Pattern::new(line) {
-                                globs.push(pattern);
-                            }
-                        }
-
-                        globs
-                    } else {
-                        vec![]
-                    };
+                    let ignore_globs = load_ignore_globs(Path::new(&ignore_file_string));
 
                     for item in directory {
                         // If a close request was sent in, stop syncing this remote so we can quit
@@ -1965,7 +1969,7 @@ pub fn launch(app: &Application, background: bool) {
                             // to safely convert it to an `i64` and `u64`.
                             if local_utc_timestamp > db_model.last_local_timestamp as u64
                                 && let Some(remote_timestamp) = remote_utc_timestamp
-                                && remote_timestamp > db_model.last_remote_timestamp as i64
+                                && remote_timestamp != db_model.last_remote_timestamp as i64
                             {
                                 // Only add the error if one of the items is not a directory -
                                 // there's no point in saying both directories are more current, and
@@ -2034,10 +2038,24 @@ pub fn launch(app: &Application, background: bool) {
                                 && remote_timestamp == db_model.last_remote_timestamp as i64
                             {
                                 continue;
-                            // Every possible scenario should have been covered
-                            // above, so panic if not.
+                            // Google Drive can move modified times backwards without the
+                            // file contents changing. The local copy is unchanged, so keep
+                            // both copies and record the new remote time.
+                            } else if local_utc_timestamp == db_model.last_local_timestamp as u64
+                                && let Some(remote_timestamp) = remote_utc_timestamp
+                                && remote_timestamp < db_model.last_remote_timestamp as i64
+                            {
+                                update_db_item(
+                                    local_utc_timestamp.try_into().unwrap(),
+                                    remote_timestamp.try_into().unwrap(),
+                                );
+                                continue;
                             } else {
-                                unreachable!();
+                                add_error(SyncError::General(
+                                    local_path.clone(),
+                                    "Could not decide which copy is newer".into(),
+                                ));
+                                continue;
                             }
                         // Otherwise just check the local timestamps against
                         // those on the remote, and record our new transaction
@@ -2128,27 +2146,7 @@ pub fn launch(app: &Application, background: bool) {
 
                     let ignore_file_string =
                         format!("{}/{}", sync_dir.local_path, FILE_IGNORE_NAME);
-                    let ignore_file_path = Path::new(&ignore_file_string);
-                    let ignore_globs = if ignore_file_path.exists() {
-                        let _lock = FileLock::lock(
-                            ignore_file_path,
-                            true,
-                            FileOptions::new().write(true).read(true),
-                        )
-                        .unwrap();
-                        let file_content = fs::read_to_string(ignore_file_path).unwrap();
-                        let mut globs = vec![];
-
-                        for line in file_content.lines() {
-                            if let Ok(pattern) = glob::Pattern::new(line) {
-                                globs.push(pattern);
-                            }
-                        }
-
-                        globs
-                    } else {
-                        vec![]
-                    };
+                    let ignore_globs = load_ignore_globs(Path::new(&ignore_file_string));
                     let update_ui_progress = |dir: &str| {
                         // If this directory no longer exists in the database (i.e. from being
                         // deleted from the `sync_dir_deletion_queue`, do nothing).
@@ -2203,11 +2201,20 @@ pub fn launch(app: &Application, background: bool) {
                         }
 
                         let remote_path_string = item.path.clone();
-                        let local_path_string = format!(
-                            "{}/{}",
-                            sync_dir.local_path,
-                            item.path.strip_prefix(&sync_dir.remote_path).unwrap()
-                        );
+                        let local_path_string = match util::local_path_for_remote(
+                            &sync_dir.local_path,
+                            &sync_dir.remote_path,
+                            &item.path,
+                        ) {
+                            Some(path) => path,
+                            None => {
+                                add_error(SyncError::General(
+                                    item.path.clone(),
+                                    "Remote path is outside the synced folder".into(),
+                                ));
+                                continue;
+                            }
+                        };
                         update_ui_progress(&remote_path_string);
 
                         // If we've already synced this directory from `fn sync_local_directory`
@@ -2416,7 +2423,7 @@ pub fn launch(app: &Application, background: bool) {
                             // Both items are more recent.
                             if let Some(l_timestamp) = local_timestamp
                                 && l_timestamp > db_model.last_local_timestamp as u64
-                                && remote_timestamp > db_model.last_remote_timestamp as i64
+                                && remote_timestamp != db_model.last_remote_timestamp as i64
                             {
                                 // Only add the error if one of the items is not a directory -
                                 // there's no point in saying both directories are more current, and
@@ -2482,11 +2489,24 @@ pub fn launch(app: &Application, background: bool) {
                                 && remote_timestamp == db_model.last_remote_timestamp as i64
                             {
                                 continue;
-
-                            // Every possible scenario should have been covered
-                            // above, so panic if not.
+                            // Google Drive can move modified times backwards without the
+                            // file contents changing. The local copy is unchanged, so keep
+                            // both copies and record the new remote time.
+                            } else if let Some(l_timestamp) = local_timestamp
+                                && l_timestamp == db_model.last_local_timestamp as u64
+                                && remote_timestamp < db_model.last_remote_timestamp as i64
+                            {
+                                update_db_item(
+                                    l_timestamp.try_into().unwrap(),
+                                    remote_timestamp.try_into().unwrap(),
+                                );
+                                continue;
                             } else {
-                                unreachable!();
+                                add_error(SyncError::General(
+                                    remote_path_string.clone(),
+                                    "Could not decide which copy is newer".into(),
+                                ));
+                                continue;
                             }
                         // Otherwise just check the local timestamps against
                         // those on th remote, and record our new transaction in
