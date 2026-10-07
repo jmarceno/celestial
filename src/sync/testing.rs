@@ -59,8 +59,24 @@ impl Hooks for TestHooks<'_> {
     fn progress(&mut self, _text: String) {}
 }
 
+/// Which backend the fixture's remote uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// A local folder through an alias: hashes, server-side move.
+    Local,
+    /// A local folder that reports case-insensitive names.
+    CaseInsensitive,
+    /// rclone's in-memory backend: bucket-based, no server-side move and no
+    /// empty folders.
+    Memory,
+}
+
 impl Fixture {
     pub fn new() -> Self {
+        Self::with_backend(Backend::Local)
+    }
+
+    pub fn with_backend(backend: Backend) -> Self {
         let guard = rclone_guard();
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
@@ -76,14 +92,42 @@ impl Fixture {
             "test-sync-{}",
             temp.path().file_name().unwrap().to_str().unwrap()
         );
-        librclone::rpc(
-            "config/create",
-            json!({
-                "name": remote_name, "type": "alias", "parameters": {"remote": remote_root}
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let create = |name: &str, kind: &str, parameters: serde_json::Value| {
+            librclone::rpc(
+                "config/create",
+                json!({ "name": name, "type": kind, "parameters": parameters }).to_string(),
+            )
+            .unwrap();
+        };
+        let remote_path = match backend {
+            Backend::Local => {
+                create(&remote_name, "alias", json!({ "remote": remote_root }));
+                "sandbox"
+            }
+            Backend::CaseInsensitive => {
+                let inner = format!("{remote_name}-ci");
+                create(&inner, "local", json!({ "case_insensitive": "true" }));
+                create(
+                    &remote_name,
+                    "alias",
+                    json!({ "remote": format!("{inner}:{}", remote_root.display()) }),
+                );
+                "sandbox"
+            }
+            Backend::Memory => {
+                create(&remote_name, "memory", json!({}));
+                // A bucket cannot be empty: give the folder a placeholder.
+                let seed = temp.path().join("placeholder");
+                fs::write(&seed, "placeholder").unwrap();
+                crate::rclone::sync::copy_to_remote(
+                    seed.to_str().unwrap(),
+                    &remote_name,
+                    "bucket/sandbox/placeholder.txt",
+                )
+                .unwrap();
+                "bucket/sandbox"
+            }
+        };
         let db = util::await_future(Database::connect("sqlite::memory:")).unwrap();
         util::await_future(Migrator::up(&db, None)).unwrap();
         let remote = util::await_future(
@@ -98,7 +142,7 @@ impl Fixture {
             SyncDirsActiveModel {
                 remote_id: ActiveValue::Set(remote.id),
                 local_path: ActiveValue::Set(local.to_str().unwrap().into()),
-                remote_path: ActiveValue::Set("sandbox".into()),
+                remote_path: ActiveValue::Set(remote_path.into()),
                 ..Default::default()
             }
             .insert(&db),
@@ -232,6 +276,16 @@ impl Fixture {
         set_time(&self.local.join(name), 1_700_000_000);
         self.pass();
         self.assert_no_errors();
+    }
+
+    /// Read a remote file through rclone (for backends without a folder).
+    pub fn cat_remote(&self, rel: &str) -> Option<String> {
+        let target = self.temp.path().join("cat");
+        let _ = fs::remove_file(&target);
+        let remote = format!("{}/{rel}", self.dir.remote_path);
+        crate::rclone::sync::copy_to_local(target.to_str().unwrap(), &self.remote.name, &remote)
+            .ok()?;
+        fs::read_to_string(target).ok()
     }
 
     pub fn remote_file(&self, rel: &str) -> PathBuf {

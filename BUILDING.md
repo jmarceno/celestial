@@ -15,6 +15,16 @@ bash scripts/build-run.sh
 
 `scripts/build-run.sh` uses the `cargo remote-release` alias from `.cargo/config.toml` and produces `target/release/celestial.run`, retaining `target/release/celestial` for packaging. Stable Cargo does not support dots in binary target names, so the script adds the suffix after a successful build. This `.run` file is the native executable; the portable bundle is generated separately below. Dependencies and intermediate build files stay on the builder. If the remote build fails, report the error instead of compiling locally.
 
+## Tests
+
+Synchronization tests run against disposable local folders behind rclone `alias`, case-insensitive `local` and `memory` remotes; they never use a cloud account. Failpoints in the sync engine (`src/sync/failpoint.rs`) interrupt an operation at each step, as a crash would, or inject an edit inside a commit window; the tests then check the journal replay and that every version survived.
+
+The 20,000-file measurement is ignored by default. Run it on the builder, in the folder `cargo remote` synchronizes to:
+
+```sh
+ssh rust-builder 'cd ~/remote-builds/<project hash> && source ~/.profile && cargo test --lib measure_twenty -- --ignored --nocapture'
+```
+
 ## Staging and portable packaging
 
 ```sh

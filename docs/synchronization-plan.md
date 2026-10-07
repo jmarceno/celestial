@@ -2,7 +2,7 @@
 
 Date: 2026-10-07. Reviewed checkout: `2a970e1` (source unchanged at `d9d3a56`). Embedded rclone: v1.64.2, read from the vendored `librclone-sys 0.6.3+rclone-v1.64.2` sources.
 
-Status: planning only; none of the changes below are implemented by this document. This plan replaces `docs/synchronization-audit.md`, whose original evidence remains in Git history. Current status was checked against source, existing test definitions and the vendored rclone sources; builds, tests, cloud accounts and running application data were not accessed during this review. Earlier test counts and timings are historical evidence, not fresh validation. Keep plans and audits under `docs`; do not link them from README or AGENTS.md.
+Status: implemented in phases 1–7 on 2026-10-07; outcomes, measurements and unverified gates are recorded in `docs/synchronization-validation.md`. The original planning notes follow unchanged. This plan replaces `docs/synchronization-audit.md`, whose original evidence remains in Git history. Current status was checked against source, existing test definitions and the vendored rclone sources; builds, tests, cloud accounts and running application data were not accessed during this review. Earlier test counts and timings are historical evidence, not fresh validation. Keep plans and audits under `docs`; do not link them from README or AGENTS.md.
 
 ## Goal and scope
 
@@ -222,13 +222,13 @@ After every implementation commit, immediately run a fresh `bash scripts/build-r
 
 Implement in phases 1–7 after separate implementation approval. Two fixes are small and independent and can land first: forcing intended transfers with `_config.IgnoreTimes` (G01) and replacing the pair-wide halt with per-item blocking (G16). Phase 2 may land as a tested decision module before it is connected to live mutations; enable the new mutation behavior only after preservation and guarded operations from phases 3–4 are ready. Watcher/performance work must preserve the new verification guarantees.
 
-- [ ] Every G01–G16 item has implementation and acceptance evidence, including the documented behavior for each backend capability.
-- [ ] Every pending audit item has a recorded outcome; repaired items still pass their regressions. Historical metrics are replaced by measured current results where relevant.
-- [ ] Bootstrap/migration never invents a common baseline, discards divergence or interprets a failed observation as deletion.
-- [ ] Conflict resolution, normal replacement, deletion, type replacement and restore all use the same preservation/commit/recovery path.
-- [ ] One failing or conflicting item never stops the rest of its pair; transient failures retry automatically.
-- [ ] No silent destructive fallback exists; capability limits, the residual remote race window and recovery locations are visible and documented.
+- [x] Every G01–G16 item has implementation and acceptance evidence, including the documented behavior for each backend capability.
+- [x] Every pending audit item has a recorded outcome; repaired items still pass their regressions. Historical metrics are replaced by measured current results where relevant.
+- [x] Bootstrap/migration never invents a common baseline, discards divergence or interprets a failed observation as deletion.
+- [x] Conflict resolution, normal replacement, deletion, type replacement and restore all use the same preservation/commit/recovery path.
+- [x] One failing or conflicting item never stops the rest of its pair; transient failures retry automatically.
+- [x] No silent destructive fallback exists; capability limits, the residual remote race window and recovery locations are visible and documented.
 - [ ] Live provider, real desktop/tray, crash recovery and compatible portable delivery gates are satisfied for supported claims. Unavailable evidence remains explicitly incomplete.
-- [ ] README/BUILDING document the resulting conflict, deletion, retention, restore and backend behavior without presenting sync as a backup of arbitrary local edits.
+- [x] README/BUILDING document the resulting conflict, deletion, retention, restore and backend behavior without presenting sync as a backup of arbitrary local edits.
 
 Additional references: [rclone list metadata and hashes](https://rclone.org/rc/#operations-list-list-the-given-remote-and-path-in-json-format), [rclone copyfile interface](https://rclone.org/rc/#operations-copyfile-copy-a-file-from-source-remote-to-destination-remote), [rclone filesystem information](https://rclone.org/rc/#operations-fsinfo-return-information-about-the-remote), [rclone backup-dir](https://rclone.org/docs/#backup-dir-dir), [notify caveats](https://docs.rs/notify/8.2.0/notify/#known-problems), [racy Git](https://git-scm.com/docs/racy-git), [Syncthing conflict-copy retention](https://docs.syncthing.net/users/config.html#maxconflicts), [separate historical versioning](https://docs.syncthing.net/users/versioning.html).

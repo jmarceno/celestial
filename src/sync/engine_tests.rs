@@ -1494,3 +1494,212 @@ fn measure_twenty_thousand_files() {
     assert_eq!(idle_stats.hashed_bytes, 0);
     assert_eq!(f.last.as_ref().unwrap().actions, 0);
 }
+
+#[test]
+fn case_insensitive_backends_are_detected_and_collisions_blocked() {
+    use crate::sync::testing::Backend;
+    let mut f = Fixture::with_backend(Backend::CaseInsensitive);
+    assert!(f.caps.case_insensitive);
+    fs::write(f.local.join("Notes.txt"), "one").unwrap();
+    fs::write(f.local.join("notes.txt"), "two").unwrap();
+    fs::write(f.local.join("other.txt"), "other").unwrap();
+    f.pass();
+    assert_eq!(f.read_remote("other.txt"), "other");
+    assert_eq!(f.errors().len(), 2);
+    assert_eq!(f.read_local("Notes.txt"), "one");
+    assert_eq!(f.read_local("notes.txt"), "two");
+}
+
+#[test]
+fn backends_without_server_side_move_still_preserve_versions() {
+    use crate::sync::testing::Backend;
+    let mut f = Fixture::with_backend(Backend::Memory);
+    assert!(!f.caps.server_move);
+    f.pass();
+    f.seed("file.txt");
+    f.seed("other.txt");
+    assert_eq!(f.cat_remote("file.txt").as_deref(), Some("original"));
+    // An overwrite and a deletion both preserve the previous remote version
+    // through rclone's copy-and-delete fallback.
+    fs::write(f.local.join("file.txt"), "local edit").unwrap();
+    fs::remove_file(f.local.join("other.txt")).unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.cat_remote("file.txt").as_deref(), Some("local edit"));
+    assert_eq!(f.cat_remote("other.txt"), None);
+    let items = recovered(&f);
+    assert_eq!(items.len(), 2);
+    for item in items {
+        let target = f.temp.path().join("recovered");
+        rclone::sync::copy_to_local(target.to_str().unwrap(), &f.remote.name, &item.stored_path)
+            .unwrap();
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
+    }
+}
+
+#[test]
+fn without_hashes_equal_size_and_time_count_as_equal_contents() {
+    // Generic WebDAV: no hash, so a same-size edit within the provider's
+    // precision cannot be seen without downloading. Different sizes or
+    // times are still different contents.
+    let mut f = Fixture::new();
+    f.caps.hashes.clear();
+    f.caps.precision_ns = 1_000_000_000;
+    fs::write(f.local.join("same.txt"), "aaaa").unwrap();
+    set_time(&f.local.join("same.txt"), 1_700_000_000);
+    fs::write(f.remote_file("same.txt"), "bbbb").unwrap();
+    set_time(&f.remote_file("same.txt"), 1_700_000_000);
+    fs::write(f.local.join("differ.txt"), "local").unwrap();
+    set_time(&f.local.join("differ.txt"), 1_700_000_000);
+    fs::write(f.remote_file("differ.txt"), "remote!").unwrap();
+    set_time(&f.remote_file("differ.txt"), 1_700_000_000);
+    f.pass();
+    assert_eq!(conflicts(&f), 1);
+    assert_eq!(f.read_local("same.txt"), "aaaa");
+    assert_eq!(f.read_remote("same.txt"), "bbbb");
+}
+
+#[test]
+fn an_item_missing_from_a_delayed_listing_is_not_deleted() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.seed("other.txt");
+    // The listing misses the file (eventual consistency) but it exists by
+    // the time Celestial would act on that observation.
+    let hidden = f.temp.path().join("hidden");
+    fs::rename(f.remote_file("file.txt"), &hidden).unwrap();
+    let target = f.remote_file("file.txt");
+    let mut restored = false;
+    f.pass_with(|_| {
+        if !restored {
+            restored = true;
+            fs::rename(&hidden, &target).unwrap();
+        }
+    });
+    assert_eq!(f.read_local("file.txt"), "original");
+    assert_eq!(f.read_remote("file.txt"), "original");
+    f.retry_all();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_local("file.txt"), "original");
+}
+
+#[test]
+fn nested_folders_converge_and_stay_clean() {
+    let mut f = Fixture::new();
+    for dir in ["a", "a/b", "a/b/c", "x", "x/empty"] {
+        fs::create_dir(f.local.join(dir)).unwrap();
+    }
+    for file in ["a/1", "a/b/2", "a/b/c/3", "x/4"] {
+        fs::write(f.local.join(file), file).unwrap();
+        set_time(&f.local.join(file), 1_700_000_000);
+    }
+    fs::create_dir_all(f.remote_root.join("sandbox/r/s")).unwrap();
+    fs::write(f.remote_file("r/s/5"), "5").unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert!(f.remote_file("x/empty").is_dir());
+    assert_eq!(f.read_local("r/s/5"), "5");
+    f.assert_clean();
+    f.assert_clean();
+}
+
+#[test]
+fn a_corrupt_baseline_never_loses_either_side() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    sql(
+        &f,
+        "UPDATE sync_items SET hash = 'garbage', remote_hash = 'garbage', local_inode = 1",
+    );
+    fs::write(f.remote_file("file.txt"), "remote edit").unwrap();
+    f.pass();
+    // Both sides look changed against the damaged baseline: both versions
+    // survive.
+    let mut texts = vec![f.read_local("file.txt"), f.read_remote("file.txt")];
+    if let Ok(entries) = fs::read_dir(&f.local) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".sync-conflict-")
+            {
+                texts.push(fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+    }
+    assert!(texts.contains(&"original".to_owned()), "{texts:?}");
+    assert!(texts.contains(&"remote edit".to_owned()), "{texts:?}");
+}
+
+#[test]
+fn long_names_get_conflict_copies_that_fit() {
+    let mut f = Fixture::new();
+    let name = format!("{}.txt", "n".repeat(240));
+    fs::write(f.local.join(&name), "local").unwrap();
+    set_time(&f.local.join(&name), 1_700_000_000);
+    fs::write(f.remote_file(&name), "remote").unwrap();
+    set_time(&f.remote_file(&name), 1_700_000_100);
+    f.pass();
+    let copy = only_conflict_copy(&f, "nnnn");
+    assert!(copy.len() <= 255);
+    assert!(copy.ends_with(".txt"));
+    assert_eq!(f.read_remote(&copy), "local");
+}
+
+#[test]
+fn unicode_normalization_variants_are_blocked() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join("caf\u{e9}.txt"), "composed").unwrap();
+    fs::write(f.remote_file("cafe\u{301}.txt"), "decomposed").unwrap();
+    f.pass();
+    assert_eq!(f.errors().len(), 2);
+    assert!(!f.local.join("cafe\u{301}.txt").exists());
+    assert!(!f.remote_file("caf\u{e9}.txt").exists());
+}
+
+#[test]
+fn settings_read_failures_are_errors_not_empty_configuration() {
+    let f = Fixture::new();
+    sql(&f, "DROP TABLE sync_dirs");
+    let mut model = Model::new();
+    assert!(reload_model(&f.db, &mut model).is_err());
+}
+
+#[test]
+fn versions_of_unresolved_conflicts_are_never_pruned() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    let internal = recovery::ensure_internal(&f.db, &f.dir).unwrap();
+    let old = internal.recovery().join("old");
+    fs::write(&old, "old").unwrap();
+    let item = store::RecoveryItem {
+        id: 0,
+        pair_uuid: internal.pair_uuid.clone(),
+        remote_name: f.remote.name.clone(),
+        local_root: f.dir.local_path.clone(),
+        remote_root: f.dir.remote_path.clone(),
+        rel: "file.txt".into(),
+        side: "local".into(),
+        stored_path: old.display().to_string(),
+        reason: "test".into(),
+        op_id: "conflict-op".into(),
+        size: Some(3),
+        mtime: Some(0),
+        created_at: store::now() - 90 * 86_400,
+    };
+    store::insert_recovery(&f.db, &item).unwrap();
+    store::insert_conflict(
+        &f.db,
+        f.dir.id,
+        &internal.pair_uuid,
+        "file.txt",
+        "edit_edit",
+        "{}",
+        None,
+        "conflict-op",
+    )
+    .unwrap();
+    f.pass();
+    assert!(old.exists());
+}

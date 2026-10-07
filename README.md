@@ -4,7 +4,7 @@ Celestial synchronizes folders in both directions between your computer and clou
 
 Supported providers: Dropbox, Google Drive, Nextcloud, Owncloud, pCloud, Proton Drive and WebDAV.
 
-The app reports conflicts when both copies have changed and supports exclusions stored in `.sync-exclude.lst` in each local folder.
+Exclusions are stored in `.sync-exclude.lst` in each local folder.
 
 ## Installation
 
@@ -25,6 +25,29 @@ Configuration and synchronization history remain in `$XDG_CONFIG_HOME/celestial`
 The app was previously called Celeste. On first start, Celestial moves `~/.config/celeste` and `celeste.db` to the new names, and `celestial install` (or starting the portable bundle) replaces the old menu and autostart entries. `scripts/install.sh` also removes the old `~/.local/bin/celeste` launcher.
 
 Local folders are watched for changes, so local edits sync within about a second without rescanning idle folders. Remote folders are checked every 60 seconds, or sooner when a local change starts a pass.
+
+## How synchronization works
+
+Celestial compares contents, not only timestamps. For each item it keeps the last contents both sides had in common, using the provider's hash (MD5, SHA-1, DropboxHash, ...) and, locally, size, modification time, inode change time and inode, so edits that keep the size and modification time (`cp -p`, `touch -d`) are still detected. Local files are hashed only when their metadata changed, on the first synchronization and when both sides changed.
+
+- One side changed: that version is copied to the other side.
+- Both sides changed to the same contents, or the first synchronization finds the same contents on both sides: nothing is copied.
+- Both sides changed differently, or the first synchronization finds different contents: both versions are kept. The version with the older modification time (the remote one on a tie) is renamed to `<name>.sync-conflict-<UTC date-time>-<local|remote>-<id>.<ext>`, and both files then exist on both sides. A file and a folder with the same name are handled the same way, renaming the file. At most 10 conflict copies are kept visible per item.
+- Deleted on one side and unchanged on the other: the deletion is propagated. Deleted on one side but changed on the other: the changed version is restored and the outcome is listed; it can then be deleted everywhere from that entry.
+- A folder is only removed when everything in it is being removed; changed, excluded or new contents keep it.
+
+Every version Celestial replaces or deletes is preserved first. Locally it is moved into a hidden `.celestial-<id>` folder that Celestial creates inside the synced folder; on the remote it is moved to `.celestial-recovery/<pair>` at the root of the remote, which other clients of the account can see. Preserved versions are listed in the folder's view with a Restore action; restoring preserves the current version first. The newest 10 versions of each item are kept for 30 days; versions of unresolved conflicts, of unfinished operations, and the last version of a deleted item are not removed automatically. Stopping a folder or removing an account keeps them. This protects against Celestial's own replacements and deletions; it is not a backup of arbitrary local edits, and an edit you overwrite yourself is not preserved.
+
+Downloads are written to the internal folder and committed with an atomic rename; an edit that lands in the file at that moment is kept as a conflict copy. Uploads preserve the remote version before replacing it; an edit another client makes between Celestial's last check and that move is kept as a conflict copy. The embedded rclone offers no conditional writes, so an edit another client makes while an upload is in progress can still be replaced; that version then survives only in the provider's own version history, where one exists. Every change is journaled before it is made, so an interrupted operation is finished or undone on the next pass.
+
+An item that cannot be synchronized right now is retried automatically after one minute, doubling up to one hour, while everything else continues. Items that need you to act (names that differ only by letter case on a case-insensitive provider, Unicode normalization variants, names that are not valid UTF-8, several remote items with one name, unfinished `.partial` downloads left by older versions) are listed with the reason, and nothing is changed until they are renamed. Only an unavailable or emptied folder, unreadable exclusions or a database failure pause a whole folder, and it is checked again automatically.
+
+Provider differences:
+
+- Google Drive, Dropbox, pCloud, Proton Drive, Nextcloud and ownCloud report hashes, so remote edits are detected from contents.
+- Generic WebDAV reports no hash and cannot set modification times. An edit that keeps the same size within the provider's time precision cannot be detected without downloading it, and a first synchronization keeps both versions unless size and time match. Uploads to providers without a hash are made from a snapshot, so the bytes sent are the bytes recorded.
+- Providers without server-side moves preserve remote versions by copying and deleting, which uses transfer and quota.
+- Deletions on Google Drive also go to the Drive trash; Celestial does not rely on provider trash.
 
 ## License and origin
 
