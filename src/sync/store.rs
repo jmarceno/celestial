@@ -760,6 +760,30 @@ pub fn protected_operations<C: ConnectionTrait>(
     .collect()
 }
 
+/// Whether a preserved version stored at `stored_path` by operation `op`
+/// is recorded.
+pub fn recovery_for_op<C: ConnectionTrait>(
+    db: &C,
+    op: &str,
+    stored_path: &str,
+) -> Result<bool, DbErr> {
+    Ok(!query(
+        db,
+        "SELECT id FROM recovery_items WHERE op_id = ? AND stored_path = ?",
+        vec![op.into(), stored_path.into()],
+    )?
+    .is_empty())
+}
+
+pub fn conflict_for_op<C: ConnectionTrait>(db: &C, op: &str) -> Result<bool, DbErr> {
+    Ok(!query(
+        db,
+        "SELECT id FROM conflicts WHERE op_id = ?",
+        vec![op.into()],
+    )?
+    .is_empty())
+}
+
 pub fn recovery_by_id<C: ConnectionTrait>(
     db: &C,
     pair_uuid: &str,

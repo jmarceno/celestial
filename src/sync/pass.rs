@@ -8,6 +8,8 @@
 //! or emptied root, unreadable exclusions, a database failure) stop a pass.
 
 use super::capabilities::Capabilities;
+use super::failpoint;
+use super::localfs::Root;
 use super::model::{FILE_IGNORE_NAME, SyncError};
 use super::observe::{self, Fingerprint, HashError, LocalMeta, LocalTree, Obs, RemoteMeta};
 use super::reconcile::{self, ConflictKind, Decision, Delta, History, Input, Kind, Side};
@@ -120,19 +122,6 @@ impl Pair<'_> {
         )
         .map(|item| item.map(|item| RemoteMeta::from_item(&item, self.caps.preferred_hash())))
         .map_err(|err| err.error)
-    }
-
-    fn stat_local(&self, rel: &str) -> Result<Option<LocalMeta>, String> {
-        let path = self.local_path(rel);
-        validate_local_path(Path::new(&self.dir.local_path), &path)?;
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                Err("Symbolic links inside a synced folder are not followed".into())
-            }
-            Ok(metadata) => Ok(Some(LocalMeta::from_metadata(&metadata))),
-            Err(err) if missing(&err) => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
     }
 
     /// A remote hash is a fingerprint only in the pair's algorithm.
@@ -257,6 +246,8 @@ fn remote_delta(meta: &RemoteMeta, base: &Baseline) -> Delta {
 struct Cx<'a> {
     pair: &'a Pair<'a>,
     internal: Internal,
+    /// The pair root, opened once and checked against its identity.
+    root: Root,
     remote_free: Cell<Option<Option<i64>>>,
 }
 
@@ -267,7 +258,12 @@ impl Cx<'_> {
             remote: self.pair.remote,
             dir: self.pair.dir,
             internal: &self.internal,
+            root: &self.root,
         }
+    }
+
+    fn stat_local(&self, rel: &str) -> Result<Option<LocalMeta>, String> {
+        self.root.lstat(rel).map_err(|err| err.to_string())
     }
 
     /// Pause before writing when the destination is short of space, instead
@@ -305,9 +301,12 @@ pub fn run(
     hooks: &mut dyn Hooks,
     cached: Option<LocalTree>,
 ) -> Result<Report, String> {
-    let root = Path::new(&pair.dir.local_path);
-    let patterns = load_ignore_globs(&root.join(FILE_IGNORE_NAME))?;
-    let internal = recovery::ensure_internal(pair.db, pair.dir)?;
+    let root_path = Path::new(&pair.dir.local_path);
+    let patterns = load_ignore_globs(&root_path.join(FILE_IGNORE_NAME))?;
+    let cx = context(pair)?;
+    // Finish or undo anything an interruption left half done before looking.
+    cx.rec().replay()?;
+    let internal = &cx.internal;
     // When the whole remote is synced, its recovery folder is inside it.
     let root_pair = pair.dir.remote_path.is_empty();
     let ours_remote = |rel: &str| {
@@ -318,11 +317,14 @@ pub fn run(
     let ignored = |rel: &str| is_ignored(rel, &patterns);
     let local = match cached {
         Some(tree) => tree,
-        None => {
-            observe::observe_local(root, &|rel, metadata| ignored(rel) || internal.is(metadata))
-                .map_err(|err| format!("Local sync folder is unavailable: {err}"))?
-        }
+        None => observe::observe_local(root_path, &|rel, metadata| {
+            ignored(rel) || internal.is(metadata)
+        })
+        .map_err(|err| format!("Local sync folder is unavailable: {err}"))?,
     };
+    // The walk went by path: make sure it walked the folder that is open.
+    let identity = cx.root.identity().map_err(|err| err.to_string())?;
+    Root::open(root_path, Some(identity)).map_err(|err| err.to_string())?;
     let listing = rclone::sync::list_with(
         &pair.remote.name,
         &pair.dir.remote_path,
@@ -437,11 +439,6 @@ pub fn run(
     settle_folders(&mut entries);
     cap_conflict_copies(&mut entries);
 
-    let cx = Cx {
-        pair,
-        internal,
-        remote_free: Cell::new(None),
-    };
     let mut report = Report::default();
     let mut failed = vec![false; entries.len()];
     // Removals first, deepest items first, so folders are empty when they go.
@@ -513,6 +510,10 @@ pub fn run(
         .collect();
     if let Err(err) = cx.rec().prune(&live) {
         tracing::warn!("could not apply the retention policy: {err}");
+    }
+    // Finished journal entries are kept a week for diagnosis.
+    if let Err(err) = store::prune_operations(pair.db, 7 * 24 * 3600) {
+        tracing::warn!("could not prune the operation journal: {err}");
     }
 
     let states = store::load_item_states(pair.db, pair.dir.id).map_err(|err| err.to_string())?;
@@ -643,7 +644,7 @@ fn execute_removal(cx: &Cx, entry: &Entry, step: Removal) -> Result<(), String> 
         let Obs::Present(expected) = &entry.local else {
             return Err("The local item is no longer present".into());
         };
-        if !pair
+        if !cx
             .stat_local(&entry.rel)?
             .is_some_and(|now| now.same_tuple(expected))
         {
@@ -665,7 +666,7 @@ fn execute_removal(cx: &Cx, entry: &Entry, step: Removal) -> Result<(), String> 
         let reappeared = if local_step {
             pair.stat_remote(&entry.rel)?.is_some()
         } else {
-            pair.stat_local(&entry.rel)?.is_some()
+            cx.stat_local(&entry.rel)?.is_some()
         };
         if reappeared {
             return Err(tr::tr!(
@@ -678,7 +679,7 @@ fn execute_removal(cx: &Cx, entry: &Entry, step: Removal) -> Result<(), String> 
             return Err("The local item is no longer present".into());
         };
         if expected.is_dir {
-            fs::remove_dir(pair.local_path(&entry.rel)).map_err(|err| {
+            cx.root.rmdir(&entry.rel).map_err(|err| {
                 tr::tr!(
                     "The folder still has contents that are not being deleted ({}).",
                     err
@@ -777,17 +778,9 @@ fn same_remote(seen: &RemoteMeta, now: &RemoteMeta) -> bool {
     }
 }
 
-/// A path is absent when it, or one of its parents, does not exist.
-fn missing(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-    )
-}
-
 /// The local side must still be what was observed.
-fn expect_local(pair: &Pair, entry: &Entry) -> Result<Option<LocalMeta>, String> {
-    let now = pair.stat_local(&entry.rel)?;
+fn expect_local(cx: &Cx, entry: &Entry) -> Result<Option<LocalMeta>, String> {
+    let now = cx.stat_local(&entry.rel)?;
     let same = match (&entry.local, &now) {
         (Obs::Present(seen), Some(now)) => seen.same_tuple(now),
         (Obs::Missing, None) => true,
@@ -834,9 +827,13 @@ fn fresh_entry(rel: &str, local: Option<LocalMeta>, remote: Option<RemoteMeta>) 
 
 /// Upload a local file. A remote file it replaces is moved into recovery
 /// first (server-side where possible) and moved back if the upload fails.
+/// rclone refuses a source whose size or time changes while it is read and
+/// verifies a shared hash afterwards; the local tuple is compared before and
+/// after for the same-size, same-time case rclone cannot see. Without a
+/// shared hash the bytes are uploaded from a snapshot instead.
 fn upload(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
     let pair = cx.pair;
-    expect_local(pair, entry)?;
+    expect_local(cx, entry)?;
     let replaced = if entry.remote.present().is_some_and(|remote| remote.is_dir) {
         // The folder this file replaces was emptied and removed first.
         if pair.stat_remote(&entry.rel)?.is_some() {
@@ -847,43 +844,109 @@ fn upload(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
         expect_remote(pair, entry)?
     };
     cx.check_space(false, i64::try_from(local.size).unwrap_or(i64::MAX))?;
-    let source = pair.local_path(&entry.rel);
-    let source = source.to_str().ok_or(observe::NON_UTF8)?;
     let destination = pair.remote_path(&entry.rel);
     let op = recovery::random_id();
+    let rec = cx.rec();
+    let snapshot = pair
+        .caps
+        .preferred_hash()
+        .is_none()
+        .then(|| rec.staging_rel(&op));
+    rec.begin(
+        &op,
+        &entry.rel,
+        "upload",
+        serde_json::json!({ "remote": destination, "snapshot": snapshot }),
+    )?;
+    let result = upload_steps(
+        cx,
+        entry,
+        local,
+        replaced,
+        &destination,
+        &op,
+        snapshot.as_deref(),
+    );
+    if let Some(snapshot) = &snapshot {
+        let _ = cx.root.unlink(snapshot);
+    }
+    match result {
+        Ok(()) => rec.finish(&op),
+        Err(err) => {
+            rec.abandon(&op, &err);
+            Err(err)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_steps(
+    cx: &Cx,
+    entry: &Entry,
+    local: &LocalMeta,
+    replaced: Option<RemoteMeta>,
+    destination: &str,
+    op: &str,
+    snapshot: Option<&str>,
+) -> Result<(), String> {
+    let pair = cx.pair;
+    let source_rel = match snapshot {
+        Some(snapshot) => {
+            fs::copy(pair.local_path(&entry.rel), cx.root.path().join(snapshot))
+                .map_err(|err| err.to_string())?;
+            if !cx
+                .stat_local(&entry.rel)?
+                .is_some_and(|now| now.same_tuple(local))
+            {
+                return Err(tr::tr!("The local file changed while it was read."));
+            }
+            snapshot.to_owned()
+        }
+        None => entry.rel.clone(),
+    };
+    let source = cx.root.path().join(&source_rel);
+    let source = source.to_str().ok_or(observe::NON_UTF8)?;
     let preserved = match &replaced {
         Some(expected) => {
             let (item, moved) = cx.rec().preserve_remote(
                 &entry.rel,
                 expected,
                 &tr::tr!("Replaced by the local version"),
-                &op,
+                op,
                 &pair.list_options(),
                 pair.caps.preferred_hash(),
             )?;
             if !same_remote(expected, &moved) {
-                keep_displaced_remote(cx, &entry.rel, &item, &moved, &op)?;
+                keep_displaced_remote(cx, &entry.rel, &item, &moved, op)?;
             }
+            cx.rec().step(
+                op,
+                "preserved",
+                Some(&serde_json::json!({
+                    "remote": destination,
+                    "backup": item.stored_path,
+                    "snapshot": snapshot,
+                })),
+            )?;
             Some(item)
         }
         None => None,
     };
-    if let Err(err) = rclone::sync::copy_to_remote(source, &pair.remote.name, &destination) {
+    failpoint::hit("upload:before_transfer");
+    if let Err(err) = rclone::sync::copy_to_remote(source, &pair.remote.name, destination) {
         if let Some(item) = preserved {
             // Put the previous version back where nothing replaced it.
             if matches!(pair.stat_remote(&entry.rel), Ok(None)) {
-                let _ = rclone::sync::move_on_remote(
-                    &pair.remote.name,
-                    &item.stored_path,
-                    &destination,
-                );
+                let _ =
+                    rclone::sync::move_on_remote(&pair.remote.name, &item.stored_path, destination);
             }
         }
         return Err(err.error);
     }
+    failpoint::hit("upload:after_transfer");
     // Acknowledge only the bytes that were read: if the file changed while
     // it was uploaded, the next pass uploads it again.
-    let after = pair
+    let after = cx
         .stat_local(&entry.rel)?
         .filter(|after| after.same_tuple(local))
         .ok_or_else(|| tr::tr!("The local file changed while it was uploaded."))?;
@@ -896,43 +959,83 @@ fn upload(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
 /// Download into the internal staging folder, then commit with an atomic
 /// rename: no-replace for a new file, exchange for a replacement. The
 /// displaced file is compared with what was observed and preserved; an edit
-/// that arrived in between is kept as a conflict copy instead.
+/// that arrived in between is kept as a conflict copy instead. The journal
+/// records the staged inode so a replay can tell whether the commit
+/// happened.
 fn download(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), String> {
     let pair = cx.pair;
     let replaced = if entry.local.present().is_some_and(|local| local.is_dir) {
-        if pair.stat_local(&entry.rel)?.is_some() {
+        if cx.stat_local(&entry.rel)?.is_some() {
             return Err(tr::tr!("The local folder could not be replaced yet."));
         }
         None
     } else {
-        expect_local(pair, entry)?
+        expect_local(cx, entry)?
     };
     expect_remote(pair, entry)?;
-    let path = pair.local_path(&entry.rel);
-    ensure_local_parent(pair, &path)?;
+    ensure_local_parent(cx, &entry.rel)?;
     cx.check_space(true, remote.size)?;
     let op = recovery::random_id();
-    let stage = cx.internal.staging().join(&op);
-    let stage_text = stage.to_str().ok_or(observe::NON_UTF8)?;
-    let discard = |stage: &Path| {
-        let _ = fs::remove_file(stage);
-    };
+    let rec = cx.rec();
+    let stage = rec.staging_rel(&op);
+    rec.begin(
+        &op,
+        &entry.rel,
+        "download",
+        serde_json::json!({ "stage": stage }),
+    )?;
+    let committed = Cell::new(false);
+    match download_steps(cx, entry, remote, replaced, &op, &stage, &committed) {
+        Ok(()) => rec.finish(&op),
+        // After the exchange the stage may hold the displaced version: the
+        // journal stays open so the next pass preserves it.
+        Err(err) if committed.get() => Err(err),
+        Err(err) => {
+            rec.abandon(&op, &err);
+            Err(err)
+        }
+    }
+}
+
+fn download_steps(
+    cx: &Cx,
+    entry: &Entry,
+    remote: &RemoteMeta,
+    replaced: Option<LocalMeta>,
+    op: &str,
+    stage: &str,
+    committed: &Cell<bool>,
+) -> Result<(), String> {
+    let pair = cx.pair;
+    let stage_path = cx.root.path().join(stage);
+    let stage_text = stage_path.to_str().ok_or(observe::NON_UTF8)?;
     rclone::sync::copy_to_local(stage_text, &pair.remote.name, &pair.remote_path(&entry.rel))
         .map_err(|err| {
-            discard(&stage);
+            let _ = cx.root.unlink(stage);
             err.error
         })?;
+    let staged = cx
+        .stat_local(stage)?
+        .ok_or_else(|| tr::tr!("The downloaded file disappeared."))?;
+    cx.root.sync_file(stage).map_err(|err| err.to_string())?;
+    cx.rec().step(
+        op,
+        "staged",
+        Some(&serde_json::json!({ "stage": stage, "stageInode": staged.inode })),
+    )?;
+    failpoint::hit("download:staged");
     if pair.stat_remote(&entry.rel)?.as_ref() != Some(remote) {
-        discard(&stage);
+        let _ = cx.root.unlink(stage);
         return Err(tr::tr!("The remote file changed while it was downloaded."));
     }
     match replaced {
-        None => match recovery::rename_noreplace(&stage, &path) {
+        None => match cx.root.rename_noreplace(stage, &entry.rel) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Something was created at the path meanwhile: keep both.
-                let copy = recovery::conflict_rel(&entry.rel, "remote", &op, observe::Stamp::now());
-                recovery::rename_noreplace(&stage, &pair.local_path(&copy))
+                let copy = recovery::conflict_rel(&entry.rel, "remote", op, observe::Stamp::now());
+                cx.root
+                    .rename_noreplace(stage, &copy)
                     .map_err(|err| err.to_string())?;
                 record_conflict(
                     cx,
@@ -940,7 +1043,7 @@ fn download(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), String> {
                     "concurrent_create",
                     &copy,
                     "remote",
-                    &op,
+                    op,
                     None,
                     Some(remote),
                 )?;
@@ -949,29 +1052,34 @@ fn download(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), String> {
                 ));
             }
             Err(err) => {
-                discard(&stage);
+                let _ = cx.root.unlink(stage);
                 return Err(err.to_string());
             }
         },
         Some(expected) => {
-            recovery::rename_exchange(&stage, &path).map_err(|err| {
-                discard(&stage);
+            failpoint::hit("download:before_exchange");
+            cx.root.exchange(stage, &entry.rel).map_err(|err| {
+                let _ = cx.root.unlink(stage);
                 tr::tr!("Could not replace the local file atomically [{}].", err)
             })?;
+            committed.set(true);
+            failpoint::hit("download:exchanged");
             // `stage` now holds the displaced version.
-            let displaced = fs::symlink_metadata(&stage).map_err(|err| err.to_string())?;
-            let displaced = LocalMeta::from_metadata(&displaced);
+            let displaced = cx
+                .stat_local(stage)?
+                .ok_or_else(|| tr::tr!("The previous version disappeared."))?;
             if displaced.same_after_rename(&expected) {
                 cx.rec().preserve_path(
-                    &stage,
+                    stage,
                     &entry.rel,
                     &expected,
                     &tr::tr!("Replaced by the remote version"),
-                    &op,
+                    op,
                 )?;
             } else {
-                let copy = recovery::conflict_rel(&entry.rel, "local", &op, observe::Stamp::now());
-                recovery::rename_noreplace(&stage, &pair.local_path(&copy))
+                let copy = recovery::conflict_rel(&entry.rel, "local", op, observe::Stamp::now());
+                cx.root
+                    .rename_noreplace(stage, &copy)
                     .map_err(|err| err.to_string())?;
                 record_conflict(
                     cx,
@@ -979,14 +1087,17 @@ fn download(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), String> {
                     "edit_edit",
                     &copy,
                     "local",
-                    &op,
+                    op,
                     Some(&displaced),
                     Some(remote),
                 )?;
             }
         }
     }
-    let local = pair
+    cx.root
+        .sync_file(&entry.rel)
+        .map_err(|err| err.to_string())?;
+    let local = cx
         .stat_local(&entry.rel)?
         .ok_or_else(|| tr::tr!("The local item disappeared after it was downloaded."))?;
     save(pair, &entry.rel, &local, remote, None)
@@ -994,7 +1105,7 @@ fn download(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), String> {
 
 fn create_remote_dir(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
     let pair = cx.pair;
-    expect_local(pair, entry)?;
+    expect_local(cx, entry)?;
     let path = pair.remote_path(&entry.rel);
     if let Some(remote) = expect_remote(pair, entry)? {
         if !remote.is_dir {
@@ -1023,8 +1134,7 @@ fn create_remote_dir(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), St
 fn create_local_dir(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), String> {
     let pair = cx.pair;
     expect_remote(pair, entry)?;
-    let path = pair.local_path(&entry.rel);
-    if let Some(local) = expect_local(pair, entry)? {
+    if let Some(local) = expect_local(cx, entry)? {
         if !local.is_dir {
             let op = recovery::random_id();
             cx.rec().preserve_local(
@@ -1035,13 +1145,9 @@ fn create_local_dir(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), S
             )?;
         }
     }
-    ensure_local_parent(pair, &path)?;
-    match fs::create_dir(&path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(err) => return Err(err.to_string()),
-    }
-    let local = pair
+    ensure_local_parent(cx, &entry.rel)?;
+    cx.root.mkdir(&entry.rel).map_err(|err| err.to_string())?;
+    let local = cx
         .stat_local(&entry.rel)?
         .filter(|local| local.is_dir)
         .ok_or_else(|| tr::tr!("The local folder disappeared after it was created."))?;
@@ -1070,7 +1176,7 @@ fn record(pair: &Pair, entry: &Entry) -> Result<(), String> {
 /// synchronizes the folder and the copy.
 fn keep_both(cx: &Cx, entry: &Entry, kind: ConflictKind) -> Result<(), String> {
     let pair = cx.pair;
-    let local = expect_local(pair, entry)?
+    let local = expect_local(cx, entry)?
         .ok_or_else(|| tr::tr!("The local item changed after it was checked."))?;
     let remote = expect_remote(pair, entry)?
         .ok_or_else(|| tr::tr!("The remote item changed after it was checked."))?;
@@ -1083,20 +1189,36 @@ fn keep_both(cx: &Cx, entry: &Entry, kind: ConflictKind) -> Result<(), String> {
     };
     let side = if move_local { "local" } else { "remote" };
     let copy = recovery::conflict_rel(&entry.rel, side, &op, now);
-    if pair.stat_local(&copy)?.is_some() || pair.stat_remote(&copy)?.is_some() {
+    if cx.stat_local(&copy)?.is_some() || pair.stat_remote(&copy)?.is_some() {
         return Err(tr::tr!("A conflict copy with this name already exists."));
     }
-    if move_local {
-        recovery::rename_noreplace(&pair.local_path(&entry.rel), &pair.local_path(&copy))
-            .map_err(|err| tr::tr!("Could not rename the local version [{}].", err))?;
+    // Journal the rename so a retry never renames the same conflict twice
+    // and an interruption still leaves a conflict record.
+    let rec = cx.rec();
+    rec.begin(
+        &op,
+        &entry.rel,
+        "keep_both",
+        serde_json::json!({ "copy": copy, "side": side, "kind": kind_name(kind) }),
+    )?;
+    let renamed = if move_local {
+        cx.root
+            .rename_noreplace(&entry.rel, &copy)
+            .map_err(|err| tr::tr!("Could not rename the local version [{}].", err))
     } else {
         rclone::sync::move_on_remote(
             &pair.remote.name,
             &pair.remote_path(&entry.rel),
             &pair.remote_path(&copy),
         )
-        .map_err(|err| tr::tr!("Could not rename the remote version [{}].", err.error))?;
+        .map_err(|err| tr::tr!("Could not rename the remote version [{}].", err.error))
+    };
+    if let Err(err) = renamed {
+        rec.abandon(&op, &err);
+        return Err(err);
     }
+    rec.step(&op, "renamed", None)?;
+    failpoint::hit("keep_both:renamed");
     record_conflict(
         cx,
         &entry.rel,
@@ -1107,13 +1229,14 @@ fn keep_both(cx: &Cx, entry: &Entry, kind: ConflictKind) -> Result<(), String> {
         Some(&local),
         Some(&remote),
     )?;
+    rec.finish(&op)?;
     if local.is_dir != remote.is_dir {
         return Ok(());
     }
     // Copy each version to the side that lacks it now. A failure here is
     // retried by the normal rules: nothing is lost either way.
     if move_local {
-        let moved = pair
+        let moved = cx
             .stat_local(&copy)?
             .ok_or_else(|| tr::tr!("The conflict copy disappeared."))?;
         download(
@@ -1228,13 +1351,15 @@ fn remote_json(meta: &RemoteMeta) -> serde_json::Value {
     })
 }
 
-fn ensure_local_parent(pair: &Pair, path: &Path) -> Result<(), String> {
-    let parent = path.parent().ok_or("Invalid local path")?;
-    validate_local_path(Path::new(&pair.dir.local_path), parent)?;
-    match fs::symlink_metadata(parent) {
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(tr::tr!("The containing folder is not a folder.")),
-        Err(_) => Err(tr::tr!("Waiting for the containing folder to be created.")),
+fn ensure_local_parent(cx: &Cx, rel: &str) -> Result<(), String> {
+    let Some((parent, _)) = rel.rsplit_once('/') else {
+        return Ok(());
+    };
+    match cx.stat_local(parent) {
+        Ok(Some(meta)) if meta.is_dir => Ok(()),
+        Ok(Some(_)) => Err(tr::tr!("The containing folder is not a folder.")),
+        Ok(None) => Err(tr::tr!("Waiting for the containing folder to be created.")),
+        Err(err) => Err(err),
     }
 }
 
@@ -1443,28 +1568,15 @@ pub fn is_ignored(relative: &str, patterns: &[glob::Pattern]) -> bool {
     }
 }
 
-pub fn validate_local_path(root: &Path, path: &Path) -> Result<(), String> {
-    let relative = path.strip_prefix(root).map_err(|err| err.to_string())?;
-    let mut current = root.to_path_buf();
-    for part in relative.components() {
-        current.push(part);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err("Symbolic links inside a synced folder are not followed".into());
-            }
-            Ok(_) => {}
-            Err(err) if missing(&err) => break,
-            Err(err) => return Err(err.to_string()),
-        }
-    }
-    Ok(())
-}
-
 /// The pair's internal folder and recovery store, for actions outside a pass.
 fn context<'a>(pair: &'a Pair<'a>) -> Result<Cx<'a>, String> {
+    let internal = recovery::ensure_internal(pair.db, pair.dir)?;
+    let root = Root::open(Path::new(&pair.dir.local_path), None)
+        .map_err(|err| format!("Local sync folder is unavailable: {err}"))?;
     Ok(Cx {
         pair,
-        internal: recovery::ensure_internal(pair.db, pair.dir)?,
+        internal,
+        root,
         remote_free: Cell::new(None),
     })
 }
@@ -1472,7 +1584,9 @@ fn context<'a>(pair: &'a Pair<'a>) -> Result<Cx<'a>, String> {
 /// A token for what both sides of `rel` look like now, shown with an action
 /// so the action can be refused once either side changes.
 pub fn item_token(pair: &Pair, rel: &str) -> Result<String, String> {
-    let local = pair.stat_local(rel)?.map_or(Obs::Missing, Obs::Present);
+    let local = context(pair)?
+        .stat_local(rel)?
+        .map_or(Obs::Missing, Obs::Present);
     let remote = pair.stat_remote(rel)?.map_or(Obs::Missing, Obs::Present);
     Ok(observe::content_token(&local, &remote))
 }
@@ -1481,7 +1595,7 @@ pub fn item_token(pair: &Pair, rel: &str) -> Result<String, String> {
 /// versions first. Refused when either side changed since `token`.
 pub fn delete_everywhere(pair: &Pair, rel: &str, token: &str) -> Result<(), String> {
     let cx = context(pair)?;
-    let local = pair.stat_local(rel)?;
+    let local = cx.stat_local(rel)?;
     let remote = pair.stat_remote(rel)?;
     let local_obs = local.map_or(Obs::Missing, Obs::Present);
     let remote_obs = remote.clone().map_or(Obs::Missing, Obs::Present);
@@ -1535,43 +1649,59 @@ pub fn restore(pair: &Pair, id: i64) -> Result<String, String> {
         let source = PathBuf::from(&item.stored_path);
         let source_meta = fs::symlink_metadata(&source)
             .map_err(|_| tr::tr!("This preserved version is no longer available."))?;
-        let current = pair.stat_local(&rel)?;
+        let current = cx.stat_local(&rel)?;
         if current.is_some_and(|meta| meta.is_dir) {
             return Err(tr::tr!("A folder now has this name; rename it first."));
         }
-        let path = pair.local_path(&rel);
-        let parent = path.parent().ok_or("Invalid local path")?;
-        validate_local_path(Path::new(&pair.dir.local_path), parent)?;
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-        let stage = cx.internal.staging().join(&op);
-        fs::copy(&source, &stage).map_err(|err| err.to_string())?;
+        if let Some((parent, _)) = rel.rsplit_once('/') {
+            cx.root.mkdir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let rec = cx.rec();
+        let stage = rec.staging_rel(&op);
+        let stage_path = cx.root.path().join(&stage);
+        fs::copy(&source, &stage_path).map_err(|err| err.to_string())?;
         fs::File::options()
             .write(true)
-            .open(&stage)
+            .open(&stage_path)
             .and_then(|file| file.set_modified(source_meta.modified()?))
             .map_err(|err| err.to_string())?;
+        let staged = cx
+            .stat_local(&stage)?
+            .ok_or_else(|| tr::tr!("The restored copy disappeared."))?;
+        rec.begin(
+            &op,
+            &rel,
+            "download",
+            serde_json::json!({ "stage": stage, "stageInode": staged.inode }),
+        )?;
         match current {
             Some(expected) => {
-                recovery::rename_exchange(&stage, &path).map_err(|err| err.to_string())?;
-                let displaced = LocalMeta::from_metadata(
-                    &fs::symlink_metadata(&stage).map_err(|err| err.to_string())?,
-                );
+                if let Err(err) = cx.root.exchange(&stage, &rel) {
+                    let _ = cx.root.unlink(&stage);
+                    rec.abandon(&op, &err.to_string());
+                    return Err(err.to_string());
+                }
+                let displaced = cx
+                    .stat_local(&stage)?
+                    .ok_or_else(|| tr::tr!("The previous version disappeared."))?;
                 if displaced.same_after_rename(&expected) {
-                    cx.rec()
-                        .preserve_path(&stage, &rel, &expected, &reason, &op)?;
+                    rec.preserve_path(&stage, &rel, &expected, &reason, &op)?;
                 } else {
                     let copy = recovery::conflict_rel(&rel, "local", &op, observe::Stamp::now());
-                    recovery::rename_noreplace(&stage, &pair.local_path(&copy))
+                    cx.root
+                        .rename_noreplace(&stage, &copy)
                         .map_err(|err| err.to_string())?;
                 }
             }
             None => {
-                recovery::rename_noreplace(&stage, &path).map_err(|err| {
-                    let _ = fs::remove_file(&stage);
-                    err.to_string()
-                })?;
+                if let Err(err) = cx.root.rename_noreplace(&stage, &rel) {
+                    let _ = cx.root.unlink(&stage);
+                    rec.abandon(&op, &err.to_string());
+                    return Err(err.to_string());
+                }
             }
         }
+        rec.finish(&op)?;
     } else {
         let current = pair.stat_remote(&rel)?;
         if current.as_ref().is_some_and(|meta| meta.is_dir) {

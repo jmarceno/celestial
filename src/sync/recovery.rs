@@ -8,12 +8,14 @@
 //! visible to other clients of the account. Provider trash is never relied
 //! on.
 
+use super::failpoint;
+use super::localfs::Root;
 use super::observe::{LocalMeta, RemoteMeta, Stamp};
 use super::store::{self, RecoveryItem};
 use crate::entities::{RemotesModel, SyncDirsModel};
 use crate::rclone;
-use nix::fcntl::{RenameFlags, renameat2};
 use sea_orm::DatabaseConnection;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -215,22 +217,13 @@ pub fn conflict_origin(rel: &str) -> Option<(String, String)> {
     Some((origin, stamp.to_owned()))
 }
 
-/// Rename without replacing anything at the destination.
-pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    renameat2(None, from, None, to, RenameFlags::RENAME_NOREPLACE).map_err(std::io::Error::from)
-}
-
-/// Swap two existing paths atomically.
-pub fn rename_exchange(first: &Path, second: &Path) -> std::io::Result<()> {
-    renameat2(None, first, None, second, RenameFlags::RENAME_EXCHANGE).map_err(std::io::Error::from)
-}
-
 /// Where everything for one pair lives.
 pub struct Store<'a> {
     pub db: &'a DatabaseConnection,
     pub remote: &'a RemotesModel,
     pub dir: &'a SyncDirsModel,
     pub internal: &'a Internal,
+    pub root: &'a Root,
 }
 
 impl Store<'_> {
@@ -238,9 +231,53 @@ impl Store<'_> {
         format!("{}-{}", Stamp::now().secs, op)
     }
 
+    /// The staging path of an operation, relative to the pair root.
+    pub fn staging_rel(&self, op: &str) -> String {
+        format!("{}/staging/{op}", self.internal.name)
+    }
+
     /// The remote folder that keeps this pair's preserved versions.
     pub fn remote_root(&self) -> String {
         format!("{REMOTE_RECOVERY_ROOT}/{}", self.internal.pair_uuid)
+    }
+
+    fn absolute(&self, rel: &str) -> String {
+        self.root.path().join(rel).display().to_string()
+    }
+
+    // ------------------------------------------------------------ journal
+
+    /// Record an operation before it changes anything.
+    pub fn begin(&self, op: &str, rel: &str, action: &str, payload: Value) -> Result<(), String> {
+        store::insert_operation(
+            self.db,
+            &store::Operation {
+                id: op.to_owned(),
+                sync_dir_id: self.dir.id,
+                pair_uuid: self.internal.pair_uuid.clone(),
+                rel: rel.to_owned(),
+                action: action.to_owned(),
+                state: "planned".into(),
+                payload,
+            },
+        )
+        .map_err(|err| format!("Could not record the operation: {err}"))
+    }
+
+    pub fn step(&self, op: &str, state: &str, payload: Option<&Value>) -> Result<(), String> {
+        store::update_operation(self.db, op, state, payload, None)
+            .map_err(|err| format!("Could not record the operation: {err}"))
+    }
+
+    pub fn finish(&self, op: &str) -> Result<(), String> {
+        self.step(op, "complete", None)
+    }
+
+    /// Mark an operation that stopped before changing anything durable.
+    pub fn abandon(&self, op: &str, error: &str) {
+        if let Err(err) = store::update_operation(self.db, op, "failed", None, Some(error)) {
+            tracing::warn!("could not record a failed operation: {err}");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -283,49 +320,72 @@ impl Store<'_> {
         reason: &str,
         op: &str,
     ) -> Result<RecoveryItem, String> {
-        let source = Path::new(&self.dir.local_path).join(rel);
-        self.preserve_path(&source, rel, expected, reason, op)
+        self.preserve_path(rel, rel, expected, reason, op)
     }
 
-    /// Preserve the file at `source` (inside the pair) as a version of `rel`.
+    /// Preserve the file at `source` (relative to the pair root) as a version
+    /// of `rel`. The move is journaled first, so an interruption at any point
+    /// leaves a version that the replay records rather than loses.
     pub fn preserve_path(
         &self,
-        source: &Path,
+        source: &str,
         rel: &str,
         expected: &LocalMeta,
         reason: &str,
         op: &str,
     ) -> Result<RecoveryItem, String> {
-        let target = self
-            .internal
-            .recovery()
-            .join(self.version_folder(op))
-            .join(rel);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        let target = format!(
+            "{}/recovery/{}/{rel}",
+            self.internal.name,
+            self.version_folder(op)
+        );
+        let current = self
+            .root
+            .lstat(source)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| tr::tr!("The local item changed after it was checked."))?;
+        if current.device != self.internal.identity.0 {
+            return Err(tr::tr!(
+                "This item is on another filesystem than the sync folder; it is paused so it can be preserved before it is replaced."
+            ));
         }
-        same_filesystem(source, &self.internal.path)?;
-        rename_noreplace(source, &target)
-            .map_err(|err| tr::tr!("Could not move the previous version aside [{}].", err))?;
-        let moved = fs::symlink_metadata(&target).map_err(|err| err.to_string())?;
-        if !LocalMeta::from_metadata(&moved).same_after_rename(expected) {
+        if let Some((parent, _)) = target.rsplit_once('/') {
+            self.root.mkdir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let journal_id = format!("{op}-keep-{}", random_id());
+        self.begin(
+            &journal_id,
+            rel,
+            "preserve_local",
+            json!({ "source": source, "target": target, "reason": reason, "op": op }),
+        )?;
+        failpoint::hit("preserve_local:before_move");
+        if let Err(err) = self.root.rename_noreplace(source, &target) {
+            self.abandon(&journal_id, &err.to_string());
+            return Err(tr::tr!(
+                "Could not move the previous version aside [{}].",
+                err
+            ));
+        }
+        failpoint::hit("preserve_local:after_move");
+        let moved = self.root.lstat(&target).ok().flatten();
+        if !moved.is_some_and(|moved| moved.same_after_rename(expected)) {
             // Something else was at the path by then: leave it where it was.
-            let _ = rename_noreplace(&target, source);
+            let _ = self.root.rename_noreplace(&target, source);
+            self.abandon(&journal_id, "changed before it was preserved");
             return Err(tr::tr!("The local item changed after it was checked."));
         }
-        self.record(
+        let item = self.record(
             rel,
             "local",
-            target.display().to_string(),
+            self.absolute(&target),
             reason,
             op,
             Some(i64::try_from(expected.size).unwrap_or(i64::MAX)),
             Some(expected.mtime.secs),
-        )
-        .inspect_err(|_| {
-            // Unrecorded preservation would be invisible: put it back.
-            let _ = rename_noreplace(&target, source);
-        })
+        )?;
+        self.finish(&journal_id)?;
+        Ok(item)
     }
 
     /// Move a remote file into the remote recovery folder (server-side when
@@ -343,31 +403,189 @@ impl Store<'_> {
     ) -> Result<(RecoveryItem, RemoteMeta), String> {
         let source = store::item_paths(self.dir, rel).1;
         let target = format!("{}/{}/{rel}", self.remote_root(), self.version_folder(op));
-        rclone::sync::move_on_remote(&self.remote.name, &source, &target)
-            .map_err(|err| tr::tr!("Could not move the previous version aside [{}].", err))?;
+        let journal_id = format!("{op}-keep-{}", random_id());
+        self.begin(
+            &journal_id,
+            rel,
+            "preserve_remote",
+            json!({ "source": source, "target": target, "reason": reason, "op": op }),
+        )?;
+        failpoint::hit("preserve_remote:before_move");
+        if let Err(err) = rclone::sync::move_on_remote(&self.remote.name, &source, &target) {
+            self.abandon(&journal_id, &err.error);
+            return Err(tr::tr!(
+                "Could not move the previous version aside [{}].",
+                err
+            ));
+        }
+        failpoint::hit("preserve_remote:after_move");
         let moved = rclone::sync::stat_with(&self.remote.name, &target, hash_opts)
             .map_err(|err| err.error)?
             .map(|item| RemoteMeta::from_item(&item, hash_type))
             .ok_or_else(|| tr::tr!("The preserved remote version could not be found."))?;
-        let item = self
-            .record(
-                rel,
-                "remote",
-                target.clone(),
-                reason,
-                op,
-                Some(moved.size),
-                Some(moved.mtime.secs),
-            )
-            .inspect_err(|_| {
-                if matches!(rclone::sync::stat(&self.remote.name, &source), Ok(None)) {
-                    let _ = rclone::sync::move_on_remote(&self.remote.name, &target, &source);
-                }
-            })?;
+        let item = self.record(
+            rel,
+            "remote",
+            target,
+            reason,
+            op,
+            Some(moved.size),
+            Some(moved.mtime.secs),
+        )?;
+        self.finish(&journal_id)?;
         if &moved != expected {
             tracing::warn!(rel, "remote item changed before it was preserved");
         }
         Ok((item, moved))
+    }
+
+    // ------------------------------------------------------------- replay
+
+    /// Finish or undo operations interrupted by a crash, a kill or a failed
+    /// database write. Every step is idempotent. Anything that cannot be
+    /// proven safe stays journaled and is reported.
+    pub fn replay(&self) -> Result<usize, String> {
+        let ops = store::incomplete_operations(self.db, Some(self.dir.id))
+            .map_err(|err| err.to_string())?;
+        let mut replayed = 0;
+        for op in &ops {
+            let text = |key: &str| op.payload[key].as_str().unwrap_or_default().to_owned();
+            match op.action.as_str() {
+                "preserve_local" => {
+                    let target = text("target");
+                    let recorded =
+                        store::recovery_for_op(self.db, &text("op"), &self.absolute(&target))
+                            .map_err(|err| err.to_string())?;
+                    match self.root.lstat(&target).map_err(|err| err.to_string())? {
+                        Some(meta) if !recorded => {
+                            self.record(
+                                &op.rel,
+                                "local",
+                                self.absolute(&target),
+                                &text("reason"),
+                                &text("op"),
+                                Some(i64::try_from(meta.size).unwrap_or(i64::MAX)),
+                                Some(meta.mtime.secs),
+                            )?;
+                            self.finish(&op.id)?;
+                        }
+                        Some(_) => self.finish(&op.id)?,
+                        None => self.abandon(&op.id, "interrupted before the move"),
+                    }
+                }
+                "preserve_remote" => {
+                    let target = text("target");
+                    let recorded = store::recovery_for_op(self.db, &text("op"), &target)
+                        .map_err(|err| err.to_string())?;
+                    match rclone::sync::stat(&self.remote.name, &target).map_err(|err| err.error)? {
+                        Some(item) if !recorded => {
+                            self.record(
+                                &op.rel,
+                                "remote",
+                                target,
+                                &text("reason"),
+                                &text("op"),
+                                Some(item.size),
+                                Some(item.mod_time.unix_timestamp()),
+                            )?;
+                            self.finish(&op.id)?;
+                        }
+                        Some(_) => self.finish(&op.id)?,
+                        None => self.abandon(&op.id, "interrupted before the move"),
+                    }
+                }
+                "download" => {
+                    let stage = text("stage");
+                    let staged_inode = op.payload["stageInode"].as_u64();
+                    let dest = self.root.lstat(&op.rel).map_err(|err| err.to_string())?;
+                    let committed = staged_inode.is_some()
+                        && dest.is_some_and(|dest| Some(dest.inode) == staged_inode);
+                    match self.root.lstat(&stage).map_err(|err| err.to_string())? {
+                        // After an exchange the stage holds the displaced
+                        // version: preserve it.
+                        Some(displaced) if committed => {
+                            self.preserve_path(
+                                &stage,
+                                &op.rel,
+                                &displaced,
+                                &tr::tr!("Replaced by the remote version"),
+                                &op.id,
+                            )?;
+                        }
+                        // The download never reached the item: discard it.
+                        Some(_) => {
+                            let _ = self.root.unlink(&stage);
+                        }
+                        None => {}
+                    }
+                    self.abandon(&op.id, "interrupted; the item is checked again");
+                }
+                "upload" => {
+                    let backup = text("backup");
+                    let destination = text("remote");
+                    if op.state == "preserved"
+                        && !backup.is_empty()
+                        && matches!(
+                            rclone::sync::stat(&self.remote.name, &destination),
+                            Ok(None)
+                        )
+                    {
+                        // The previous version was moved aside but nothing
+                        // replaced it: put it back.
+                        rclone::sync::move_on_remote(&self.remote.name, &backup, &destination)
+                            .map_err(|err| err.error)?;
+                    }
+                    let snapshot = text("snapshot");
+                    if !snapshot.is_empty() {
+                        let _ = self.root.unlink(&snapshot);
+                    }
+                    self.abandon(&op.id, "interrupted; the item is checked again");
+                }
+                "keep_both" => {
+                    if op.state == "renamed"
+                        && !store::conflict_for_op(self.db, &op.id)
+                            .map_err(|err| err.to_string())?
+                    {
+                        store::insert_conflict(
+                            self.db,
+                            self.dir.id,
+                            &self.internal.pair_uuid,
+                            &op.rel,
+                            &text("kind"),
+                            &json!({ "rel": op.rel, "copy": text("copy"), "copySide": text("side") })
+                                .to_string(),
+                            Some(&text("copy")),
+                            &op.id,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                    if op.state == "renamed" {
+                        self.finish(&op.id)?;
+                    } else {
+                        self.abandon(&op.id, "interrupted before the rename");
+                    }
+                }
+                other => {
+                    return Err(tr::tr!(
+                        "An interrupted operation of an unknown kind ({}) needs attention.",
+                        other
+                    ));
+                }
+            }
+            replayed += 1;
+        }
+        // Every interrupted operation is resolved, so whatever is left in
+        // staging (including rclone's own partial files) is a download that
+        // never replaced anything: it is disposable.
+        if let Ok(entries) = fs::read_dir(self.internal.staging()) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        if replayed > 0 {
+            tracing::info!(replayed, "recovered interrupted operations");
+        }
+        Ok(replayed)
     }
 
     /// Delete preserved versions beyond the retention policy: the newest
@@ -428,23 +646,6 @@ impl Store<'_> {
     }
 }
 
-fn same_filesystem(path: &Path, internal: &Path) -> Result<(), String> {
-    let parent = path.parent().ok_or("Invalid path")?;
-    let parent_dev = fs::symlink_metadata(parent)
-        .map_err(|err| err.to_string())?
-        .dev();
-    let internal_dev = fs::symlink_metadata(internal)
-        .map_err(|err| err.to_string())?
-        .dev();
-    if parent_dev == internal_dev {
-        Ok(())
-    } else {
-        Err(tr::tr!(
-            "This item is on another filesystem than the sync folder; it is paused so it can be preserved before it is replaced."
-        ))
-    }
-}
-
 /// Remove empty folders left under `root` (not `root` itself).
 pub fn remove_empty_dirs(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
@@ -492,15 +693,14 @@ mod tests {
     #[test]
     fn no_replace_rename_refuses_to_overwrite_and_exchange_swaps() {
         let temp = tempfile::tempdir().unwrap();
-        let a = temp.path().join("a");
-        let b = temp.path().join("b");
-        fs::write(&a, "a").unwrap();
-        fs::write(&b, "b").unwrap();
-        assert!(rename_noreplace(&a, &b).is_err());
-        assert_eq!(fs::read_to_string(&b).unwrap(), "b");
-        rename_exchange(&a, &b).unwrap();
-        assert_eq!(fs::read_to_string(&a).unwrap(), "b");
-        assert_eq!(fs::read_to_string(&b).unwrap(), "a");
+        fs::write(temp.path().join("a"), "a").unwrap();
+        fs::write(temp.path().join("b"), "b").unwrap();
+        let root = Root::open(temp.path(), None).unwrap();
+        assert!(root.rename_noreplace("a", "b").is_err());
+        assert_eq!(fs::read_to_string(temp.path().join("b")).unwrap(), "b");
+        root.exchange("a", "b").unwrap();
+        assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "b");
+        assert_eq!(fs::read_to_string(temp.path().join("b")).unwrap(), "a");
     }
 
     #[test]

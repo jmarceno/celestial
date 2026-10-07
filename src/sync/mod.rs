@@ -2,13 +2,13 @@
 
 mod capabilities;
 mod engine;
+mod failpoint;
+mod localfs;
 pub mod model;
 mod observe;
 mod pass;
 mod reconcile;
 mod recovery;
-// The operation journal is used by crash recovery in the next change.
-#[allow(dead_code)]
 mod store;
 #[cfg(test)]
 mod testing;

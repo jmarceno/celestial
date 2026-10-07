@@ -298,11 +298,6 @@ pub mod sync {
         on_remote("operations/rmdir", remote_name, path)
     }
 
-    /// Remove a directory and all of its contents.
-    pub fn purge(remote_name: &str, path: &str) -> Result<(), RcloneError> {
-        on_remote("operations/purge", remote_name, path)
-    }
-
     /// Delete a file.
     pub fn delete(remote_name: &str, path: &str) -> Result<(), RcloneError> {
         on_remote("operations/deletefile", remote_name, path)

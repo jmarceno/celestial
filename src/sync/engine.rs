@@ -1028,15 +1028,24 @@ fn add_dir(
         );
         return;
     }
-    let Some(db_remote) = util::await_future(
+    let db_remote = match util::await_future(
         RemotesEntity::find()
             .filter(RemotesColumn::Name.eq(remote_name))
             .one(db),
-    )
-    .ok()
-    .flatten() else {
-        shared.dialog("error", tr::tr!("Unable to log in"), remote_name.to_owned());
-        return;
+    ) {
+        Ok(Some(remote)) => remote,
+        Ok(None) => {
+            shared.dialog("error", tr::tr!("Unable to log in"), remote_name.to_owned());
+            return;
+        }
+        Err(err) => {
+            shared.dialog(
+                "error",
+                tr::tr!("Unable to read the synchronization settings"),
+                err.to_string(),
+            );
+            return;
+        }
     };
     let local_text = format!("/{}", util::strip_slashes(local_raw));
     let remote_text = util::strip_slashes(remote_raw);
@@ -1071,13 +1080,24 @@ fn add_dir(
             .filter(SyncDirsColumn::RemotePath.eq(remote_text.clone()))
             .one(db),
     );
-    if existing.ok().flatten().is_some() {
-        shared.dialog(
-            "error",
-            tr::tr!("The specified directory pair is already being synced"),
-            "",
-        );
-        return;
+    match existing {
+        Ok(Some(_)) => {
+            shared.dialog(
+                "error",
+                tr::tr!("The specified directory pair is already being synced"),
+                "",
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            shared.dialog(
+                "error",
+                tr::tr!("Unable to read the synchronization settings"),
+                err.to_string(),
+            );
+            return;
+        }
     }
     if !local_path.exists() {
         shared.dialog(
