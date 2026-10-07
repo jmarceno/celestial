@@ -1346,3 +1346,104 @@ fn local_edit_inside_the_download_window_becomes_a_conflict_copy() {
     assert_eq!(f.read_local(&copy), "local edit!!");
     assert_eq!(f.read_remote(&copy), "local edit!!");
 }
+
+#[test]
+fn slow_passes_back_off_the_remote_schedule() {
+    let mut checks = RemoteChecks::default();
+    checks.done_after(1, Duration::from_secs(5));
+    assert!(!checks.due(1));
+    checks.done_after(2, Duration::from_secs(90));
+    assert_eq!(checks.0[&2].1, Duration::from_secs(180));
+    assert_eq!(checks.0[&1].1, REMOTE_CHECK_INTERVAL);
+}
+
+#[test]
+fn quiet_pairs_reuse_their_observation_until_an_event_or_the_remote_check() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    let mut watcher = watch::LocalWatcher::new();
+    watcher.sync_pairs(&[(f.dir.id, f.local.clone())]);
+    let mut schedule = Schedule::default();
+    let (rx_tx, rx) = crossbeam_channel::unbounded();
+    drop(rx_tx);
+    let mut queue = VecDeque::new();
+    let caps = f.caps.clone();
+    let remote = f.remote.clone();
+    let dir = f.dir.clone();
+    let mut run = |f: &mut Fixture, schedule: &mut Schedule, watcher: &mut watch::LocalWatcher| {
+        sync_pair(
+            &f.shared,
+            &f.db,
+            &mut f.model,
+            &rx,
+            &mut queue,
+            &remote,
+            &dir,
+            &caps,
+            watcher,
+            schedule,
+        );
+    };
+    run(&mut f, &mut schedule, &mut watcher);
+    assert!(schedule.local_trees.contains_key(&f.dir.id));
+    // A remote edit is found on the remote schedule without local activity.
+    fs::write(f.remote_file("file.txt"), "remote edit").unwrap();
+    schedule.remote_checks.forget(f.dir.id);
+    run(&mut f, &mut schedule, &mut watcher);
+    assert_eq!(f.read_local("file.txt"), "remote edit");
+    // A local edit is seen through the watcher.
+    thread::sleep(Duration::from_millis(300));
+    run(&mut f, &mut schedule, &mut watcher);
+    fs::write(f.local.join("new.txt"), "new").unwrap();
+    let mut uploaded = false;
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(100));
+        run(&mut f, &mut schedule, &mut watcher);
+        if f.remote_file("new.txt").exists() {
+            uploaded = true;
+            break;
+        }
+    }
+    assert!(uploaded);
+}
+
+#[test]
+fn atomic_save_storms_converge_to_the_last_version() {
+    let mut f = Fixture::new();
+    f.seed("doc.txt");
+    for round in 0..50 {
+        let temp = f.local.join(format!(".doc.txt.tmp{round}"));
+        fs::write(&temp, format!("version {round}")).unwrap();
+        fs::rename(&temp, f.local.join("doc.txt")).unwrap();
+    }
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_remote("doc.txt"), "version 49");
+    assert_eq!(conflicts(&f), 0);
+    assert!(
+        !fs::read_dir(f.remote_root.join("sandbox"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp"))
+    );
+}
+
+#[test]
+fn an_offline_remote_pauses_the_pair_and_recovers_without_action() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    let sandbox = f.remote_root.join("sandbox");
+    let away = f.remote_root.join("away");
+    fs::rename(&sandbox, &away).unwrap();
+    fs::write(f.local.join("file.txt"), "edited offline").unwrap();
+    f.pass();
+    assert_eq!(f.model.error_dir_count(), 1);
+    assert_eq!(f.read_local("file.txt"), "edited offline");
+    fs::rename(&away, &sandbox).unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_remote("file.txt"), "edited offline");
+}

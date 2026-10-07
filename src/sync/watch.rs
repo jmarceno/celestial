@@ -21,13 +21,34 @@ use std::time::{Duration, Instant};
 const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// How long to wait before retrying a watch that failed or hit the limit.
 const RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// A burst of events (an atomic save, a build, an unpacked archive) is
+/// complete once nothing arrived for this long...
+pub const QUIET_WINDOW: Duration = Duration::from_millis(250);
+/// ...or once it has lasted this long, so a continuous writer cannot
+/// postpone synchronization forever. A file still being written is then
+/// retried by the pass, never copied unstable.
+pub const MAX_DELAY: Duration = Duration::from_secs(2);
 
 struct PairState {
     root: PathBuf,
+    /// Celestial's own internal folder: its events are not changes.
+    internal: Option<PathBuf>,
     /// An event arrived since the last check.
     dirty: bool,
+    /// The first and the latest event of the current burst.
+    burst: Option<(Instant, Instant)>,
     /// When a full scan last found the local tree matching the history.
     verified_at: Option<Instant>,
+}
+
+impl PairState {
+    fn touch(&mut self, now: Instant) {
+        self.dirty = true;
+        self.burst = Some(match self.burst {
+            Some((first, _)) => (first, now),
+            None => (now, now),
+        });
+    }
 }
 
 #[derive(Default)]
@@ -41,8 +62,9 @@ struct Hints {
 
 impl Hints {
     fn mark_all(&mut self) {
+        let now = Instant::now();
         for pair in self.pairs.values_mut() {
-            pair.dirty = true;
+            pair.touch(now);
         }
     }
 }
@@ -90,7 +112,9 @@ impl LocalWatcher {
             for (id, root) in pairs {
                 let pair = hints.pairs.entry(*id).or_insert_with(|| PairState {
                     root: root.clone(),
+                    internal: None,
                     dirty: true,
+                    burst: None,
                     verified_at: None,
                 });
                 if pair.root != *root {
@@ -150,9 +174,30 @@ impl LocalWatcher {
                 .is_some_and(|at| at.elapsed() < FULL_SCAN_INTERVAL);
         if !unchanged {
             pair.dirty = false;
+            pair.burst = None;
             pair.verified_at = None;
         }
         unchanged
+    }
+
+    /// Events inside `path` (the pair's internal folder) are Celestial's own
+    /// staging and recovery writes, not changes to synchronize.
+    pub fn ignore_internal(&mut self, id: i32, path: PathBuf) {
+        if let Some(pair) = lock(&self.hints).pairs.get_mut(&id) {
+            pair.internal = Some(path);
+        }
+    }
+
+    /// Whether the pair is in the middle of a burst of events: wait for it to
+    /// end (or reach [`MAX_DELAY`]) before scanning.
+    pub fn settling(&self, id: i32, now: Instant) -> bool {
+        lock(&self.hints)
+            .pairs
+            .get(&id)
+            .and_then(|pair| pair.burst)
+            .is_some_and(|(first, last)| {
+                now.duration_since(last) < QUIET_WINDOW && now.duration_since(first) < MAX_DELAY
+            })
     }
 
     /// A full scan found the pair's local tree matching its history.
@@ -183,6 +228,7 @@ impl LocalWatcher {
                 for pair in lock(&self.hints).pairs.values_mut() {
                     if pair.root == *root {
                         pair.dirty = true;
+                        pair.burst = None;
                         pair.verified_at = None;
                     }
                 }
@@ -254,15 +300,26 @@ fn handle_event(hints: &Mutex<Hints>, result: notify::Result<Event>) {
                 event.kind,
                 EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
             );
+            let now = Instant::now();
             for path in &event.paths {
                 if root_lost && hints.pairs.values().any(|pair| pair.root == *path) {
                     hints.lost_roots.insert(path.clone());
                 }
                 let mut matched = false;
+                // Every pair whose root contains the path is affected: pairs
+                // sharing a root, nested roots, and a change to a pair's
+                // exclusion rules.
                 for pair in hints.pairs.values_mut() {
                     if path.starts_with(&pair.root) {
-                        pair.dirty = true;
                         matched = true;
+                        if pair
+                            .internal
+                            .as_ref()
+                            .is_some_and(|internal| path.starts_with(internal))
+                        {
+                            continue;
+                        }
+                        pair.touch(now);
                     }
                 }
                 if !matched {
@@ -398,6 +455,80 @@ mod tests {
         watcher.mark_verified(1);
         fs::write(root.join("file.txt"), "edit").unwrap();
         assert!(wait_for_change(&mut watcher, &root));
+    }
+
+    #[test]
+    fn an_event_during_a_scan_leaves_the_pair_dirty() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut watcher = watched(temp.path());
+        fs::write(temp.path().join("a"), "x").unwrap();
+        assert!(wait_for_change(&mut watcher, temp.path()));
+        // The scan starts (the check above), an edit lands while it runs,
+        // and the scan then reports the tree verified.
+        fs::write(temp.path().join("b"), "during the scan").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        watcher.mark_verified(1);
+        assert!(!watcher.local_unchanged(1, temp.path()));
+    }
+
+    #[test]
+    fn bursts_are_debounced_with_a_maximum_delay() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut watcher = watched(temp.path());
+        let start = Instant::now();
+        {
+            let mut hints = lock(&watcher.hints);
+            let pair = hints.pairs.get_mut(&1).unwrap();
+            pair.touch(start);
+        }
+        assert!(watcher.settling(1, start + Duration::from_millis(100)));
+        assert!(!watcher.settling(1, start + QUIET_WINDOW));
+        {
+            let mut hints = lock(&watcher.hints);
+            let pair = hints.pairs.get_mut(&1).unwrap();
+            pair.burst = Some((start, start + Duration::from_millis(1900)));
+        }
+        // Still writing, but the burst has lasted long enough.
+        assert!(watcher.settling(1, start + Duration::from_millis(1950)));
+        assert!(!watcher.settling(1, start + MAX_DELAY));
+        assert!(!watcher.local_unchanged(1, temp.path()));
+        assert!(!watcher.settling(1, start + Duration::from_millis(1950)));
+    }
+
+    #[test]
+    fn internal_folder_writes_do_not_mark_the_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let internal = temp.path().join(".celestial-test");
+        fs::create_dir(&internal).unwrap();
+        let mut watcher = watched(temp.path());
+        watcher.ignore_internal(1, internal.clone());
+        fs::write(internal.join("staged"), "x").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(watcher.local_unchanged(1, temp.path()));
+        fs::write(temp.path().join(model_rules()), "*.tmp").unwrap();
+        assert!(wait_for_change(&mut watcher, temp.path()));
+    }
+
+    fn model_rules() -> &'static str {
+        crate::sync::model::FILE_IGNORE_NAME
+    }
+
+    #[test]
+    fn nested_roots_are_both_marked() {
+        let temp = tempfile::tempdir().unwrap();
+        let inner = temp.path().join("inner");
+        fs::create_dir(&inner).unwrap();
+        let mut watcher = LocalWatcher::new();
+        watcher.sync_pairs(&[(1, temp.path().to_path_buf()), (2, inner.clone())]);
+        for (id, root) in [(1, temp.path()), (2, inner.as_path())] {
+            assert!(!watcher.local_unchanged(id, root));
+            watcher.mark_verified(id);
+        }
+        thread::sleep(Duration::from_millis(100));
+        fs::write(inner.join("file"), "x").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(!watcher.local_unchanged(1, temp.path()));
+        assert!(!watcher.local_unchanged(2, &inner));
     }
 
     #[test]

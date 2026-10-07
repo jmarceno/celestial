@@ -81,6 +81,8 @@ struct Schedule {
     retries: HashMap<i32, i64>,
     /// Local observations a quiet watcher vouches for, by pair.
     local_trees: HashMap<i32, LocalTree>,
+    /// A pair is waiting for a burst of local events to end.
+    settling: bool,
 }
 
 impl Schedule {
@@ -144,6 +146,14 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
     let mut prompted_login = false;
     let mut watcher = watch::LocalWatcher::new();
     let mut schedule = Schedule::default();
+    // Items waiting for a retry are retried once after a restart.
+    if let Err(err) = store::exec(
+        &db,
+        "UPDATE item_states SET next_attempt = ? WHERE state = 'retrying'",
+        vec![store::now().into()],
+    ) {
+        tracing::warn!("could not schedule retries after the restart: {err}");
+    }
 
     loop {
         pump(&rx, &mut queue);
@@ -289,7 +299,9 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         if shared.quit_requested() {
             break;
         }
-        wait_command(&rx, &mut queue, Duration::from_millis(500));
+        let pause = if schedule.settling { 100 } else { 500 };
+        schedule.settling = false;
+        wait_command(&rx, &mut queue, Duration::from_millis(pause));
     }
     Ok(())
 }
@@ -310,6 +322,12 @@ fn sync_pair(
     schedule: &mut Schedule,
 ) {
     let id = sync_dir.id;
+    // Let a burst of writes (an atomic save, an unpacked archive) finish
+    // before scanning, up to a maximum delay.
+    if watcher.settling(id, Instant::now()) {
+        schedule.settling = true;
+        return;
+    }
     let local_quiet = watcher.local_unchanged(id, Path::new(&sync_dir.local_path));
     if !local_quiet {
         schedule.local_trees.remove(&id);
@@ -358,8 +376,12 @@ fn sync_pair(
         remote_name: &remote.name,
         sync_dir,
     };
+    let started = Instant::now();
     let result = pass::run(&pair, &mut hooks, cached);
-    schedule.remote_checks.done(id);
+    schedule.remote_checks.done_after(id, started.elapsed());
+    if let Ok(Some((name, _))) = store::internal_dir(db, id) {
+        watcher.ignore_internal(id, Path::new(&sync_dir.local_path).join(name));
+    }
     match result {
         Err(message) => {
             tracing::warn!(pair = %sync_dir.local_path, "pass stopped: {message}");
@@ -1198,19 +1220,35 @@ pub(super) fn pair_roots_available(
 /// changes are still picked up on the next pass.
 const REMOTE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
-/// When each pair's remote folder was last listed successfully.
+/// When each pair's remote folder was last checked, and how long to wait
+/// before the next check.
 #[derive(Default)]
-struct RemoteChecks(HashMap<i32, Instant>);
+struct RemoteChecks(HashMap<i32, (Instant, Duration)>);
 
 impl RemoteChecks {
     fn due(&self, id: i32) -> bool {
         self.0
             .get(&id)
-            .is_none_or(|at| at.elapsed() >= REMOTE_CHECK_INTERVAL)
+            .is_none_or(|(at, interval)| at.elapsed() >= *interval)
     }
 
     fn done(&mut self, id: i32) {
-        self.0.insert(id, Instant::now());
+        self.0.insert(id, (Instant::now(), REMOTE_CHECK_INTERVAL));
+    }
+
+    /// A pass took `took`: a slow remote is checked less often instead of
+    /// overrunning its schedule.
+    fn done_after(&mut self, id: i32, took: Duration) {
+        let interval = REMOTE_CHECK_INTERVAL.max(took.saturating_mul(2));
+        if interval > REMOTE_CHECK_INTERVAL {
+            tracing::info!(
+                pair = id,
+                ?took,
+                ?interval,
+                "slow pass; checking the remote less often"
+            );
+        }
+        self.0.insert(id, (Instant::now(), interval));
     }
 
     fn forget(&mut self, id: i32) {
