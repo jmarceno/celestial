@@ -1551,7 +1551,10 @@ fn sync_local_directory(
         };
 
         if let Some(db_model) = db_item {
-            if local_utc_timestamp > db_model.last_local_timestamp as u64
+            // Any difference from the baseline is a change, including a
+            // timestamp that moved backwards because an older version was restored.
+            let local_changed = local_utc_timestamp != db_model.last_local_timestamp as u64;
+            if local_changed
                 && remote_utc_timestamp.is_some_and(|remote_timestamp| {
                     remote_timestamp != db_model.last_remote_timestamp as i64
                 })
@@ -1567,7 +1570,7 @@ fn sync_local_directory(
                         );
                     }
                 }
-            } else if local_utc_timestamp > db_model.last_local_timestamp as u64 {
+            } else if local_changed {
                 if let Ok(rclone_item) = push_local(
                     item.file_type().ok(),
                     &item,
@@ -1600,7 +1603,7 @@ fn sync_local_directory(
                     );
                 }
             } else if let Some(remote_timestamp) = remote_utc_timestamp.filter(|remote_timestamp| {
-                *remote_timestamp > db_model.last_remote_timestamp as i64
+                *remote_timestamp != db_model.last_remote_timestamp as i64
             }) {
                 if pull_local(
                     item.file_type().ok(),
@@ -1634,9 +1637,7 @@ fn sync_local_directory(
                         );
                     }
                 }
-            } else if remote_item.is_none()
-                && local_utc_timestamp == db_model.last_local_timestamp as u64
-            {
+            } else if remote_item.is_none() {
                 let removed = if item.path().is_dir() {
                     remove_unchanged_local(db, sync_dir, Path::new(&local_path))
                 } else {
@@ -1647,35 +1648,6 @@ fn sync_local_directory(
                     continue;
                 }
                 delete_db_entry(db, sync_dir.id, &local_path, &remote_path);
-            } else if local_utc_timestamp == db_model.last_local_timestamp as u64
-                && remote_utc_timestamp.is_some_and(|remote_timestamp| {
-                    remote_timestamp == db_model.last_remote_timestamp as i64
-                })
-            {
-            } else if local_utc_timestamp == db_model.last_local_timestamp as u64
-                && remote_utc_timestamp.is_some_and(|remote_timestamp| {
-                    remote_timestamp < db_model.last_remote_timestamp as i64
-                })
-            {
-                let remote_timestamp = remote_utc_timestamp.unwrap_or(0);
-                save_baseline(
-                    db,
-                    model,
-                    shared,
-                    remote,
-                    sync_dir,
-                    &db_model,
-                    i32::try_from(local_utc_timestamp).unwrap_or(db_model.last_local_timestamp),
-                    i32::try_from(remote_timestamp).unwrap_or(db_model.last_remote_timestamp),
-                );
-            } else {
-                record_error(
-                    model,
-                    shared,
-                    &remote.name,
-                    sync_dir,
-                    SyncError::General(local_path, "Could not decide which copy is newer".into()),
-                );
             }
         } else if let Some(remote_timestamp) = remote_utc_timestamp {
             let pushed = if local_utc_timestamp > remote_timestamp as u64 {
@@ -2294,10 +2266,12 @@ fn sync_remote_directory(
         };
 
         if let Some(db_model) = db_item {
-            if local_timestamp.is_some_and(|l_timestamp| {
-                l_timestamp > db_model.last_local_timestamp as u64
-                    && remote_timestamp != db_model.last_remote_timestamp as i64
-            }) {
+            // Any difference from the baseline is a change, including a
+            // timestamp that moved backwards because an older version was restored.
+            let local_changed = local_timestamp
+                .is_some_and(|l_timestamp| l_timestamp != db_model.last_local_timestamp as u64);
+            let remote_changed = remote_timestamp != db_model.last_remote_timestamp as i64;
+            if local_changed && remote_changed {
                 if !local_path.is_dir() || !item.is_dir {
                     record_error(
                         model,
@@ -2311,9 +2285,7 @@ fn sync_remote_directory(
                     );
                 }
                 continue;
-            } else if local_timestamp
-                .is_some_and(|l_timestamp| l_timestamp > db_model.last_local_timestamp as u64)
-            {
+            } else if local_changed {
                 if let Some(rclone_item) = push_remote(
                     &item,
                     local_path,
@@ -2351,7 +2323,7 @@ fn sync_remote_directory(
                     );
                 }
                 continue;
-            } else if remote_timestamp > db_model.last_remote_timestamp as i64 {
+            } else if remote_changed {
                 if pull_remote(
                     &item,
                     local_path,
@@ -2388,9 +2360,7 @@ fn sync_remote_directory(
                     }
                 }
                 continue;
-            } else if !local_path.exists()
-                && remote_timestamp == db_model.last_remote_timestamp as i64
-            {
+            } else if !local_path.exists() {
                 let result = if item.is_dir {
                     purge_unchanged_remote(db, sync_dir, remote, &remote_path_string)
                 } else {
@@ -2409,37 +2379,7 @@ fn sync_remote_directory(
                     ),
                 }
                 continue;
-            } else if local_timestamp.is_some_and(|l_timestamp| {
-                l_timestamp == db_model.last_local_timestamp as u64
-                    && remote_timestamp == db_model.last_remote_timestamp as i64
-            }) {
-                continue;
-            } else if let Some(l_timestamp) = local_timestamp.filter(|l_timestamp| {
-                *l_timestamp == db_model.last_local_timestamp as u64
-                    && remote_timestamp < db_model.last_remote_timestamp as i64
-            }) {
-                save_baseline(
-                    db,
-                    model,
-                    shared,
-                    remote,
-                    sync_dir,
-                    &db_model,
-                    i32::try_from(l_timestamp).unwrap_or(db_model.last_local_timestamp),
-                    i32::try_from(remote_timestamp).unwrap_or(db_model.last_remote_timestamp),
-                );
-                continue;
             } else {
-                record_error(
-                    model,
-                    shared,
-                    &remote.name,
-                    sync_dir,
-                    SyncError::General(
-                        remote_path_string.clone(),
-                        "Could not decide which copy is newer".into(),
-                    ),
-                );
                 continue;
             }
         } else if let Some(l_timestamp) = local_timestamp {

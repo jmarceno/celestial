@@ -759,3 +759,53 @@ fn remote_exclusion_file_never_replaces_local_rules() {
     assert_eq!(fs::read_to_string(&remote_rules).unwrap(), "*.other\n");
     assert!(!directory_changed(&f.db, &f.remote, &f.dir).unwrap());
 }
+
+#[test]
+fn restored_older_remote_version_is_downloaded() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::write(f.remote_root.join("sandbox/file.txt"), "restored").unwrap();
+    set_time(&f.remote_root.join("sandbox/file.txt"), 1_600_000_000);
+    f.probed_pass();
+    f.assert_no_errors();
+    assert_eq!(
+        fs::read_to_string(f.local.join("file.txt")).unwrap(),
+        "restored"
+    );
+    assert!(!directory_changed(&f.db, &f.remote, &f.dir).unwrap());
+}
+
+#[test]
+fn restored_older_local_version_is_uploaded() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::write(f.local.join("file.txt"), "restored").unwrap();
+    set_time(&f.local.join("file.txt"), 1_600_000_000);
+    f.probed_pass();
+    f.assert_no_errors();
+    assert_eq!(
+        fs::read_to_string(f.remote_root.join("sandbox/file.txt")).unwrap(),
+        "restored"
+    );
+    assert!(!directory_changed(&f.db, &f.remote, &f.dir).unwrap());
+}
+
+#[test]
+fn older_versions_restored_on_both_sides_are_a_conflict() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::write(f.local.join("file.txt"), "local restore").unwrap();
+    set_time(&f.local.join("file.txt"), 1_600_000_000);
+    fs::write(f.remote_root.join("sandbox/file.txt"), "remote restore").unwrap();
+    set_time(&f.remote_root.join("sandbox/file.txt"), 1_600_000_100);
+    f.probed_pass();
+    assert_eq!(f.model.error_dir_count(), 1);
+    assert_eq!(
+        fs::read_to_string(f.local.join("file.txt")).unwrap(),
+        "local restore"
+    );
+    assert_eq!(
+        fs::read_to_string(f.remote_root.join("sandbox/file.txt")).unwrap(),
+        "remote restore"
+    );
+}
