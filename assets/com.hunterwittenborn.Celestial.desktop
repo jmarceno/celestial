@@ -1,10 +1,10 @@
 [Desktop Entry]
-Name=Celeste
-Exec=celeste
+Name=Celestial
+Exec=celestial
 GenericName=Folder Sync
 Comment=GUI file synchronization client that can connect to virtually any cloud provider
 Keywords=backup;cloud;file sync;sharing;syncing;dropbox;nextcloud;owncloud;google drive;webdav;rclone;proton;proton drive;pcloud
-Icon=com.hunterwittenborn.Celeste
+Icon=com.hunterwittenborn.Celestial
 Type=Application
 Categories=FileTools;FileTransfer;Utility;
 StartupNotify=true

@@ -1,10 +1,10 @@
 import QtQuick
 import QtQuick.Controls
-import app.celeste
+import app.celestial
 
 Button {
     id: root
-    property CelesteTheme theme: CelesteTheme {}
+    property CelestialTheme theme: CelestialTheme {}
     property bool selected: false
     implicitHeight: 38
     leftPadding: 14

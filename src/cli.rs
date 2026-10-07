@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use crate::platform::desktop;
 
 #[derive(Parser, Debug)]
-#[command(name = "celeste", version, about = "Folder sync for cloud storage")]
+#[command(name = "celestial", version, about = "Folder sync for cloud storage")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -35,13 +35,16 @@ pub fn run(cmd: Commands) -> i32 {
         Commands::App => unreachable!("handled in main"),
         Commands::Install { autostart } => {
             let exe = desktop::resolve_binary_path();
+            // Keep login autostart if it was enabled under the former name.
+            let legacy_autostart = desktop::remove_legacy_entries();
             let mut ok = report(desktop::write_menu_entry(&exe), "menu entry");
-            if autostart {
+            if autostart || legacy_autostart {
                 ok &= report(desktop::write_autostart(&exe), "autostart entry");
             }
             if ok { 0 } else { 1 }
         }
         Commands::Uninstall => {
+            desktop::remove_legacy_entries();
             let ok = report_removed(desktop::remove_menu_entry(), "menu entry")
                 & report_removed(desktop::remove_autostart(), "autostart entry");
             if ok { 0 } else { 1 }

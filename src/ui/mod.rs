@@ -12,12 +12,12 @@ use crate::single_instance::{self, AcquireOutcome};
 use crate::ui::controller::{UiBootstrap, install_bootstrap};
 use crate::ui::tray::TrayHandle;
 
-const MAIN_QML: &str = "qrc:/qt/qml/app/celeste/qml/Main.qml";
+const MAIN_QML: &str = "qrc:/qt/qml/app/celestial/qml/Main.qml";
 
 pub fn run(background: bool) -> i32 {
     let guard = match single_instance::acquire() {
         Ok(AcquireOutcome::Secondary) => {
-            eprintln!("Celeste is already running; opened the existing window.");
+            eprintln!("Celestial is already running; opened the existing window.");
             return 0;
         }
         Ok(AcquireOutcome::Primary(guard)) => Some(guard),
@@ -40,7 +40,7 @@ pub fn run(background: bool) -> i32 {
     }
     apply_render_backend_fallback();
 
-    let skip_tray = std::env::var_os("CELESTE_FAKE_TRAY").is_some()
+    let skip_tray = std::env::var_os("CELESTIAL_FAKE_TRAY").is_some()
         || std::env::var("QT_QPA_PLATFORM").ok().as_deref() == Some("offscreen");
     let tray = if skip_tray {
         None
@@ -48,7 +48,7 @@ pub fn run(background: bool) -> i32 {
         match TrayHandle::start() {
             Ok(tray) => Some(Arc::new(tray)),
             Err(err) => {
-                eprintln!("Celeste cannot start without a system tray: {err}");
+                eprintln!("Celestial cannot start without a system tray: {err}");
                 return 1;
             }
         }
@@ -71,7 +71,7 @@ pub fn run(background: bool) -> i32 {
         app.set_application_name(&QString::from(crate::util::APP_NAME));
     }
     let Some(engine) = engine.as_mut() else {
-        eprintln!("Celeste failed to start: Qt QML engine is null.");
+        eprintln!("Celestial failed to start: Qt QML engine is null.");
         return 1;
     };
     engine.load(&QUrl::from(MAIN_QML));
@@ -97,7 +97,7 @@ fn spawn_bootstrap_watchdog() {
             std::thread::sleep(Duration::from_secs(10));
             if controller::is_bootstrap_pending() {
                 eprintln!(
-                    "Celeste failed to start: the QML UI did not load.\n\
+                    "Celestial failed to start: the QML UI did not load.\n\
                      See the QML error above, or `journalctl --user --since '5 minutes ago' | grep -i qml`."
                 );
                 std::process::exit(2);

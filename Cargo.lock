@@ -670,7 +670,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "celeste"
+name = "celestial"
 version = "0.8.3"
 dependencies = [
  "clap 4.5.20",

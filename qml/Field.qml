@@ -1,11 +1,11 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import app.celeste
+import app.celestial
 
 ColumnLayout {
     id: root
-    property CelesteTheme theme: CelesteTheme {}
+    property CelestialTheme theme: CelestialTheme {}
     property string label: ""
     property alias text: field.text
     property bool password: false

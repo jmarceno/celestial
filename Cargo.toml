@@ -1,5 +1,5 @@
 [package]
-name = "celeste"
+name = "celestial"
 version = "0.8.3"
 edition = "2024"
 description = "Folder sync for the cloud providers rclone supports"
@@ -7,11 +7,11 @@ rust-version = "1.85"
 build = "build.rs"
 
 [lib]
-name = "celeste"
+name = "celestial"
 path = "src/lib.rs"
 
 [[bin]]
-name = "celeste"
+name = "celestial"
 path = "src/main.rs"
 
 [dependencies]

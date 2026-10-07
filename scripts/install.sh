@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install a portable .run as ~/.local/bin/celeste plus its menu entry.
+# Install a portable .run as ~/.local/bin/celestial plus its menu entry.
 #
 # Usage:
 #   ./scripts/install.sh [path/to/*-portable.run] [--prefix <dir>] [--autostart]
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-APP=celeste
+APP=celestial
 PREFIX="$HOME/.local"
 RUN_PATH=""
 INSTALL_ARGS=()
@@ -37,6 +37,11 @@ mkdir -p "$PREFIX/bin"
 install -m 0755 "$RUN_PATH" "$TARGET.new"
 mv -f "$TARGET.new" "$TARGET"
 echo "installed: $TARGET"
+# The launcher installed while the app was called Celeste.
+if [[ -f "$PREFIX/bin/celeste" ]]; then
+  rm -f "$PREFIX/bin/celeste"
+  echo "removed former launcher: $PREFIX/bin/celeste"
+fi
 
 # The app writes its own desktop entries pointing at the stable .run path.
 "$TARGET" install "${INSTALL_ARGS[@]}"

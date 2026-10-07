@@ -2,11 +2,11 @@
 # Portable single-file build.
 #
 # Produces one self-extracting executable:
-#   build/portable/Celeste-<version>-x86_64-portable.run
+#   build/portable/Celestial-<version>-x86_64-portable.run
 #
 # The .run embeds the release binary plus its full shared-library closure
 # (Qt, its plugins and QML modules, GL, X11/Wayland client libs, ...). On
-# first launch it extracts to $XDG_CACHE_HOME/celeste-portable/<version>-<hash>/
+# first launch it extracts to $XDG_CACHE_HOME/celestial-portable/<version>-<hash>/
 # and execs the app; later launches reuse that tree. Needs nothing on the
 # host beyond a kernel, glibc and a GPU/display stack.
 #
@@ -24,8 +24,8 @@ PROJECT_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P
 source "$PROJECT_ROOT/scripts/lib/sanitize-host-env.sh"
 sanitize_host_env
 
-APP=celeste
-APP_NAME="Celeste"
+APP=celestial
+APP_NAME="Celestial"
 GLIBC_BASELINE=GLIBC_2.35
 CONTAINER=0
 REBUILD_IMAGE=0
@@ -84,7 +84,7 @@ if [[ "$CONTAINER" -eq 1 ]]; then
     -v "$PROJECT_ROOT:/workspace" \
     ${APP_VERSION:+-e APP_VERSION="$APP_VERSION"} \
     -e PORTABLE_CHOWN_TO="$(id -u):$(id -g)" \
-    -e CELESTE_PACKAGE_STAGED=1 \
+    -e CELESTIAL_PACKAGE_STAGED=1 \
     -w /workspace "$IMAGE" ./scripts/build-portable.sh "${INNER_ARGS[@]}"
   exit $?
 fi
@@ -114,7 +114,7 @@ QMAKE="${QMAKE:-$(command -v qmake6 || command -v qmake || true)}"
 
 # Always re-stage from the remote build: a stale stage is
 # how an old binary ends up in a new bundle.
-if [[ "${CELESTE_PACKAGE_STAGED:-0}" != 1 ]]; then
+if [[ "${CELESTIAL_PACKAGE_STAGED:-0}" != 1 ]]; then
   "$PROJECT_ROOT/scripts/build-native.sh" --release --stage "$STAGE"
 fi
 [[ -x "$STAGE/bin/$APP" ]] || die "staged binary missing at $STAGE/bin/$APP"
@@ -361,7 +361,7 @@ export QT_QPA_PLATFORM_PLUGIN_PATH="$DEST/plugins/platforms"
 export QML2_IMPORT_PATH="$DEST/qml"
 export QML_IMPORT_PATH="$DEST/qml"
 # Stable launcher path for desktop entries (the extraction is versioned).
-export CELESTE_PORTABLE_EXE="$SELF"
+export CELESTIAL_PORTABLE_EXE="$SELF"
 
 exec "$DEST/bin/$APP" "$@"
 __PAYLOAD_FOLLOWS__

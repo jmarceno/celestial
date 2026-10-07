@@ -15,7 +15,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: What version of Celeste are you using?
-      description: Run `celeste --version` to find it.
+      label: What version of Celestial are you using?
+      description: Run `celestial --version` to find it.
     validations:
       required: true

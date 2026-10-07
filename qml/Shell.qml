@@ -2,18 +2,18 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
-import app.celeste
+import app.celestial
 
 ApplicationWindow {
     id: root
     property AppController controller
-    property CelesteTheme theme: CelesteTheme {}
+    property CelestialTheme theme: CelestialTheme {}
     width: 980
     height: 680
     minimumWidth: 860
     minimumHeight: 560
     visible: false
-    title: "Celeste"
+    title: "Celestial"
     color: theme.windowBg
 
     property var snapshot: ({ remotes: [] })
@@ -218,7 +218,7 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     Label {
-                        text: root.selectedRemote() ? root.selectedRemote().name : "Celeste"
+                        text: root.selectedRemote() ? root.selectedRemote().name : "Celestial"
                         color: root.theme.textPrimary
                         font.pixelSize: 22
                         font.bold: true

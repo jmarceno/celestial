@@ -10,7 +10,7 @@ PROJECT_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P
 source "$PROJECT_ROOT/scripts/lib/sanitize-host-env.sh"
 sanitize_host_env
 
-APP=celeste
+APP=celestial
 BUILD_TYPE="debug"
 STAGE=""
 FEATURES=""
@@ -57,8 +57,8 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" \
          "$STAGE/share/icons/hicolor/scalable/apps" "$STAGE/share/doc/$APP"
 install -m 0755 "$BIN" "$STAGE/bin/$APP"
-install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celeste.desktop" "$STAGE/share/applications/com.hunterwittenborn.Celeste.desktop"
-install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celeste-regular.svg" "$STAGE/share/icons/hicolor/scalable/apps/com.hunterwittenborn.Celeste.svg"
+install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celestial.desktop" "$STAGE/share/applications/com.hunterwittenborn.Celestial.desktop"
+install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celestial-regular.svg" "$STAGE/share/icons/hicolor/scalable/apps/com.hunterwittenborn.Celestial.svg"
 for f in LICENSE THIRD_PARTY_LICENSES.md; do
   [[ -f "$PROJECT_ROOT/$f" ]] && install -m 0644 "$PROJECT_ROOT/$f" "$STAGE/share/doc/$APP/$f"
 done

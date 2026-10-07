@@ -1,5 +1,5 @@
 import QtQuick
-import app.celeste
+import app.celestial
 
 // QtObject has no default property. Every child is bound to a property.
 QtObject {

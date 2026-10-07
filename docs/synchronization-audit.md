@@ -5,7 +5,7 @@ This review uses source inspection and disposable local rclone remotes with an i
 ## Confirmed defects repaired
 
 - The single-file removal helper called `operations/delete`, which operates on the remote filesystem. It now calls `operations/deletefile` with the individual path. [rclone RPC reference](https://rclone.org/rc/#operations-deletefile-remove-the-single-file-pointed-to).
-- Normal file uploads/downloads incorrectly treated two files as different types and removed the destination before copying. Celeste no longer deletes the destination before ordinary copies; the missing-source failure regressions preserve the previous copy. Backend behavior during mid-transfer failures still needs integration validation.
+- Normal file uploads/downloads incorrectly treated two files as different types and removed the destination before copying. Celestial no longer deletes the destination before ordinary copies; the missing-source failure regressions preserve the previous copy. Backend behavior during mid-transfer failures still needs integration validation.
 - Unchanged parent-folder timestamps prevented traversal into changed children. Both local and remote child trees are checked independently of the parent's timestamp.
 - Some history, conflict and stop-folder queries omitted the selected sync-pair/account ID. Identical paths on different accounts now keep independent histories.
 - Stop/remove commands discarded database errors and updated the UI before database success. Record removal is now transactional and failures remain visible.
@@ -46,7 +46,7 @@ No watcher dependency, polling interval change, sync-engine replacement or datab
 
 Removed Snap/makedeb definitions and publishing workflows, the old package-based CI setup, unused GTK tray/icon artwork, screenshot and legacy AppStream metadata, unused translation catalogs/build recipes, an unused OAuth template, template-app renaming files, and the obsolete panic-wrapper CLI entry point. The portable bundle also excludes Qt's optional GTK theme plugin so it does not pull GTK libraries into the runtime closure. Build/staging paths and docs now reflect Qt Quick and the configured remote builder. The public CI workflow checks formatting and shell syntax; Rust tests and Clippy run on the private builder.
 
-The stable app ID, config directory, current logo, active OAuth assets, original license/copyright, release history and database migrations are retained because current functionality or existing data depends on them. Qt may still depend on GLib; GLib runtime libraries are not obsolete GTK application code.
+The current logo, active OAuth assets, original license/copyright, release history and database migrations are retained because current functionality or existing data depends on them. Qt may still depend on GLib; GLib runtime libraries are not obsolete GTK application code. The app was later renamed from Celeste to Celestial; the former config directory, database and desktop entries are migrated on first start.
 
 ## Follow-up validation
 

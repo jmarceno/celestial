@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 /// The ID of the app. Kept stable so existing desktop entries and the tray
 /// item stay the same item the session already knows.
-pub static APP_ID: &str = "com.hunterwittenborn.Celeste";
+pub static APP_ID: &str = "com.hunterwittenborn.Celestial";
 
-pub static APP_NAME: &str = "Celeste";
+pub static APP_NAME: &str = "Celestial";
 
 /// Get the value out of a future.
 pub fn await_future<F: Future>(future: F) -> F::Output {
@@ -25,25 +25,59 @@ pub fn fmt_home(dir: &str) -> String {
     }
 }
 
-/// Celeste's config directory (`$XDG_CONFIG_HOME/celeste`, usually
-/// `~/.config/celeste`). `CELESTE_CONFIG_DIR` overrides it for tests.
+/// Celestial's config directory (`$XDG_CONFIG_HOME/celestial`, usually
+/// `~/.config/celestial`). `CELESTIAL_CONFIG_DIR` overrides it for tests.
 pub fn get_config_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CELESTE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+    if let Some(dir) = std::env::var_os("CELESTIAL_CONFIG_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
     }
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(base).join("celeste");
-    }
-    PathBuf::from(home_dir()).join(".config").join("celeste")
+    config_base().join("celestial")
 }
 
-/// `$XDG_RUNTIME_DIR/celeste` for the single-instance socket.
+fn config_base() -> PathBuf {
+    match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(base) => PathBuf::from(base),
+        None => PathBuf::from(home_dir()).join(".config"),
+    }
+}
+
+/// The database file inside [`get_config_dir`].
+pub const DATABASE_NAME: &str = "celestial.db";
+
+/// Move the configuration and history kept under the app's former name,
+/// Celeste (`celeste/` and `celeste.db`), to the current names. Nothing is
+/// moved when the current files already exist.
+pub fn migrate_legacy_config() -> std::io::Result<()> {
+    let legacy = std::env::var_os("CELESTIAL_CONFIG_DIR")
+        .is_none()
+        .then(|| config_base().join("celeste"));
+    move_legacy_config(legacy.as_deref(), &get_config_dir())
+}
+
+fn move_legacy_config(
+    legacy: Option<&std::path::Path>,
+    config: &std::path::Path,
+) -> std::io::Result<()> {
+    if let Some(legacy) = legacy.filter(|legacy| legacy.is_dir()) {
+        if !config.exists() {
+            std::fs::rename(legacy, config)?;
+        }
+    }
+    let legacy_db = config.join("celeste.db");
+    let db = config.join(DATABASE_NAME);
+    if legacy_db.is_file() && !db.exists() {
+        std::fs::rename(legacy_db, db)?;
+    }
+    Ok(())
+}
+
+/// `$XDG_RUNTIME_DIR/celestial` for the single-instance socket.
 pub fn runtime_dir() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", uid())));
-    base.join("celeste")
+    base.join("celestial")
 }
 
 fn uid() -> u32 {
@@ -103,7 +137,45 @@ pub fn strip_slashes(string: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::local_path_for_remote;
+    use super::{DATABASE_NAME, local_path_for_remote, move_legacy_config};
+    use std::fs;
+
+    #[test]
+    fn moves_former_config_and_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("celeste");
+        let config = temp.path().join("celestial");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("rclone.conf"), "remotes").unwrap();
+        fs::write(legacy.join("celeste.db"), "history").unwrap();
+        move_legacy_config(Some(&legacy), &config).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read_to_string(config.join("rclone.conf")).unwrap(),
+            "remotes"
+        );
+        assert_eq!(
+            fs::read_to_string(config.join(DATABASE_NAME)).unwrap(),
+            "history"
+        );
+    }
+
+    #[test]
+    fn keeps_existing_config_over_former_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("celeste");
+        let config = temp.path().join("celestial");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("celeste.db"), "old").unwrap();
+        fs::create_dir(&config).unwrap();
+        fs::write(config.join(DATABASE_NAME), "current").unwrap();
+        move_legacy_config(Some(&legacy), &config).unwrap();
+        assert!(legacy.join("celeste.db").exists());
+        assert_eq!(
+            fs::read_to_string(config.join(DATABASE_NAME)).unwrap(),
+            "current"
+        );
+    }
 
     #[test]
     fn joins_remote_path_without_double_slash() {

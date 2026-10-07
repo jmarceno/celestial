@@ -14,7 +14,7 @@ body:
     id: installation-source
     attributes:
       label: Installation Source
-      description: Where did you install Celeste from?
+      description: Where did you install Celestial from?
       options:
         - Portable executable
         - Built from source
@@ -24,8 +24,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: What version of Celeste are you using?
-      description: Run `celeste --version` to find it.
+      label: What version of Celestial are you using?
+      description: Run `celestial --version` to find it.
     validations:
       required: true
   - type: dropdown

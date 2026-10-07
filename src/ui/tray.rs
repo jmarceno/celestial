@@ -1,5 +1,5 @@
 //! StatusNotifier tray. The icon is drawn here so it does not depend on a
-//! theme having Celeste's old symbolic names installed.
+//! theme having Celestial's old symbolic names installed.
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use ksni::menu::{MenuItem, StandardItem};
@@ -14,25 +14,25 @@ pub enum TrayEvent {
     Quit,
 }
 
-struct CelesteTray {
+struct CelestialTray {
     tx: Sender<TrayEvent>,
     message: String,
     phase: String,
 }
 
-impl CelesteTray {
+impl CelestialTray {
     fn send(&self, event: TrayEvent) {
         let _ = self.tx.send(event);
     }
 }
 
-impl Tray for CelesteTray {
+impl Tray for CelestialTray {
     fn id(&self) -> String {
         crate::util::APP_ID.to_owned()
     }
 
     fn title(&self) -> String {
-        "Celeste".to_owned()
+        "Celestial".to_owned()
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
@@ -82,7 +82,7 @@ impl Tray for CelesteTray {
 
 pub struct TrayHandle {
     pub rx: Receiver<TrayEvent>,
-    handle: ksni::Handle<CelesteTray>,
+    handle: ksni::Handle<CelestialTray>,
 }
 
 impl TrayHandle {
@@ -93,14 +93,14 @@ impl TrayHandle {
             );
         }
         let (tx, rx) = unbounded();
-        let service = TrayService::new(CelesteTray {
+        let service = TrayService::new(CelestialTray {
             tx,
             message: tr::tr!("Awaiting sync checks..."),
             phase: "loading".into(),
         });
         let handle = service.handle();
         thread::Builder::new()
-            .name("celeste-tray".into())
+            .name("celestial-tray".into())
             .spawn(move || {
                 if let Err(err) = service.run() {
                     tracing::error!("tray stopped: {err}");
@@ -119,7 +119,7 @@ impl TrayHandle {
 }
 
 fn wait_for_watcher() -> bool {
-    if std::env::var_os("CELESTE_FAKE_TRAY").is_some()
+    if std::env::var_os("CELESTIAL_FAKE_TRAY").is_some()
         || std::env::var("QT_QPA_PLATFORM").ok().as_deref() == Some("offscreen")
     {
         return true;
@@ -140,7 +140,7 @@ fn wait_for_watcher() -> bool {
 }
 
 fn watcher_present() -> bool {
-    if std::env::var_os("CELESTE_FAKE_TRAY").is_some()
+    if std::env::var_os("CELESTIAL_FAKE_TRAY").is_some()
         || std::env::var("QT_QPA_PLATFORM").ok().as_deref() == Some("offscreen")
     {
         return true;

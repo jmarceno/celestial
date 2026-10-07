@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 /// The file desktop entries should launch.
 ///
 /// From the portable `.run` this is the `.run` itself (exported by its stub
-/// as `CELESTE_PORTABLE_EXE`), never the versioned extraction under
+/// as `CELESTIAL_PORTABLE_EXE`), never the versioned extraction under
 /// `~/.cache`, which is replaced on every upgrade.
 pub fn resolve_binary_path() -> PathBuf {
-    if let Some(exe) = std::env::var_os("CELESTE_PORTABLE_EXE").map(PathBuf::from) {
+    if let Some(exe) = std::env::var_os("CELESTIAL_PORTABLE_EXE").map(PathBuf::from) {
         if exe.is_file() {
             return exe;
         }
@@ -77,7 +77,7 @@ pub fn desktop_entry(exec: &Path, icon: Option<&Path>) -> String {
 
 /// Write the embedded SVG next to the user's other icons.
 fn install_icon() -> Option<PathBuf> {
-    const SVG: &[u8] = include_bytes!("../../assets/com.hunterwittenborn.Celeste-regular.svg");
+    const SVG: &[u8] = include_bytes!("../../assets/com.hunterwittenborn.Celestial-regular.svg");
     let path = data_home()
         .join("icons/hicolor/scalable/apps")
         .join(format!("{}.svg", crate::APP_ID));
@@ -119,6 +119,52 @@ pub fn remove_autostart() -> Result<Option<PathBuf>, String> {
     remove(autostart_path())
 }
 
+/// The app ID used while the app was called Celeste.
+const LEGACY_APP_ID: &str = "com.hunterwittenborn.Celeste";
+
+/// Remove the menu entry, autostart entry and icon written under the former
+/// name. Returns whether a former autostart entry existed.
+pub fn remove_legacy_entries() -> bool {
+    let entry = format!("{LEGACY_APP_ID}.desktop");
+    let autostart = config_home().join("autostart").join(&entry);
+    let had_autostart = autostart.is_file();
+    for path in [
+        data_home().join("applications").join(&entry),
+        autostart,
+        data_home()
+            .join("icons/hicolor/scalable/apps")
+            .join(format!("{LEGACY_APP_ID}.svg")),
+    ] {
+        match remove(path) {
+            Ok(Some(path)) => tracing::info!(path = %path.display(), "removed former entry"),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("could not remove former entry: {e}"),
+        }
+    }
+    had_autostart
+}
+
+/// Replace entries written under the former name with current ones.
+fn migrate_legacy_entries(exec: &Path) {
+    let had_menu = data_home()
+        .join("applications")
+        .join(format!("{LEGACY_APP_ID}.desktop"))
+        .is_file();
+    let had_autostart = remove_legacy_entries();
+    let mut writes = Vec::new();
+    if had_menu {
+        writes.push(menu_entry_path());
+    }
+    if had_autostart {
+        writes.push(autostart_path());
+    }
+    for path in writes {
+        if let Err(e) = write_entry(&path, exec) {
+            tracing::warn!(path = %path.display(), "could not write desktop entry: {e}");
+        }
+    }
+}
+
 /// First word of `Exec=` with quotes stripped, skipping an `env VAR=…` prefix.
 fn exec_target(contents: &str) -> Option<String> {
     let line = contents.lines().find_map(|l| l.strip_prefix("Exec="))?;
@@ -136,10 +182,11 @@ fn exec_target(contents: &str) -> Option<String> {
 /// Only runs from the portable bundle, so a dev `cargo run` never hijacks
 /// the user's entries, and never creates entries that did not exist.
 pub fn refresh_stale_entries() {
-    if std::env::var_os("CELESTE_PORTABLE_EXE").is_none() {
+    if std::env::var_os("CELESTIAL_PORTABLE_EXE").is_none() {
         return;
     }
     let current = resolve_binary_path();
+    migrate_legacy_entries(&current);
     for path in [menu_entry_path(), autostart_path()] {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
@@ -147,7 +194,7 @@ pub fn refresh_stale_entries() {
         let Some(target) = exec_target(&contents) else {
             continue;
         };
-        // Bare names (`Exec=celeste`) resolve via PATH; leave them alone.
+        // Bare names (`Exec=celestial`) resolve via PATH; leave them alone.
         let target = Path::new(&target);
         if !target.is_absolute() || target.is_file() {
             continue;
@@ -167,8 +214,8 @@ mod tests {
 
     #[test]
     fn entry_quotes_exec_and_has_no_args() {
-        let e = desktop_entry(Path::new("/opt/My App/celeste.run"), None);
-        assert!(e.contains("Exec=\"/opt/My App/celeste.run\"\n"));
+        let e = desktop_entry(Path::new("/opt/My App/celestial.run"), None);
+        assert!(e.contains("Exec=\"/opt/My App/celestial.run\"\n"));
         assert!(!e.contains("Icon="));
     }
 

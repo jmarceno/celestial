@@ -30,7 +30,7 @@ pub fn spawn(
     rx: crossbeam_channel::Receiver<Command>,
 ) -> std::thread::JoinHandle<()> {
     thread::Builder::new()
-        .name("celeste-sync".into())
+        .name("celestial-sync".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(&shared, rx)));
             match result {
@@ -51,7 +51,7 @@ pub fn spawn(
                     tr::tr!("Unknown Error"),
                     format!(
                         "{}\n\n{message}",
-                        tr::tr!("An unknown error has occurred while running. This is an internal issue with Celeste and should be reported.\n\nThe following backtrace may help with debugging the issue - note that it may contain information such as login tokens/keys, so avoid posting the information publicly:")
+                        tr::tr!("An unknown error has occurred while running. This is an internal issue with Celestial and should be reported.\n\nThe following backtrace may help with debugging the issue - note that it may contain information such as login tokens/keys, so avoid posting the information publicly:")
                     ),
                 );
                 }
@@ -72,9 +72,15 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(), String> {
+    util::migrate_legacy_config().map_err(|err| {
+        tr::tr!(
+            "Unable to move the configuration from Celeste's former folder [{}].",
+            err
+        )
+    })?;
     let mut config = util::get_config_dir();
     fs::create_dir_all(&config)
-        .map_err(|err| tr::tr!("Unable to create Celeste's config directory [{}].", err))?;
+        .map_err(|err| tr::tr!("Unable to create Celestial's config directory [{}].", err))?;
     config.push("rclone.conf");
     librclone::initialize();
     librclone::rpc(
@@ -84,10 +90,10 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
     .map_err(|err| format!("Could not set the rclone config path: {err}"))?;
 
     let mut db_path = util::get_config_dir();
-    db_path.push("celeste.db");
+    db_path.push(util::DATABASE_NAME);
     if !db_path.exists() {
         File::create(&db_path)
-            .map_err(|err| tr::tr!("Unable to create Celeste's database file [{}].", err))?;
+            .map_err(|err| tr::tr!("Unable to create Celestial's database file [{}].", err))?;
     }
     let db = util::await_future(Database::connect(format!("sqlite://{}", db_path.display())))
         .map_err(|err| tr::tr!("Unable to connect to database [{}].", err))?;
