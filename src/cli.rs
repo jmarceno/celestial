@@ -24,7 +24,8 @@ pub enum Commands {
         #[arg(long)]
         autostart: bool,
     },
-    /// Remove the app-menu and autostart entries.
+    /// Remove the app-menu entry, autostart entry and icon. Configuration,
+    /// synchronization history and synced files are kept.
     Uninstall,
     /// Print config / runtime paths.
     Paths,
@@ -45,8 +46,19 @@ pub fn run(cmd: Commands) -> i32 {
         }
         Commands::Uninstall => {
             desktop::remove_legacy_entries();
-            let ok = report_removed(desktop::remove_menu_entry(), "menu entry")
-                & report_removed(desktop::remove_autostart(), "autostart entry");
+            let mut ok = report_removed(desktop::remove_menu_entry(), "menu entry")
+                & report_removed(desktop::remove_autostart(), "autostart entry")
+                & report_removed(desktop::remove_icon(), "icon");
+            // Keep the next start from adding the menu entry back.
+            if let Err(err) = desktop::remember_first_run() {
+                eprintln!("could not record the uninstall: {err}");
+                ok = false;
+            }
+            println!(
+                "the executable ({}) and configuration ({}) were left in place",
+                desktop::resolve_binary_path().display(),
+                crate::util::get_config_dir().display()
+            );
             if ok { 0 } else { 1 }
         }
         Commands::Paths => {

@@ -75,12 +75,16 @@ pub fn desktop_entry(exec: &Path, icon: Option<&Path>) -> String {
     s
 }
 
+fn icon_path() -> PathBuf {
+    data_home()
+        .join("icons/hicolor/scalable/apps")
+        .join(format!("{}.svg", crate::APP_ID))
+}
+
 /// Write the embedded SVG next to the user's other icons.
 fn install_icon() -> Option<PathBuf> {
     const SVG: &[u8] = include_bytes!("../../assets/com.hunterwittenborn.Celestial-regular.svg");
-    let path = data_home()
-        .join("icons/hicolor/scalable/apps")
-        .join(format!("{}.svg", crate::APP_ID));
+    let path = icon_path();
     std::fs::create_dir_all(path.parent()?).ok()?;
     std::fs::write(&path, SVG).ok()?;
     Some(path)
@@ -117,6 +121,43 @@ pub fn remove_menu_entry() -> Result<Option<PathBuf>, String> {
 
 pub fn remove_autostart() -> Result<Option<PathBuf>, String> {
     remove(autostart_path())
+}
+
+pub fn remove_icon() -> Result<Option<PathBuf>, String> {
+    remove(icon_path())
+}
+
+/// Records that the menu entry was added automatically once, so a later
+/// `uninstall` is not undone by the next start.
+fn first_run_marker() -> PathBuf {
+    data_home().join("celestial").join("menu-entry-added")
+}
+
+pub fn remember_first_run() -> Result<(), String> {
+    let marker = first_run_marker();
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(marker, "").map_err(|e| e.to_string())
+}
+
+/// Add the app-menu entry the first time the portable launcher runs.
+fn add_menu_entry_on_first_run(exec: &Path) {
+    if first_run_marker().exists() {
+        return;
+    }
+    if !menu_entry_path().exists() {
+        match write_menu_entry(exec) {
+            Ok(path) => tracing::info!(path = %path.display(), "added app-menu entry"),
+            Err(e) => {
+                tracing::warn!("could not add app-menu entry: {e}");
+                return;
+            }
+        }
+    }
+    if let Err(e) = remember_first_run() {
+        tracing::warn!("could not record the app-menu entry: {e}");
+    }
 }
 
 /// The app ID used while the app was called Celeste.
@@ -176,17 +217,19 @@ fn exec_target(contents: &str) -> Option<String> {
     Some(w.to_string())
 }
 
-/// Repoint existing entries whose absolute launcher path no longer exists
-/// (the `.run` was moved or renamed) at the portable launcher running now.
+/// Add the app-menu entry on the first run, and repoint existing entries
+/// whose absolute launcher path no longer exists (the `.run` was moved or
+/// renamed) at the portable launcher running now.
 ///
 /// Only runs from the portable bundle, so a dev `cargo run` never hijacks
-/// the user's entries, and never creates entries that did not exist.
+/// the user's entries. Autostart is never created here.
 pub fn refresh_stale_entries() {
     if std::env::var_os("CELESTIAL_PORTABLE_EXE").is_none() {
         return;
     }
     let current = resolve_binary_path();
     migrate_legacy_entries(&current);
+    add_menu_entry_on_first_run(&current);
     for path in [menu_entry_path(), autostart_path()] {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;

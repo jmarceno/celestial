@@ -14,6 +14,8 @@ Build the portable executable following [BUILDING.md](BUILDING.md), then install
 ./scripts/install.sh build/portable/Celestial-0.8.3-x86_64-portable.run
 ```
 
+Running the portable `.run` directly also adds the app-menu entry the first time it starts. `celestial uninstall` removes the menu entry, autostart entry and icon, and keeps the executable, configuration and synchronization history; the menu entry is not added back on later starts, but `celestial install` restores it.
+
 Add `--autostart` to start Celestial at login. Launch `celestial` to open the window or `celestial --background` to start in the tray.
 
 ## Configuration
