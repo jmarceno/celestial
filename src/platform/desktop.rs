@@ -83,7 +83,7 @@ fn icon_path() -> PathBuf {
 
 /// Write the embedded SVG next to the user's other icons.
 fn install_icon() -> Option<PathBuf> {
-    const SVG: &[u8] = include_bytes!("../../assets/com.hunterwittenborn.Celestial-regular.svg");
+    const SVG: &[u8] = include_bytes!("../../assets/com.unboundmark.Celestial-regular.svg");
     let path = icon_path();
     std::fs::create_dir_all(path.parent()?).ok()?;
     std::fs::write(&path, SVG).ok()?;

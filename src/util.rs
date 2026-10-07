@@ -1,9 +1,9 @@
 use futures::future::Future;
 use std::path::PathBuf;
 
-/// The ID of the app. Kept stable so existing desktop entries and the tray
-/// item stay the same item the session already knows.
-pub static APP_ID: &str = "com.hunterwittenborn.Celestial";
+/// The ID of the app, used for desktop entries, the icon and the tray item.
+/// Entries written under the former ID are migrated by `platform::desktop`.
+pub static APP_ID: &str = "com.unboundmark.Celestial";
 
 pub static APP_NAME: &str = "Celestial";
 

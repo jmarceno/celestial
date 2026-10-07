@@ -57,8 +57,8 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" \
          "$STAGE/share/icons/hicolor/scalable/apps" "$STAGE/share/doc/$APP"
 install -m 0755 "$BIN" "$STAGE/bin/$APP"
-install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celestial.desktop" "$STAGE/share/applications/com.hunterwittenborn.Celestial.desktop"
-install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celestial-regular.svg" "$STAGE/share/icons/hicolor/scalable/apps/com.hunterwittenborn.Celestial.svg"
+install -m 0644 "$PROJECT_ROOT/assets/com.unboundmark.Celestial.desktop" "$STAGE/share/applications/com.unboundmark.Celestial.desktop"
+install -m 0644 "$PROJECT_ROOT/assets/com.unboundmark.Celestial-regular.svg" "$STAGE/share/icons/hicolor/scalable/apps/com.unboundmark.Celestial.svg"
 for f in LICENSE THIRD_PARTY_LICENSES.md; do
   [[ -f "$PROJECT_ROOT/$f" ]] && install -m 0644 "$PROJECT_ROOT/$f" "$STAGE/share/doc/$APP/$f"
 done

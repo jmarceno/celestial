@@ -14,6 +14,6 @@ fn main() {
     .qt_module("Quick")
     .qt_module("QuickControls2")
     .qt_module("Svg")
-    .qrc_resources(["assets/com.hunterwittenborn.Celestial-regular.svg"])
+    .qrc_resources(["assets/com.unboundmark.Celestial-regular.svg"])
     .build();
 }
