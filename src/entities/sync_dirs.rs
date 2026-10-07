@@ -15,16 +15,18 @@ pub struct Model {
     /// The remote path being synced, as an absolute path (though it won't start
     /// with `/`).
     pub remote_path: String,
+    /// Stable identity used for recovery storage; survives path changes.
+    pub pair_uuid: Option<String>,
+    /// Incremented by every committed operation in this pair.
+    pub generation: i64,
 }
 
 impl Model {
     // See if this item still exists in the database (i.e. the struct was created
     // and the item was later deleted).
-    pub fn exists(&self, db: &DatabaseConnection) -> bool {
-        util::await_future(Entity::find_by_id(self.id).one(db))
-            .ok()
-            .flatten()
-            .is_some()
+    // A failed read is an error, not evidence that the pair was removed.
+    pub fn exists(&self, db: &DatabaseConnection) -> Result<bool, DbErr> {
+        util::await_future(Entity::find_by_id(self.id).one(db)).map(|row| row.is_some())
     }
 }
 

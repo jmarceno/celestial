@@ -702,6 +702,7 @@ dependencies = [
  "tr",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "zbus",
 ]

@@ -1,7 +1,8 @@
 //! Two-way synchronization worker. The Qt window communicates through [`Model`].
 
+use super::capabilities::{self, Capabilities};
 use super::model::{self, FILE_IGNORE_NAME, Model, SyncError};
-use super::{Command, Shared, watch};
+use super::{Command, Shared, store, watch};
 use crate::{
     entities::{
         RemotesColumn, RemotesEntity, RemotesModel, SyncDirsActiveModel, SyncDirsColumn,
@@ -97,12 +98,28 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
     }
     let db = util::await_future(Database::connect(format!("sqlite://{}", db_path.display())))
         .map_err(|err| tr::tr!("Unable to connect to database [{}].", err))?;
+    backup_before_migration(&db, &db_path)?;
     util::await_future(Migrator::up(&db, None))
         .map_err(|err| tr::tr!("Unable to run database migrations [{}]", err))?;
+    let rclone_version = match rclone::version() {
+        Ok(version) => version,
+        Err(err) => {
+            tracing::warn!("could not read the embedded rclone version: {err}");
+            "unknown".into()
+        }
+    };
+    tracing::info!("embedded rclone {rclone_version}");
 
     let mut model = Model::new();
-    reload_model(&db, &mut model);
+    if let Err(err) = reload_model(&db, &mut model) {
+        shared.dialog(
+            "error",
+            tr::tr!("Unable to read the synchronization settings"),
+            err.to_string(),
+        );
+    }
     shared.publish(&mut model);
+    let mut capabilities: HashMap<String, Capabilities> = HashMap::new();
 
     let mut queue = VecDeque::new();
     let mut prompted_login = false;
@@ -125,7 +142,16 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
             break;
         }
 
-        let remotes = util::await_future(RemotesEntity::find().all(&db)).unwrap_or_default();
+        // A failed read is not an empty configuration: keep the last known
+        // state, report the failure and try again.
+        let remotes = match util::await_future(RemotesEntity::find().all(&db)) {
+            Ok(remotes) => remotes,
+            Err(err) => {
+                database_unavailable(shared, &mut model, &err);
+                wait_command(&rx, &mut queue, Duration::from_secs(5));
+                continue;
+            }
+        };
         if remotes.is_empty() {
             model.remotes.clear();
             shared.set_tray(&mut model, tr::tr!("Awaiting sync checks..."), "loading");
@@ -139,11 +165,17 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
             continue;
         }
         prompted_login = false;
-        let pairs: Vec<(i32, PathBuf)> = util::await_future(SyncDirsEntity::find().all(&db))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|dir| (dir.id, PathBuf::from(dir.local_path)))
-            .collect();
+        let pairs: Vec<(i32, PathBuf)> = match util::await_future(SyncDirsEntity::find().all(&db)) {
+            Ok(dirs) => dirs
+                .into_iter()
+                .map(|dir| (dir.id, PathBuf::from(dir.local_path)))
+                .collect(),
+            Err(err) => {
+                database_unavailable(shared, &mut model, &err);
+                wait_command(&rx, &mut queue, Duration::from_secs(5));
+                continue;
+            }
+        };
         watcher.sync_pairs(&pairs);
 
         for remote in remotes {
@@ -153,12 +185,28 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 break;
             }
             model.ensure_remote(&remote.name);
-            let sync_dirs = util::await_future(
+            let sync_dirs = match util::await_future(
                 SyncDirsEntity::find()
                     .filter(SyncDirsColumn::RemoteId.eq(remote.id))
                     .all(&db),
-            )
-            .unwrap_or_default();
+            ) {
+                Ok(dirs) => dirs,
+                Err(err) => {
+                    database_unavailable(shared, &mut model, &err);
+                    continue;
+                }
+            };
+            if !capabilities.contains_key(&remote.name) {
+                match capabilities::probe(&db, &remote.name, &rclone_version) {
+                    Ok(caps) => {
+                        tracing::info!(remote = %remote.name, hash = ?caps.preferred_hash(), ?caps, "remote capabilities");
+                        capabilities.insert(remote.name.clone(), caps);
+                    }
+                    Err(err) => {
+                        tracing::warn!(remote = %remote.name, "could not read capabilities: {err}")
+                    }
+                }
+            }
             for dir in &sync_dirs {
                 model.ensure_dir(&remote.name, &dir.local_path, &dir.remote_path);
             }
@@ -169,7 +217,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 }
                 pump(&rx, &mut queue);
                 apply_deletes(&mut model, &db, &mut queue, shared);
-                if !sync_dir.exists(&db) {
+                if !matches!(sync_dir.exists(&db), Ok(true)) {
                     continue;
                 }
                 if model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path) {
@@ -251,7 +299,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                     &mut queue,
                     &please_resolve,
                 );
-                if sync_dir.exists(&db)
+                if matches!(sync_dir.exists(&db), Ok(true))
                     && !shared.quit_requested()
                     && !model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path)
                 {
@@ -271,7 +319,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 if shared.quit_requested() {
                     break;
                 }
-                if !sync_dir.exists(&db) {
+                if !matches!(sync_dir.exists(&db), Ok(true)) {
                     continue;
                 }
                 if model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path) {
@@ -309,20 +357,50 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
     Ok(())
 }
 
-fn reload_model(db: &DatabaseConnection, model: &mut Model) {
-    let remotes = util::await_future(RemotesEntity::find().all(db)).unwrap_or_default();
+fn reload_model(db: &DatabaseConnection, model: &mut Model) -> Result<(), DbErr> {
+    let remotes = util::await_future(RemotesEntity::find().all(db))?;
     for remote in remotes {
         model.ensure_remote(&remote.name);
         let dirs = util::await_future(
             SyncDirsEntity::find()
                 .filter(SyncDirsColumn::RemoteId.eq(remote.id))
                 .all(db),
-        )
-        .unwrap_or_default();
+        )?;
         for dir in dirs {
             model.ensure_dir(&remote.name, &dir.local_path, &dir.remote_path);
         }
     }
+    Ok(())
+}
+
+/// Copy the database aside before a schema change. A failed copy stops the
+/// upgrade rather than migrating without a way back.
+fn backup_before_migration(db: &DatabaseConnection, db_path: &Path) -> Result<(), String> {
+    let pending = util::await_future(Migrator::get_pending_migrations(db))
+        .map_err(|err| tr::tr!("Unable to run database migrations [{}]", err))?;
+    let applied = util::await_future(Migrator::get_applied_migrations(db))
+        .map_err(|err| tr::tr!("Unable to run database migrations [{}]", err))?;
+    if pending.is_empty() || applied.is_empty() {
+        return Ok(());
+    }
+    let backup = db_path.with_extension(format!("db.before-upgrade-{}", store::now()));
+    fs::copy(db_path, &backup).map_err(|err| {
+        tr::tr!(
+            "Unable to back up the database before upgrading it [{}].",
+            err
+        )
+    })?;
+    tracing::info!(backup = %backup.display(), "database backed up before migration");
+    Ok(())
+}
+
+fn database_unavailable(shared: &Shared, model: &mut Model, err: &DbErr) {
+    tracing::error!("database read failed: {err}");
+    shared.set_tray(
+        model,
+        tr::tr!("Synchronization paused: the database could not be read."),
+        "warning",
+    );
 }
 
 fn pump(rx: &crossbeam_channel::Receiver<Command>, queue: &mut VecDeque<Command>) {
@@ -1018,7 +1096,7 @@ fn pair_roots_available(
     model: &mut Model,
     shared: &Shared,
 ) -> bool {
-    if !sync_dir.exists(db) {
+    if !matches!(sync_dir.exists(db), Ok(true)) {
         return false;
     }
     if let Err(err) = fs::read_dir(&sync_dir.local_path) {
@@ -1453,7 +1531,7 @@ fn note_progress(
     db: &DatabaseConnection,
     status: String,
 ) {
-    if !sync_dir.exists(db) {
+    if !matches!(sync_dir.exists(db), Ok(true)) {
         return;
     }
     if model.set_status(remote, &sync_dir.local_path, &sync_dir.remote_path, status) {
@@ -1614,7 +1692,7 @@ fn sync_local_directory(
             queue,
             please_resolve,
         } = walk;
-        if !sync_dir.exists(db) || shared.quit_requested() {
+        if !matches!(sync_dir.exists(db), Ok(true)) || shared.quit_requested() {
             break;
         }
         let item = match item {
@@ -1852,7 +1930,9 @@ fn sync_local_directory(
                     push_failed(model, local_path.clone(), err.to_string());
                     continue;
                 }
-                delete_db_entry(db, sync_dir.id, &local_path, &remote_path);
+                if let Err(err) = delete_db_entry(db, sync_dir.id, &local_path, &remote_path) {
+                    push_failed(model, local_path.clone(), err);
+                }
             }
         } else if let Some(remote_timestamp) = remote_utc_timestamp {
             let pushed = if local_utc_timestamp > remote_timestamp as u64 {
@@ -2142,20 +2222,21 @@ fn save_baseline(
     }
 }
 
-fn delete_db_entry(db: &DatabaseConnection, sync_dir_id: i32, local_path: &str, remote_path: &str) {
-    util::await_future(async {
-        if let Some(row) = SyncItemsEntity::find()
+fn delete_db_entry(
+    db: &DatabaseConnection,
+    sync_dir_id: i32,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<(), String> {
+    util::await_future(
+        SyncItemsEntity::delete_many()
             .filter(SyncItemsColumn::SyncDirId.eq(sync_dir_id))
             .filter(SyncItemsColumn::LocalPath.eq(local_path))
             .filter(SyncItemsColumn::RemotePath.eq(remote_path))
-            .one(db)
-            .await
-            .ok()
-            .flatten()
-        {
-            let _ = row.delete(db).await;
-        }
-    });
+            .exec(db),
+    )
+    .map(|_| ())
+    .map_err(|err| format!("Could not update synchronization history: {err}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2337,7 +2418,7 @@ fn sync_remote_directory(
             queue,
             please_resolve,
         } = walk;
-        if !sync_dir.exists(db) || shared.quit_requested() {
+        if !matches!(sync_dir.exists(db), Ok(true)) || shared.quit_requested() {
             break;
         }
         let remote_path_string = item.path.clone();
@@ -2569,7 +2650,20 @@ fn sync_remote_directory(
                 };
                 match result {
                     Ok(()) => {
-                        delete_db_entry(db, sync_dir.id, &local_path_string, &remote_path_string)
+                        if let Err(err) = delete_db_entry(
+                            db,
+                            sync_dir.id,
+                            &local_path_string,
+                            &remote_path_string,
+                        ) {
+                            record_error(
+                                model,
+                                shared,
+                                &remote.name,
+                                sync_dir,
+                                SyncError::General(remote_path_string.clone(), err),
+                            );
+                        }
                     }
                     Err(err) => record_error(
                         model,

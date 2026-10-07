@@ -1,7 +1,13 @@
 //! Background sync. The Qt thread only sends commands and reads snapshots.
 
+mod capabilities;
 mod engine;
 pub mod model;
+// The reconciliation engine builds on these in the following changes.
+#[allow(dead_code)]
+mod observe;
+#[allow(dead_code)]
+mod store;
 mod watch;
 
 pub use engine::spawn;

@@ -1,6 +1,10 @@
 //! Structs and functions for use with Rclone RPC calls.
+//!
+//! Every response is decoded fallibly: a malformed reply or an invalid remote
+//! name is an ordinary error, never a panic and never an empty observation.
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
 /// List configured remote names without reading credentials or assuming a provider.
@@ -8,34 +12,53 @@ pub fn get_remotes() -> Result<Vec<String>, String> {
     let response = librclone::rpc("config/listremotes", json!({}).to_string())?;
     #[derive(Deserialize)]
     struct Names {
-        remotes: Vec<String>,
+        remotes: Option<Vec<String>>,
     }
     serde_json::from_str::<Names>(&response)
-        .map(|names| names.remotes)
+        .map(|names| names.remotes.unwrap_or_default())
         .map_err(|err| err.to_string())
 }
 
-#[derive(Clone, Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
 pub struct RcloneError {
     pub error: String,
 }
 
+impl RcloneError {
+    pub fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+        }
+    }
+
+    /// Decode an error reply, keeping the raw text when it is not the
+    /// expected JSON object.
+    fn from_reply(text: &str) -> Self {
+        serde_json::from_str::<Self>(text).unwrap_or_else(|_| Self::new(text))
+    }
+}
+
+impl std::fmt::Display for RcloneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
 /// The output of an `operations/stat` command.
 #[derive(Clone, Deserialize, Debug)]
-pub struct RcloneStat {
+struct RcloneStat {
     item: Option<RcloneRemoteItem>,
 }
 
 /// The output of an `operations/list` command.
 #[derive(Clone, Deserialize, Debug)]
-pub struct RcloneList {
+struct RcloneList {
     #[serde(rename = "list")]
     list: Vec<RcloneRemoteItem>,
 }
 
-/// The list of items in a folder, from the `list` object in the output of the
-/// `operations/list` command.
-#[derive(Clone, Deserialize, Debug)]
+/// One item from `operations/list` or `operations/stat`.
+#[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
 pub struct RcloneRemoteItem {
     #[serde(rename = "IsDir")]
     pub is_dir: bool,
@@ -45,6 +68,20 @@ pub struct RcloneRemoteItem {
     pub name: String,
     #[serde(rename = "ModTime", with = "time::serde::rfc3339")]
     pub mod_time: OffsetDateTime,
+    /// Size in bytes; `-1` for folders and unknown sizes.
+    #[serde(rename = "Size", default = "unknown_size")]
+    pub size: i64,
+    /// Content hashes by rclone hash name (`md5`, `sha1`, `quickxor`, ...).
+    #[serde(rename = "Hashes", default)]
+    pub hashes: BTreeMap<String, String>,
+    /// Object identity on backends that report one. It identifies an
+    /// object, not a version of its contents.
+    #[serde(rename = "ID", default)]
+    pub id: Option<String>,
+}
+
+fn unknown_size() -> i64 {
+    -1
 }
 
 /// The types of items to show in an `operations/list` command.
@@ -56,69 +93,147 @@ pub enum RcloneListFilter {
     Dirs,
 }
 
+/// Options for listings and stats beyond the filter.
+#[derive(Clone, Debug, Default)]
+pub struct ListOptions {
+    /// Hash types to request; empty requests none.
+    pub hash_types: Vec<String>,
+    /// Ask the backend for one recursive listing where it supports `ListR`.
+    pub use_list_r: bool,
+}
+
+/// What `operations/fsinfo` reports about a remote.
+#[derive(Clone, Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct FsInfo {
+    #[serde(rename = "Hashes", default)]
+    pub hashes: Vec<String>,
+    /// Modification time precision in nanoseconds.
+    #[serde(rename = "Precision", default)]
+    pub precision: i64,
+    #[serde(rename = "Features", default)]
+    pub features: BTreeMap<String, bool>,
+}
+
+/// rclone's `fs.ModTimeNotSupported`: 100 years, in nanoseconds.
+pub const MOD_TIME_NOT_SUPPORTED: i64 = 100 * 365 * 24 * 3600 * 1_000_000_000;
+
+/// The embedded rclone version from `core/version`.
+pub fn version() -> Result<String, RcloneError> {
+    let reply =
+        librclone::rpc("core/version", "{}").map_err(|text| RcloneError::from_reply(&text))?;
+    let value: Value =
+        serde_json::from_str(&reply).map_err(|err| RcloneError::new(err.to_string()))?;
+    value
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| RcloneError::new("core/version returned no version"))
+}
+
 /// Functions called synchronously on the synchronization worker.
 pub mod sync {
-    use super::{RcloneError, RcloneList, RcloneListFilter, RcloneRemoteItem, RcloneStat};
+    use super::{
+        FsInfo, ListOptions, RcloneError, RcloneList, RcloneListFilter, RcloneRemoteItem,
+        RcloneStat,
+    };
     use crate::util;
-    use serde_json::json;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Get a remote name.
-    fn get_remote_name(remote: &str) -> String {
-        if remote.ends_with(':') {
-            panic!("Remote '{remote}' is not allowed to end with a ':'. Please omit it.",);
+    /// RPCs made by this process, for measurement.
+    pub static RPC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// The filesystem string for a configured remote.
+    pub fn remote_fs(remote: &str) -> Result<String, RcloneError> {
+        if remote.is_empty() || remote.contains(':') || remote.contains('/') {
+            return Err(RcloneError::new(format!(
+                "'{remote}' is not a valid remote name"
+            )));
         }
-        format!("{remote}:")
+        Ok(format!("{remote}:"))
     }
 
-    /// Run an Rclone command without blocking the GUI.
-    fn run<T: ToString>(method: T, input: T) -> Result<String, String> {
-        let method = method.to_string();
-        let input = input.to_string();
-        librclone::rpc(method, input)
+    /// Run an Rclone command and return the raw reply.
+    fn run(method: &str, input: Value) -> Result<String, RcloneError> {
+        RPC_CALLS.fetch_add(1, Ordering::Relaxed);
+        librclone::rpc(method, input.to_string()).map_err(|text| RcloneError::from_reply(&text))
     }
 
-    /// Common function for some of the below command.
-    fn common(command: &str, remote_name: &str, path: &str) -> Result<(), RcloneError> {
-        let resp = run(
-            command,
-            &json!({
-                "fs": get_remote_name(remote_name),
+    fn decode<T: DeserializeOwned>(method: &str, reply: &str) -> Result<T, RcloneError> {
+        serde_json::from_str(reply)
+            .map_err(|err| RcloneError::new(format!("Malformed reply from {method}: {err}")))
+    }
+
+    fn on_remote(method: &str, remote_name: &str, path: &str) -> Result<(), RcloneError> {
+        run(
+            method,
+            json!({
+                "fs": remote_fs(remote_name)?,
                 "remote": util::strip_slashes(path),
-            })
-            .to_string(),
-        );
-
-        match resp {
-            Ok(_) => Ok(()),
-            Err(json_str) => Err(serde_json::from_str(&json_str).unwrap()),
-        }
+            }),
+        )
+        .map(|_| ())
     }
 
     /// Delete a config.
     pub fn delete_config(remote_name: &str) -> Result<(), RcloneError> {
-        let resp = run("config/delete", &json!({ "name": remote_name }).to_string());
+        run("config/delete", json!({ "name": remote_name })).map(|_| ())
+    }
 
-        match resp {
-            Ok(_) => Ok(()),
-            Err(json_str) => Err(serde_json::from_str(&json_str).unwrap()),
+    fn list_opt(recursive: bool, filter: &RcloneListFilter, options: &ListOptions) -> Value {
+        let mut opt = json!({ "recurse": recursive });
+        if matches!(filter, RcloneListFilter::Dirs) {
+            opt["dirsOnly"] = json!(true);
         }
+        if !options.hash_types.is_empty() {
+            opt["showHash"] = json!(true);
+            opt["hashTypes"] = json!(options.hash_types);
+        }
+        opt
     }
 
     /// Get statistics about a file or folder.
     pub fn stat(remote_name: &str, path: &str) -> Result<Option<RcloneRemoteItem>, RcloneError> {
-        let resp = run(
-            "operations/stat",
-            &json!({
-                "fs": get_remote_name(remote_name),
-                "remote": util::strip_slashes(path)
-            })
-            .to_string(),
-        );
+        stat_with(remote_name, path, &ListOptions::default())
+    }
 
-        match resp {
-            Ok(json_str) => Ok(serde_json::from_str::<RcloneStat>(&json_str).unwrap().item),
-            Err(json_str) => Err(serde_json::from_str(&json_str).unwrap()),
-        }
+    /// Get statistics about a file or folder, with the requested hashes.
+    pub fn stat_with(
+        remote_name: &str,
+        path: &str,
+        options: &ListOptions,
+    ) -> Result<Option<RcloneRemoteItem>, RcloneError> {
+        let reply = run(
+            "operations/stat",
+            json!({
+                "fs": remote_fs(remote_name)?,
+                "remote": util::strip_slashes(path),
+                "opt": list_opt(false, &RcloneListFilter::All, options),
+            }),
+        )?;
+        Ok(decode::<RcloneStat>("operations/stat", &reply)?.item)
+    }
+
+    /// Hash a local file with one of rclone's hash types. `None` means the
+    /// type could not be computed.
+    pub fn local_hash(path: &str, hash_type: &str) -> Result<Option<String>, RcloneError> {
+        let reply = run(
+            "operations/stat",
+            json!({
+                "fs": "/",
+                "remote": util::strip_slashes(path),
+                "opt": { "showHash": true, "hashTypes": [hash_type] },
+            }),
+        )?;
+        let item = decode::<RcloneStat>("operations/stat", &reply)?
+            .item
+            .ok_or_else(|| RcloneError::new(format!("'{path}' disappeared while hashing")))?;
+        Ok(item
+            .hashes
+            .get(hash_type)
+            .cloned()
+            .filter(|hash| !hash.is_empty()))
     }
 
     /// List the files/folders in a path.
@@ -128,63 +243,92 @@ pub mod sync {
         recursive: bool,
         filter: RcloneListFilter,
     ) -> Result<Vec<RcloneRemoteItem>, RcloneError> {
-        let opts = match filter {
-            RcloneListFilter::All => json!({ "recurse": recursive }),
-            RcloneListFilter::Dirs => json!({"dirsOnly": true, "recurse": recursive}),
-        };
+        list_with(
+            remote_name,
+            path,
+            recursive,
+            filter,
+            &ListOptions::default(),
+        )
+    }
 
-        let resp = run(
-            "operations/list",
-            &json!({
-                "fs": get_remote_name(remote_name),
-                "remote": util::strip_slashes(path),
-                "opt": opts
-            })
-            .to_string(),
-        );
-
-        match resp {
-            Ok(json_str) => Ok(serde_json::from_str::<RcloneList>(&json_str).unwrap().list),
-            Err(json_str) => Err(serde_json::from_str(&json_str).unwrap()),
+    /// List the files/folders in a path, with hashes and listing options.
+    pub fn list_with(
+        remote_name: &str,
+        path: &str,
+        recursive: bool,
+        filter: RcloneListFilter,
+        options: &ListOptions,
+    ) -> Result<Vec<RcloneRemoteItem>, RcloneError> {
+        let mut input = json!({
+            "fs": remote_fs(remote_name)?,
+            "remote": util::strip_slashes(path),
+            "opt": list_opt(recursive, &filter, options),
+        });
+        if options.use_list_r {
+            input["_config"] = json!({ "UseListR": true });
         }
+        let reply = run("operations/list", input)?;
+        Ok(decode::<RcloneList>("operations/list", &reply)?.list)
+    }
+
+    /// Features, hashes and precision of a remote.
+    pub fn fsinfo(remote_name: &str) -> Result<FsInfo, RcloneError> {
+        let reply = run(
+            "operations/fsinfo",
+            json!({ "fs": remote_fs(remote_name)? }),
+        )?;
+        decode("operations/fsinfo", &reply)
+    }
+
+    /// Free space reported by the remote, when it reports any.
+    pub fn free_space(remote_name: &str) -> Result<Option<i64>, RcloneError> {
+        let reply = run("operations/about", json!({ "fs": remote_fs(remote_name)? }))?;
+        let value: Value = decode("operations/about", &reply)?;
+        Ok(value.get("free").and_then(Value::as_i64))
     }
 
     /// make a directory on the remote.
     pub fn mkdir(remote_name: &str, path: &str) -> Result<(), RcloneError> {
-        common("operations/mkdir", remote_name, path)
+        on_remote("operations/mkdir", remote_name, path)
+    }
+
+    /// Remove an empty directory on the remote; fails when it has contents.
+    pub fn rmdir(remote_name: &str, path: &str) -> Result<(), RcloneError> {
+        on_remote("operations/rmdir", remote_name, path)
+    }
+
+    /// Remove a directory and all of its contents.
+    pub fn purge(remote_name: &str, path: &str) -> Result<(), RcloneError> {
+        on_remote("operations/purge", remote_name, path)
     }
 
     /// Delete a file.
     pub fn delete(remote_name: &str, path: &str) -> Result<(), RcloneError> {
-        common("operations/deletefile", remote_name, path)
-    }
-    /// Remove a directory and all of its contents.
-    pub fn purge(remote_name: &str, path: &str) -> Result<(), RcloneError> {
-        common("operations/purge", remote_name, path)
+        on_remote("operations/deletefile", remote_name, path)
     }
 
-    /// Utility for copy functions.
-    fn copy(
+    /// Copy one file. Every intended transfer sets `IgnoreTimes`: otherwise
+    /// rclone skips a destination whose size and modification time already
+    /// match and reports success without copying.
+    fn transfer(
+        method: &str,
         src_fs: &str,
         src_remote: &str,
         dst_fs: &str,
         dst_remote: &str,
     ) -> Result<(), RcloneError> {
-        let resp = run(
-            "operations/copyfile",
-            &json!({
+        run(
+            method,
+            json!({
                 "srcFs": src_fs,
                 "srcRemote": util::strip_slashes(src_remote),
                 "dstFs": dst_fs,
-                "dstRemote": util::strip_slashes(dst_remote)
-            })
-            .to_string(),
-        );
-
-        match resp {
-            Ok(_) => Ok(()),
-            Err(json_str) => Err(serde_json::from_str(&json_str).unwrap()),
-        }
+                "dstRemote": util::strip_slashes(dst_remote),
+                "_config": { "IgnoreTimes": true },
+            }),
+        )
+        .map(|_| ())
     }
 
     /// Copy a file from the local machine to the remote.
@@ -193,10 +337,11 @@ pub mod sync {
         remote_name: &str,
         remote_destination: &str,
     ) -> Result<(), RcloneError> {
-        copy(
+        transfer(
+            "operations/copyfile",
             "/",
             local_file,
-            &get_remote_name(remote_name),
+            &remote_fs(remote_name)?,
             remote_destination,
         )
     }
@@ -207,11 +352,60 @@ pub mod sync {
         remote_name: &str,
         remote_file: &str,
     ) -> Result<(), RcloneError> {
-        copy(
-            &get_remote_name(remote_name),
+        transfer(
+            "operations/copyfile",
+            &remote_fs(remote_name)?,
             remote_file,
             "/",
             local_destination,
         )
+    }
+
+    /// Copy a file between two paths of the same remote.
+    pub fn copy_on_remote(remote_name: &str, from: &str, to: &str) -> Result<(), RcloneError> {
+        let fs = remote_fs(remote_name)?;
+        transfer("operations/copyfile", &fs, from, &fs, to)
+    }
+
+    /// Move a file between two paths of the same remote (server-side where
+    /// the backend supports it, otherwise copy and delete).
+    pub fn move_on_remote(remote_name: &str, from: &str, to: &str) -> Result<(), RcloneError> {
+        let fs = remote_fs(remote_name)?;
+        transfer("operations/movefile", &fs, from, &fs, to)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_names_with_separators_are_errors_not_panics() {
+        assert!(sync::remote_fs("drive:").is_err());
+        assert!(sync::remote_fs("").is_err());
+        assert!(sync::remote_fs("a/b").is_err());
+        assert_eq!(sync::remote_fs("drive").unwrap(), "drive:");
+    }
+
+    #[test]
+    fn malformed_error_replies_keep_their_text() {
+        assert_eq!(RcloneError::from_reply("not json").error, "not json");
+        assert_eq!(
+            RcloneError::from_reply(r#"{"error":"boom","status":500}"#).error,
+            "boom"
+        );
+    }
+
+    #[test]
+    fn items_keep_size_hashes_id_and_nanoseconds() {
+        let item: RcloneRemoteItem = serde_json::from_str(
+            r#"{"Path":"a/b","Name":"b","Size":5,"ModTime":"1969-12-31T23:59:59.123456789Z","IsDir":false,"Hashes":{"md5":"x"},"ID":"id1"}"#,
+        )
+        .unwrap();
+        assert_eq!(item.size, 5);
+        assert_eq!(item.hashes["md5"], "x");
+        assert_eq!(item.id.as_deref(), Some("id1"));
+        assert_eq!(item.mod_time.unix_timestamp(), -1);
+        assert_eq!(item.mod_time.nanosecond(), 123_456_789);
     }
 }

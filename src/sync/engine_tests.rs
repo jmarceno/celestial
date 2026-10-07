@@ -693,7 +693,7 @@ fn failed_stop_command_preserves_pair_and_history() {
         remote_path: f.dir.remote_path.clone(),
     });
     apply_deletes(&mut f.model, &f.db, &mut f.queue, &f.shared);
-    assert!(f.dir.exists(&f.db));
+    assert!(f.dir.exists(&f.db).unwrap());
     assert_eq!(
         util::await_future(SyncItemsEntity::find().all(&f.db))
             .unwrap()
@@ -1037,4 +1037,48 @@ fn remote_checks_are_due_once_per_interval() {
     assert!(checks.due(2));
     checks.forget(1);
     assert!(checks.due(1));
+}
+
+#[test]
+fn capabilities_are_recorded_per_remote() {
+    let f = Fixture::new();
+    let caps = capabilities::probe(&f.db, &f.remote.name, "test").unwrap();
+    assert_eq!(caps.preferred_hash(), Some("md5"));
+    assert_eq!(
+        store::load_capabilities(&f.db, &f.remote.name).unwrap(),
+        Some(caps)
+    );
+    assert_eq!(store::load_capabilities(&f.db, "other").unwrap(), None);
+}
+
+#[test]
+fn database_is_backed_up_before_a_schema_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("celestial.db");
+    File::create(&path).unwrap();
+    let db = util::await_future(Database::connect(format!("sqlite://{}", path.display()))).unwrap();
+    util::await_future(Migrator::up(&db, Some(4))).unwrap();
+    backup_before_migration(&db, &path).unwrap();
+    let backups = fs::read_dir(temp.path())
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("before-upgrade")
+        })
+        .count();
+    assert_eq!(backups, 1);
+    util::await_future(Migrator::up(&db, None)).unwrap();
+    // Nothing is pending afterwards, so no further copies are made.
+    backup_before_migration(&db, &path).unwrap();
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn malformed_remote_names_are_errors() {
+    assert!(rclone::sync::stat("bad:", "x").is_err());
+    assert!(rclone::sync::list("", "x", false, RcloneListFilter::All).is_err());
 }
