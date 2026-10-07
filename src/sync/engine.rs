@@ -982,17 +982,49 @@ fn directory_changed(
         .iter()
         .map(|row| (row.remote_path.as_str(), row))
         .collect();
-    let mut local_seen = HashSet::new();
-    let mut remote_seen = HashSet::new();
+    let mut local_items_kept = Vec::new();
     for (path, metadata) in local_items {
-        let path = path.to_str().ok_or("Local path is not valid UTF-8")?;
-        let relative = Path::new(path)
+        let path = path
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "Local path is not valid UTF-8")?;
+        let relative = Path::new(&path)
             .strip_prefix(&sync_dir.local_path)
             .map_err(|err| err.to_string())?;
-        if is_ignored(&relative.to_string_lossy(), &ignore_globs) {
-            continue;
+        if !is_ignored(&relative.to_string_lossy(), &ignore_globs) {
+            local_items_kept.push((path, metadata));
         }
-        let Some(row) = local_rows.get(path) else {
+    }
+    let mut remote_items_kept = Vec::new();
+    for item in remote_items {
+        let local_path =
+            util::local_path_for_remote(&sync_dir.local_path, &sync_dir.remote_path, &item.path)
+                .ok_or("Remote path is outside the synced folder")?;
+        let relative = Path::new(&local_path)
+            .strip_prefix(&sync_dir.local_path)
+            .map_err(|err| err.to_string())?;
+        if !is_ignored(&relative.to_string_lossy(), &ignore_globs) {
+            remote_items_kept.push(item);
+        }
+    }
+    // An unmounted drive or a provider returning an empty listing looks like a
+    // folder whose every item was deleted. Never propagate that wholesale.
+    let local_tracked = local_items_kept
+        .iter()
+        .any(|(path, _)| local_rows.contains_key(path.as_str()));
+    let remote_tracked = remote_items_kept
+        .iter()
+        .any(|item| remote_rows.contains_key(item.path.as_str()));
+    if local_items_kept.is_empty() && remote_tracked {
+        return Err("Every synced item is missing from the local folder while the remote still has them. Automatic deletion is paused; check that the local folder or its drive is mounted. To delete everything intentionally, remove the items on both sides.".into());
+    }
+    if remote_items_kept.is_empty() && local_tracked {
+        return Err("Every synced item is missing from the remote folder while the local folder still has them. Automatic deletion is paused; check the remote. To delete everything intentionally, remove the items on both sides.".into());
+    }
+    let mut local_seen = HashSet::new();
+    let mut remote_seen = HashSet::new();
+    for (path, metadata) in local_items_kept {
+        let Some(row) = local_rows.get(path.as_str()) else {
             return Ok(true);
         };
         let timestamp = metadata
@@ -1004,18 +1036,9 @@ fn directory_changed(
         if i64::try_from(timestamp).ok() != Some(i64::from(row.last_local_timestamp)) {
             return Ok(true);
         }
-        local_seen.insert(path.to_owned());
+        local_seen.insert(path);
     }
-    for item in remote_items {
-        let local_path =
-            util::local_path_for_remote(&sync_dir.local_path, &sync_dir.remote_path, &item.path)
-                .ok_or("Remote path is outside the synced folder")?;
-        let relative = Path::new(&local_path)
-            .strip_prefix(&sync_dir.local_path)
-            .map_err(|err| err.to_string())?;
-        if is_ignored(&relative.to_string_lossy(), &ignore_globs) {
-            continue;
-        }
+    for item in remote_items_kept {
         let Some(row) = remote_rows.get(item.path.as_str()) else {
             return Ok(true);
         };

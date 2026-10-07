@@ -137,6 +137,21 @@ impl Fixture {
         }
     }
 
+    /// Probe the pair the way the worker does, then pass only when it changed.
+    fn probed_pass(&mut self) {
+        match directory_changed(&self.db, &self.remote, &self.dir) {
+            Ok(true) => self.pass(),
+            Ok(false) => {}
+            Err(err) => record_error(
+                &mut self.model,
+                &self.shared,
+                &self.remote.name,
+                &self.dir,
+                SyncError::General(self.dir.local_path.clone(), err),
+            ),
+        }
+    }
+
     fn assert_no_errors(&self) {
         assert_eq!(self.model.error_dir_count(), 0, "{}", self.model.snapshot());
     }
@@ -689,4 +704,41 @@ fn failed_stop_command_preserves_pair_and_history() {
         f.model.remotes[&f.remote.name]
             .contains_key(&(f.dir.local_path.clone(), f.dir.remote_path.clone()))
     );
+}
+
+#[test]
+fn emptied_local_root_preserves_remote_files() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::remove_file(f.local.join("file.txt")).unwrap();
+    f.probed_pass();
+    assert_eq!(
+        fs::read_to_string(f.remote_root.join("sandbox/file.txt")).unwrap(),
+        "original"
+    );
+    assert_eq!(f.model.error_dir_count(), 1);
+}
+
+#[test]
+fn emptied_remote_root_preserves_local_files() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::remove_file(f.remote_root.join("sandbox/file.txt")).unwrap();
+    f.probed_pass();
+    assert_eq!(
+        fs::read_to_string(f.local.join("file.txt")).unwrap(),
+        "original"
+    );
+    assert_eq!(f.model.error_dir_count(), 1);
+}
+
+#[test]
+fn partial_deletion_still_propagates() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.seed("neighbor.txt");
+    fs::remove_file(f.local.join("file.txt")).unwrap();
+    f.probed_pass();
+    f.assert_no_errors();
+    assert!(!f.remote_root.join("sandbox/file.txt").exists());
 }
