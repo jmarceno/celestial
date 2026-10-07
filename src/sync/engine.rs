@@ -2185,10 +2185,7 @@ fn sync_remote_directory(
             .strip_prefix(&sync_dir.local_path)
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if ignore_globs
-            .iter()
-            .any(|pattern| pattern.matches(&relative))
-        {
+        if is_ignored(&relative, &ignore_globs) {
             continue;
         }
         note_progress(

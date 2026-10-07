@@ -742,3 +742,20 @@ fn partial_deletion_still_propagates() {
     f.assert_no_errors();
     assert!(!f.remote_root.join("sandbox/file.txt").exists());
 }
+
+#[test]
+fn remote_exclusion_file_never_replaces_local_rules() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join(FILE_IGNORE_NAME), "*.tmp\n").unwrap();
+    set_time(&f.local.join(FILE_IGNORE_NAME), 1_700_000_000);
+    let remote_rules = f.remote_root.join("sandbox").join(FILE_IGNORE_NAME);
+    fs::write(&remote_rules, "*.other\n").unwrap();
+    set_time(&remote_rules, 1_700_000_100);
+    f.seed("file.txt");
+    assert_eq!(
+        fs::read_to_string(f.local.join(FILE_IGNORE_NAME)).unwrap(),
+        "*.tmp\n"
+    );
+    assert_eq!(fs::read_to_string(&remote_rules).unwrap(), "*.other\n");
+    assert!(!directory_changed(&f.db, &f.remote, &f.dir).unwrap());
+}
