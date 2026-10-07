@@ -39,11 +39,8 @@ No watcher dependency, polling interval change, sync-engine replacement or datab
 ## Remaining limitations
 
 - File change detection uses whole-second modification times. Same-second edits or contents changed while preserving modification times can be missed; hashing/size and higher-resolution baselines need a separately validated schema/design change.
-- The stored timestamps are signed 32-bit integers. Dates beyond January 2038 need a migration. Historical migrations remain necessary for existing databases.
-- The existing reconciliation rules treat a remote timestamp moving backwards as a baseline adjustment in some branches. A restored older file may therefore remain different while being reported as synced. Local timestamps moving backwards can also need manual resolution. This policy needs explicit conflict handling and dedicated restore tests.
-- Conflict actions do not recheck whether the source versions or target path have changed since the prompt. They need source-version and symlink revalidation before the chosen copy.
+- A conflict choice is revalidated against the versions shown in the prompt, but the copy itself can still race with an edit made after that final check.
 - Snapshot reads, descendant validation and subsequent copies/deletions are separate operations. Concurrent edits can occur between them. File/directory type replacements still need staged replacement to preserve the old destination on every failure. Provider versioning/conditional writes and staged local transfers need broader integration tests.
-- Previously created duplicate history rows are not automatically rewritten. This change prevents the known new-duplicate branch without migrating existing histories.
 
 ## Deprecated components removed
 
@@ -51,9 +48,27 @@ Removed Snap/makedeb definitions and publishing workflows, the old package-based
 
 The stable app ID, config directory, current logo, active OAuth assets, original license/copyright, release history and database migrations are retained because current functionality or existing data depends on them. Qt may still depend on GLib; GLib runtime libraries are not obsolete GTK application code.
 
+## Follow-up validation
+
+Each claim above was checked against the source and, where it describes behavior, against a regression test on the remote builder. All "confirmed defects repaired" items are present in the code and covered by tests, with two exceptions:
+
+- **Exclusions (partially repaired).** The remote pass matched patterns directly instead of using the shared exclusion check, so a remote `.sync-exclude.lst` was synchronized and could replace the local rules. Fixed; the remote pass now uses the same check as the probe and the local pass.
+- **Root loss (partially repaired).** A missing root paused the pair, but an empty root (an unmounted drive's mount point, or a provider returning an empty listing) still looked like the deletion of every item and was propagated. The change probe now pauses the pair when one side has no items while the other still holds tracked ones.
+
+These limitations from the list above are now resolved:
+
+- Timestamps are stored as 64-bit values. SQLite `INTEGER` columns already hold 64 bits, so no column migration was needed. Files with mtimes after 2038 previously got a baseline of `0` and were rechecked on every probe.
+- Any difference from the recorded baseline counts as a change, in either direction. Restored older versions now propagate, and restores on both sides become a conflict.
+- Conflict prompts record the versions they show. A choice is refused if either item has changed since then, if the local item is reached through a symbolic link or no longer maps into the pair, or if a file and a folder share the name.
+- A migration keeps the oldest row of each duplicate history entry (the one synchronization kept updating) and adds a unique index on `(sync_dir_id, local_path, remote_path)`.
+
+Startup failures now appear under their own title instead of "Unknown Error" with a request for a backtrace. The Clippy command in `AGENTS.md` now omits the forwarded `-- -D warnings`, which cargo-remote cannot pass through.
+
+One suspected issue did not reproduce: folder baselines do converge after a child is added while the parent's timestamps change on both sides.
+
 ## Validation
 
-- 31 remote tests pass: the original 7, 23 isolated synchronization regressions and one additional path-traversal test.
+- 44 remote tests pass: the original 7, 23 isolated synchronization regressions, one path-traversal test and 13 tests added by the follow-up validation (empty roots, remote exclusion file, restored versions, post-2038 timestamps, conflict revalidation and the duplicate-history migration).
 - Local formatting, shell syntax and whitespace checks pass.
 - Remote Clippy (all targets, manifest warning-denial settings) and the release build pass. The originally requested forwarded `-- -D warnings` command fails because cargo-remote strips its separator; the successful retry omits those forwarded arguments.
 - The regenerated portable bundle passes extraction, cache reuse, shared-library closure and headless QML startup with disposable configuration/runtime directories. No GTK libraries or GTK theme plugin remain in its payload. The bundle requires glibc 2.39 or newer; the Ubuntu 22.04 packaging-container path was not exercised.
