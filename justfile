@@ -1,6 +1,6 @@
 # Include .cargo/config.toml so the remote build uses the Qt-compatible linker.
 build:
-    cargo remote -h -- build --release --locked
+    bash scripts/build-run.sh
 
 test:
     cargo remote -h -- test --locked

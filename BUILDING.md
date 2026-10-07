@@ -8,12 +8,12 @@ The remote configuration is `~/.config/cargo-remote/cargo-remote.toml`. SSH conn
 cargo fmt --check
 cargo remote -h -- test --locked
 cargo remote -h -- clippy --locked --all-targets
-cargo remote -h -- build --release --locked
+bash scripts/build-run.sh
 ```
 
 `Cargo.toml` denies Rust warnings and the configured Clippy groups. The installed cargo-remote 0.2.0 strips an additional `--` separator, so forwarding `-- -D warnings` fails with `unexpected argument '-D'`; use the manifest lint settings as above.
 
-Only the finished executable is copied back to `target/release/celeste`; dependencies and intermediate build files stay on the builder. If the remote build fails, report the error instead of compiling locally.
+`scripts/build-run.sh` uses the `cargo remote-release` alias from `.cargo/config.toml` and produces `target/release/celeste.run`, retaining `target/release/celeste` for packaging. Stable Cargo does not support dots in binary target names, so the script adds the suffix after a successful build. This `.run` file is the native executable; the portable bundle is generated separately below. Dependencies and intermediate build files stay on the builder. If the remote build fails, report the error instead of compiling locally.
 
 ## Staging and portable packaging
 
