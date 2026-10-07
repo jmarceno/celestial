@@ -16,6 +16,6 @@ body:
     id: version
     attributes:
       label: What version of Celeste are you using?
-      description: This can be found in Celeste's about page.
+      description: Run `celeste --version` to find it.
     validations:
       required: true

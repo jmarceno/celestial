@@ -194,17 +194,6 @@ ApplicationWindow {
                     }
                 }
                 Button {
-                    text: "About"
-                    flat: true
-                    Layout.fillWidth: true
-                    contentItem: Label { text: "About"; color: root.theme.textMuted; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter }
-                    background: Rectangle { color: "transparent" }
-                    onClicked: {
-                        root.popupMode = "about"
-                        dialog.open()
-                    }
-                }
-                Button {
                     text: "Quit"
                     flat: true
                     Layout.fillWidth: true
@@ -456,7 +445,7 @@ ApplicationWindow {
             anchors.margins: 18
 
             Label {
-                text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync a folder" : (root.popupMode === "about" ? "Celeste" : root.popupTitle))
+                text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync a folder" : root.popupTitle)
                 color: root.theme.textPrimary
                 font.pixelSize: 18
                 font.bold: true
@@ -561,18 +550,6 @@ ApplicationWindow {
                         }
                     }
                 }
-            }
-
-            ColumnLayout {
-                visible: root.popupMode === "about"
-                Layout.fillWidth: true
-                Layout.leftMargin: 18
-                Layout.rightMargin: 18
-                spacing: 6
-                Label { text: "Celeste " + Qt.application.version; color: root.theme.textSecondary; font.pixelSize: 13 }
-                Label { text: "© 2022-2023 Hunter Wittenborn"; color: root.theme.textMuted; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                Label { text: "App icons by Adrien Facélina"; color: root.theme.textMuted; font.pixelSize: 12 }
-                Label { text: "GUI file synchronization that can connect to the providers rclone supports."; color: root.theme.textMuted; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             }
 
             RowLayout {
