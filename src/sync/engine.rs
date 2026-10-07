@@ -906,7 +906,7 @@ fn update_item_timestamps(
     .ok_or(())?;
     let mut active: SyncItemsActiveModel = model.into();
     active.last_local_timestamp = ActiveValue::Set(local_timestamp.try_into().map_err(|_| ())?);
-    active.last_remote_timestamp = ActiveValue::Set(remote_timestamp.try_into().map_err(|_| ())?);
+    active.last_remote_timestamp = ActiveValue::Set(remote_timestamp);
     util::await_future(active.update(db)).map_err(|_| ())?;
     Ok(())
 }
@@ -1033,7 +1033,7 @@ fn directory_changed(
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_secs();
-        if i64::try_from(timestamp).ok() != Some(i64::from(row.last_local_timestamp)) {
+        if i64::try_from(timestamp).ok() != Some(row.last_local_timestamp) {
             return Ok(true);
         }
         local_seen.insert(path);
@@ -1042,7 +1042,7 @@ fn directory_changed(
         let Some(row) = remote_rows.get(item.path.as_str()) else {
             return Ok(true);
         };
-        if item.mod_time.unix_timestamp() != i64::from(row.last_remote_timestamp) {
+        if item.mod_time.unix_timestamp() != row.last_remote_timestamp {
             return Ok(true);
         }
         remote_seen.insert(item.path);
@@ -1181,8 +1181,7 @@ fn remove_unchanged_local(
                     .ok()
                     .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .is_some_and(|time| {
-                        i64::try_from(time.as_secs()).ok()
-                            == Some(i64::from(row.last_local_timestamp))
+                        i64::try_from(time.as_secs()).ok() == Some(row.last_local_timestamp)
                     })
         });
         if !unchanged
@@ -1229,7 +1228,7 @@ fn purge_unchanged_remote(
                 error: err.to_string(),
             })?;
         let unchanged = rows.get(item.path.as_str()).is_some_and(|row| {
-            item.is_dir || item.mod_time.unix_timestamp() == i64::from(row.last_remote_timestamp)
+            item.is_dir || item.mod_time.unix_timestamp() == row.last_remote_timestamp
         });
         if !unchanged || is_ignored(&relative.to_string_lossy(), &patterns) {
             return Err(rclone::RcloneError { error: "Folder contains changed, untracked or excluded items; automatic deletion is paused".into() });
@@ -1556,7 +1555,7 @@ fn sync_local_directory(
             let local_changed = local_utc_timestamp != db_model.last_local_timestamp as u64;
             if local_changed
                 && remote_utc_timestamp.is_some_and(|remote_timestamp| {
-                    remote_timestamp != db_model.last_remote_timestamp as i64
+                    remote_timestamp != db_model.last_remote_timestamp
                 })
             {
                 if let Some(r_item) = remote_item {
@@ -1597,14 +1596,13 @@ fn sync_local_directory(
                         remote,
                         sync_dir,
                         &db_model,
-                        i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                        i32::try_from(rclone_item.mod_time.unix_timestamp())
-                            .unwrap_or(db_model.last_remote_timestamp),
+                        i64::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
+                        rclone_item.mod_time.unix_timestamp(),
                     );
                 }
-            } else if let Some(remote_timestamp) = remote_utc_timestamp.filter(|remote_timestamp| {
-                *remote_timestamp != db_model.last_remote_timestamp as i64
-            }) {
+            } else if let Some(remote_timestamp) = remote_utc_timestamp
+                .filter(|remote_timestamp| *remote_timestamp != db_model.last_remote_timestamp)
+            {
                 if pull_local(
                     item.file_type().ok(),
                     &item,
@@ -1631,9 +1629,8 @@ fn sync_local_directory(
                             remote,
                             sync_dir,
                             &db_model,
-                            i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                            i32::try_from(remote_timestamp)
-                                .unwrap_or(db_model.last_remote_timestamp),
+                            i64::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
+                            remote_timestamp,
                         );
                     }
                 }
@@ -1917,8 +1914,8 @@ fn save_baseline(
     remote: &RemotesModel,
     sync_dir: &SyncDirsModel,
     row: &crate::entities::SyncItemsModel,
-    local_timestamp: i32,
-    remote_timestamp: i32,
+    local_timestamp: i64,
+    remote_timestamp: i64,
 ) {
     let mut active: SyncItemsActiveModel = row.clone().into();
     active.last_local_timestamp = ActiveValue::Set(local_timestamp);
@@ -2013,10 +2010,8 @@ fn record_new_item(
             sync_dir_id: ActiveValue::Set(sync_dir.id),
             local_path: ActiveValue::Set(local_path.to_owned()),
             remote_path: ActiveValue::Set(remote_path.to_owned()),
-            last_local_timestamp: ActiveValue::Set(i32::try_from(local_utc_timestamp).unwrap_or(0)),
-            last_remote_timestamp: ActiveValue::Set(
-                i32::try_from(remote_item.mod_time.unix_timestamp()).unwrap_or(0),
-            ),
+            last_local_timestamp: ActiveValue::Set(i64::try_from(local_utc_timestamp).unwrap_or(0)),
+            last_remote_timestamp: ActiveValue::Set(remote_item.mod_time.unix_timestamp()),
             ..Default::default()
         }
         .insert(db),
@@ -2270,7 +2265,7 @@ fn sync_remote_directory(
             // timestamp that moved backwards because an older version was restored.
             let local_changed = local_timestamp
                 .is_some_and(|l_timestamp| l_timestamp != db_model.last_local_timestamp as u64);
-            let remote_changed = remote_timestamp != db_model.last_remote_timestamp as i64;
+            let remote_changed = remote_timestamp != db_model.last_remote_timestamp;
             if local_changed && remote_changed {
                 if !local_path.is_dir() || !item.is_dir {
                     record_error(
@@ -2317,9 +2312,8 @@ fn sync_remote_directory(
                         remote,
                         sync_dir,
                         &db_model,
-                        i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                        i32::try_from(rclone_item.mod_time.unix_timestamp())
-                            .unwrap_or(db_model.last_remote_timestamp),
+                        i64::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
+                        rclone_item.mod_time.unix_timestamp(),
                     );
                 }
                 continue;
@@ -2353,9 +2347,8 @@ fn sync_remote_directory(
                             remote,
                             sync_dir,
                             &db_model,
-                            i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                            i32::try_from(remote_timestamp)
-                                .unwrap_or(db_model.last_remote_timestamp),
+                            i64::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
+                            remote_timestamp,
                         );
                     }
                 }
@@ -2488,8 +2481,8 @@ fn sync_remote_directory(
                 sync_dir_id: ActiveValue::Set(sync_dir.id),
                 local_path: ActiveValue::Set(local_path_string.clone()),
                 remote_path: ActiveValue::Set(remote_path_string.clone()),
-                last_local_timestamp: ActiveValue::Set(i32::try_from(l_timestamp).unwrap_or(0)),
-                last_remote_timestamp: ActiveValue::Set(i32::try_from(r_timestamp).unwrap_or(0)),
+                last_local_timestamp: ActiveValue::Set(i64::try_from(l_timestamp).unwrap_or(0)),
+                last_remote_timestamp: ActiveValue::Set(r_timestamp),
                 ..Default::default()
             }
             .insert(db),

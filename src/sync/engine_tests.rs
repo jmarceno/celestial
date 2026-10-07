@@ -809,3 +809,18 @@ fn older_versions_restored_on_both_sides_are_a_conflict() {
         "remote restore"
     );
 }
+
+#[test]
+fn timestamps_after_2038_are_recorded() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join("file.txt"), "future").unwrap();
+    set_time(&f.local.join("file.txt"), 4_000_000_000);
+    f.probed_pass();
+    f.assert_no_errors();
+    let row = util::await_future(SyncItemsEntity::find().one(&f.db))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.last_local_timestamp, 4_000_000_000);
+    assert_eq!(row.last_remote_timestamp, 4_000_000_000);
+    assert!(!directory_changed(&f.db, &f.remote, &f.dir).unwrap());
+}

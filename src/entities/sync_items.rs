@@ -14,9 +14,9 @@ pub struct Model {
     /// the configured sync folder prefix).
     pub remote_path: String,
     /// The local UNIX timestamp of the item when last synced.
-    pub last_local_timestamp: i32,
+    pub last_local_timestamp: i64,
     /// The remote UNIX timestamp of the item when last synced.
-    pub last_remote_timestamp: i32,
+    pub last_remote_timestamp: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
