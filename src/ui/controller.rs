@@ -114,14 +114,24 @@ mod qobject {
         );
 
         #[qinvokable]
-        #[cxx_name = "chooseConflict"]
-        fn choose_conflict(
+        #[cxx_name = "confirmDeletion"]
+        fn confirm_deletion(
             self: Pin<&mut Self>,
             remote: &QString,
             local: &QString,
             remote_path: &QString,
             id: i64,
-            keep_local: bool,
+            token: &QString,
+        );
+
+        #[qinvokable]
+        #[cxx_name = "restoreVersion"]
+        fn restore_version(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+            id: i64,
         );
 
         #[qinvokable]
@@ -368,20 +378,35 @@ impl qobject::AppController {
         });
     }
 
-    fn choose_conflict(
+    fn confirm_deletion(
         self: Pin<&mut Self>,
         remote: &QString,
         local: &QString,
         remote_path: &QString,
         id: i64,
-        keep_local: bool,
+        token: &QString,
     ) {
-        self.send(Command::ChooseConflict {
+        self.send(Command::ConfirmDeletion {
             remote: remote.to_string(),
             local: local.to_string(),
             remote_path: remote_path.to_string(),
             id: id as u64,
-            keep_local,
+            token: token.to_string(),
+        });
+    }
+
+    fn restore_version(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+        id: i64,
+    ) {
+        self.send(Command::Restore {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+            recovery_id: id,
         });
     }
 

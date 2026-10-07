@@ -26,6 +26,14 @@ pub enum SyncError {
         reason: String,
         next_attempt: Option<i64>,
     },
+    /// A conflict that was resolved automatically, kept until acknowledged.
+    Conflict {
+        id: i64,
+        rel: String,
+        kind: String,
+        /// JSON describing both versions and where each one now lives.
+        detail: String,
+    },
 }
 
 /// Key of the pair-level error; item issues are keyed by relative path.
@@ -43,6 +51,8 @@ pub struct DirState {
     pub status: String,
     pub phase: String,
     pub errors: Vec<StoredError>,
+    /// Preserved versions that can be restored, newest first.
+    pub recovery: Vec<Value>,
 }
 
 impl DirState {
@@ -51,6 +61,7 @@ impl DirState {
             status: tr::tr!("Awaiting sync check..."),
             phase: "loading".into(),
             errors: Vec::new(),
+            recovery: Vec::new(),
         }
     }
 
@@ -228,6 +239,20 @@ impl Model {
         true
     }
 
+    pub fn set_recovery(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        items: Vec<Value>,
+    ) -> bool {
+        let Some(dir) = self.dir_mut(remote, local, remote_path) else {
+            return false;
+        };
+        dir.recovery = items;
+        true
+    }
+
     /// Record a pair-level problem (kept for callers that only add one).
     pub fn add_error(
         &mut self,
@@ -301,6 +326,7 @@ impl Model {
                             "errorStatus": dir.error_status(),
                             "errors": dir.errors.iter().map(error_json).collect::<Vec<_>>(),
                             "exclusions": read_exclusions(local),
+                            "recovery": dir.recovery,
                         })
                     })
                     .collect();
@@ -317,6 +343,14 @@ impl Model {
 
 fn error_json(err: &StoredError) -> Value {
     match &err.error {
+        SyncError::Conflict {
+            rel, kind, detail, ..
+        } => json!({
+            "id": err.id,
+            "kind": "conflict",
+            "title": conflict_title(kind, rel),
+            "detail": conflict_summary(kind, detail),
+        }),
         SyncError::General(path, message) => json!({
             "id": err.id,
             "kind": "general",
@@ -351,6 +385,63 @@ fn error_json(err: &StoredError) -> Value {
             })
         }
     }
+}
+
+pub fn conflict_title(kind: &str, rel: &str) -> String {
+    match kind {
+        "edit_delete" => tr::tr!("'{}' was deleted on one side and changed on the other", rel),
+        "file_folder" => tr::tr!("A file and a folder were both named '{}'", rel),
+        "bootstrap" => tr::tr!("The local and remote contents of '{}' differ", rel),
+        _ => tr::tr!("Both versions of '{}' were kept", rel),
+    }
+}
+
+/// Where each version of a resolved conflict now lives.
+pub fn conflict_summary(kind: &str, detail: &str) -> String {
+    let detail: Value = serde_json::from_str(detail).unwrap_or(Value::Null);
+    let text = |key: &str| detail[key].as_str().unwrap_or_default().to_owned();
+    let version = |side: &str| {
+        let value = &detail[side];
+        if value.is_null() {
+            return String::new();
+        }
+        if value["isDir"].as_bool() == Some(true) {
+            return tr::tr!("a folder");
+        }
+        tr::tr!(
+            "{} bytes, modified {}",
+            value["size"].as_i64().unwrap_or(-1),
+            value["mtime"].as_str().unwrap_or("?")
+        )
+    };
+    if kind == "edit_delete" {
+        let restored_on = text("restoredOn");
+        let changed = if restored_on == "local" {
+            "remote"
+        } else {
+            "local"
+        };
+        return tr::tr!(
+            "The changed {} version ({}) was restored on the {} side. Delete it again if it is no longer needed.",
+            changed,
+            version(changed),
+            restored_on
+        );
+    }
+    let copy_side = text("copySide");
+    let other = if copy_side == "local" {
+        "remote"
+    } else {
+        "local"
+    };
+    tr::tr!(
+        "The {} version ({}) is now '{}'. The {} version ({}) keeps the name. Both are on both sides.",
+        copy_side,
+        version(&copy_side),
+        text("copy"),
+        other,
+        version(other)
+    )
 }
 
 pub fn read_exclusions(local_path: &str) -> Vec<String> {

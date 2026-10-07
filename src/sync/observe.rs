@@ -134,6 +134,16 @@ impl LocalMeta {
         self == other
     }
 
+    /// Whether this is the same file, unchanged, after Celestial itself
+    /// renamed it (a rename updates the inode change time, so ctime cannot
+    /// be compared here).
+    pub fn same_after_rename(&self, other: &Self) -> bool {
+        self.is_dir == other.is_dir
+            && self.inode == other.inode
+            && self.device == other.device
+            && (self.is_dir || (self.size == other.size && self.mtime == other.mtime))
+    }
+
     /// A file changed within the timestamp granularity of the observation
     /// could change again without changing its tuple, so its fingerprint is
     /// not trusted as a baseline until a later observation. Every content
@@ -189,7 +199,6 @@ pub struct LocalTree {
     pub blocked: BTreeMap<String, String>,
     /// Folders that could not be read; everything below them is unknown.
     pub unreadable: BTreeMap<String, String>,
-    pub observed_at: Stamp,
 }
 
 impl LocalTree {
@@ -260,10 +269,7 @@ pub fn observe_local(
     root: &Path,
     skip: &dyn Fn(&str, &fs::Metadata) -> bool,
 ) -> std::io::Result<LocalTree> {
-    let mut tree = LocalTree {
-        observed_at: Stamp::now(),
-        ..Default::default()
-    };
+    let mut tree = LocalTree::default();
     let mut pending = vec![(root.to_path_buf(), String::new())];
     let mut first = true;
     while let Some((dir, prefix)) = pending.pop() {

@@ -2,6 +2,7 @@
 use super::*;
 use crate::entities::{RemotesActiveModel, SyncItemsActiveModel};
 use crate::sync::model::FILE_IGNORE_NAME;
+use crate::sync::recovery;
 use crate::sync::testing::{Fixture, TestHooks, permissions_apply, set_time};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -217,7 +218,7 @@ fn remote_folder_deletion_preserves_changed_local_children() {
     fs::write(f.local.join("nested/file.txt"), "unsynced edit").unwrap();
     set_time(&f.local.join("nested/file.txt"), 1_700_000_100);
     f.pass();
-    f.assert_no_errors();
+    assert_eq!(conflicts(&f), 1);
     // The edit survives on both sides.
     assert_eq!(f.read_local("nested/file.txt"), "unsynced edit");
     assert_eq!(f.read_remote("nested/file.txt"), "unsynced edit");
@@ -234,7 +235,7 @@ fn local_folder_deletion_preserves_changed_remote_children() {
     fs::write(f.remote_file("nested/file.txt"), "unsynced remote edit").unwrap();
     set_time(&f.remote_file("nested/file.txt"), 1_700_000_100);
     f.pass();
-    f.assert_no_errors();
+    assert_eq!(conflicts(&f), 1);
     assert_eq!(f.read_remote("nested/file.txt"), "unsynced remote edit");
     assert_eq!(f.read_local("nested/file.txt"), "unsynced remote edit");
     // The unchanged sibling follows the local deletion.
@@ -377,7 +378,7 @@ fn remote_update_after_local_delete_restores_without_duplicates() {
     fs::write(f.remote_file("file.txt"), "new remote edit").unwrap();
     set_time(&f.remote_file("file.txt"), 1_700_000_100);
     f.pass();
-    f.assert_no_errors();
+    assert_eq!(conflicts(&f), 1);
     assert_eq!(rows(&f).len(), 2);
     assert_eq!(f.read_local("file.txt"), "new remote edit");
 }
@@ -516,8 +517,32 @@ fn different_versions_restored_on_both_sides_keep_both() {
     fs::write(f.remote_file("file.txt"), "remote restore").unwrap();
     set_time(&f.remote_file("file.txt"), 1_600_000_100);
     f.pass();
-    assert_eq!(f.read_local("file.txt"), "local restore");
+    // The older (local) version moved to a conflict copy; both versions are
+    // on both sides and nothing is left to do.
+    let copy = only_conflict_copy(&f, "file");
+    assert!(copy.contains("-local-"));
+    assert_eq!(f.read_local("file.txt"), "remote restore");
     assert_eq!(f.read_remote("file.txt"), "remote restore");
+    assert_eq!(f.read_local(&copy), "local restore");
+    assert_eq!(f.read_remote(&copy), "local restore");
+    assert_eq!(conflicts(&f), 1);
+    f.pass();
+    assert_eq!(f.last.as_ref().unwrap().actions, 0);
+}
+
+/// The single conflict copy whose name starts with `stem`.
+fn only_conflict_copy(f: &Fixture, stem: &str) -> String {
+    let copies: Vec<String> = fs::read_dir(&f.local)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(stem) && name.contains(".sync-conflict-"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    copies[0].clone()
+}
+
+fn conflicts(f: &Fixture) -> usize {
+    store::open_conflicts(&f.db, f.dir.id).unwrap().len()
 }
 
 #[test]
@@ -630,8 +655,26 @@ fn first_sync_with_different_contents_never_overwrites_by_timestamp() {
     fs::write(f.remote_file("file.txt"), "remote older").unwrap();
     set_time(&f.remote_file("file.txt"), 1_500_000_000);
     f.pass();
-    assert_eq!(f.read_remote("file.txt"), "remote older");
+    let copy = only_conflict_copy(&f, "file");
+    assert!(copy.contains("-remote-"));
     assert_eq!(f.read_local("file.txt"), "local newer");
+    assert_eq!(f.read_remote("file.txt"), "local newer");
+    assert_eq!(f.read_local(&copy), "remote older");
+    assert_eq!(f.read_remote(&copy), "remote older");
+}
+
+#[test]
+fn equal_modification_times_move_the_remote_version() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join("file.txt"), "local text").unwrap();
+    set_time(&f.local.join("file.txt"), 1_700_000_000);
+    fs::write(f.remote_file("file.txt"), "remote text").unwrap();
+    set_time(&f.remote_file("file.txt"), 1_700_000_000);
+    f.pass();
+    let copy = only_conflict_copy(&f, "file");
+    assert!(copy.contains("-remote-"));
+    assert_eq!(f.read_local(&copy), "remote text");
+    assert_eq!(f.read_remote("file.txt"), "local text");
 }
 
 #[test]
@@ -726,8 +769,14 @@ fn file_and_folder_with_one_name_are_both_kept() {
     fs::write(f.local.join("thing/inside.txt"), "inside").unwrap();
     fs::write(f.remote_file("thing"), "a file").unwrap();
     f.pass();
+    f.pass();
+    // The file moved aside; the folder and the file both exist everywhere.
+    let copy = only_conflict_copy(&f, "thing");
     assert_eq!(f.read_local("thing/inside.txt"), "inside");
-    assert_eq!(f.read_remote("thing"), "a file");
+    assert_eq!(f.read_remote("thing/inside.txt"), "inside");
+    assert_eq!(f.read_local(&copy), "a file");
+    assert_eq!(f.read_remote(&copy), "a file");
+    assert_eq!(conflicts(&f), 1);
 }
 
 #[test]
@@ -849,4 +898,240 @@ fn racy_files_are_rechecked_before_their_tuple_is_trusted() {
     assert!(baseline.verified());
     assert!(baseline.local.is_none());
     assert!(baseline.fingerprint.is_some());
+}
+
+fn recovered(f: &Fixture) -> Vec<store::RecoveryItem> {
+    let pair = f.pair();
+    pass::recovery_list(&pair).unwrap()
+}
+
+#[test]
+fn propagated_deletions_are_recoverable_on_both_sides() {
+    for delete_local in [true, false] {
+        let mut f = Fixture::new();
+        f.seed("file.txt");
+        f.seed("neighbor.txt");
+        if delete_local {
+            fs::remove_file(f.local.join("file.txt")).unwrap();
+        } else {
+            fs::remove_file(f.remote_file("file.txt")).unwrap();
+        }
+        f.pass();
+        f.assert_no_errors();
+        assert!(!f.local.join("file.txt").exists());
+        assert!(!f.remote_file("file.txt").exists());
+        let items = recovered(&f);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].side, if delete_local { "remote" } else { "local" });
+        // Restoring puts it back on that side and the next pass propagates it.
+        let pair = f.pair();
+        pass::restore(&pair, items[0].id).unwrap();
+        f.pass();
+        f.assert_no_errors();
+        assert_eq!(f.read_local("file.txt"), "original");
+        assert_eq!(f.read_remote("file.txt"), "original");
+    }
+}
+
+#[test]
+fn replaced_versions_are_preserved_in_both_directions() {
+    let mut f = Fixture::new();
+    f.seed("down.txt");
+    f.seed("up.txt");
+    fs::write(f.remote_file("down.txt"), "remote edit").unwrap();
+    fs::write(f.local.join("up.txt"), "local edit").unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_local("down.txt"), "remote edit");
+    assert_eq!(f.read_remote("up.txt"), "local edit");
+    let items = recovered(&f);
+    assert_eq!(items.len(), 2);
+    for item in &items {
+        let text = if item.side == "local" {
+            fs::read_to_string(&item.stored_path).unwrap()
+        } else {
+            fs::read_to_string(f.remote_root.join(&item.stored_path)).unwrap()
+        };
+        assert_eq!(text, "original", "{item:?}");
+    }
+    // Restoring a version preserves the current one first.
+    let local_item = items.iter().find(|item| item.side == "local").unwrap();
+    let pair = f.pair();
+    pass::restore(&pair, local_item.id).unwrap();
+    assert_eq!(f.read_local("down.txt"), "original");
+    assert_eq!(recovered(&f).len(), 3);
+}
+
+#[test]
+fn internal_folder_is_never_synchronized() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    let internal = fs::read_dir(&f.local)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name.starts_with(".celestial-"))
+        .expect("internal folder");
+    assert!(!f.remote_file(&internal).exists());
+    // A remote item with that name is reported, never downloaded into it.
+    fs::create_dir(f.remote_file(&internal)).unwrap();
+    fs::write(f.remote_file(&format!("{internal}/x")), "x").unwrap();
+    f.pass();
+    assert!(!f.local.join(&internal).join("x").exists());
+    assert_eq!(f.errors().len(), 1);
+}
+
+#[test]
+fn preexisting_folders_are_never_used_as_the_internal_folder() {
+    let mut f = Fixture::new();
+    let uuid = store::pair_uuid(&f.db, f.dir.id).unwrap();
+    let taken = f.local.join(format!(".celestial-{}", &uuid[..8]));
+    fs::create_dir(&taken).unwrap();
+    fs::write(taken.join("mine.txt"), "user data").unwrap();
+    f.pass();
+    f.assert_no_errors();
+    // The person's folder is synchronized like any other.
+    assert_eq!(
+        fs::read_to_string(
+            f.remote_root
+                .join("sandbox")
+                .join(taken.file_name().unwrap())
+                .join("mine.txt")
+        )
+        .unwrap(),
+        "user data"
+    );
+}
+
+#[test]
+fn deletion_after_an_edit_delete_outcome_is_bound_to_what_was_shown() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.seed("neighbor.txt");
+    fs::remove_file(f.local.join("file.txt")).unwrap();
+    fs::write(f.remote_file("file.txt"), "remote edit").unwrap();
+    f.pass();
+    assert_eq!(f.read_local("file.txt"), "remote edit");
+    let record = store::open_conflicts(&f.db, f.dir.id).unwrap().remove(0);
+    assert_eq!(record.kind, "edit_delete");
+    let pair = f.pair();
+    let token = pass::item_token(&pair, "file.txt").unwrap();
+    // A change after the prompt was shown refuses the deletion.
+    fs::write(f.remote_file("file.txt"), "newer remote edit").unwrap();
+    assert!(pass::delete_everywhere(&pair, "file.txt", &token).is_err());
+    assert_eq!(f.read_remote("file.txt"), "newer remote edit");
+    let token = pass::item_token(&pair, "file.txt").unwrap();
+    pass::delete_everywhere(&pair, "file.txt", &token).unwrap();
+    assert!(!f.local.join("file.txt").exists());
+    assert!(!f.remote_file("file.txt").exists());
+    assert_eq!(recovered(&f).len(), 2);
+    f.pass();
+    f.assert_no_errors_except_conflicts();
+}
+
+#[test]
+fn acknowledging_a_conflict_removes_it() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join("file.txt"), "local").unwrap();
+    fs::write(f.remote_file("file.txt"), "remote").unwrap();
+    f.pass();
+    let id = f.errors()[0].id;
+    let (remote, local, remote_path) = f.names();
+    let mut schedule = Schedule::default();
+    dismiss_error(
+        &f.db,
+        &mut f.model,
+        &mut schedule,
+        &remote,
+        &local,
+        &remote_path,
+        id,
+    );
+    assert_eq!(conflicts(&f), 0);
+    f.pass();
+    f.assert_no_errors();
+}
+
+#[test]
+fn retention_keeps_recent_versions_and_the_only_copy_of_deleted_items() {
+    let mut f = Fixture::new();
+    f.seed("live.txt");
+    let internal = recovery::ensure_internal(&f.db, &f.dir).unwrap();
+    let uuid = internal.pair_uuid.clone();
+    let add = |rel: &str, age_days: i64, index: usize| {
+        let path = internal.recovery().join(format!("{rel}.{index}"));
+        fs::write(&path, "old").unwrap();
+        store::insert_recovery(
+            &f.db,
+            &store::RecoveryItem {
+                id: 0,
+                pair_uuid: uuid.clone(),
+                remote_name: f.remote.name.clone(),
+                local_root: f.dir.local_path.clone(),
+                remote_root: f.dir.remote_path.clone(),
+                rel: rel.into(),
+                side: "local".into(),
+                stored_path: path.display().to_string(),
+                reason: "test".into(),
+                op_id: format!("op{rel}{index}"),
+                size: Some(3),
+                mtime: Some(0),
+                created_at: store::now() - age_days * 86_400 + index as i64,
+            },
+        )
+        .unwrap();
+        path
+    };
+    let recent: Vec<_> = (0..12).map(|index| add("live.txt", 0, index)).collect();
+    let expired = add("gone.txt", 40, 0);
+    let rec = recovery::Store {
+        db: &f.db,
+        remote: &f.remote,
+        dir: &f.dir,
+        internal: &internal,
+    };
+    let live = ["live.txt".to_owned()].into();
+    rec.prune(&live).unwrap();
+    // Ten newest versions of a live item remain.
+    assert_eq!(recent.iter().filter(|path| path.exists()).count(), 10);
+    assert!(!recent[0].exists() && !recent[1].exists());
+    // The only copy of a deleted item is kept even when old.
+    assert!(expired.exists());
+}
+
+#[test]
+fn conflict_copies_are_capped_per_item() {
+    let mut f = Fixture::new();
+    for index in 0..12u64 {
+        let name = recovery::conflict_rel(
+            "file.txt",
+            "local",
+            &format!("{index:08x}"),
+            crate::sync::observe::Stamp::new(1_700_000_000 + index as i64 * 60, 0),
+        );
+        fs::write(f.local.join(&name), format!("copy {index}")).unwrap();
+        set_time(&f.local.join(&name), 1_700_000_000);
+    }
+    f.pass();
+    f.pass();
+    f.assert_no_errors();
+    let visible = |root: &Path| {
+        fs::read_dir(root)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".sync-conflict-")
+            })
+            .count()
+    };
+    assert_eq!(visible(&f.local), recovery::MAX_CONFLICT_COPIES);
+    assert_eq!(
+        visible(&f.remote_root.join("sandbox")),
+        recovery::MAX_CONFLICT_COPIES
+    );
+    // The two oldest went to recovery on both sides.
+    assert_eq!(recovered(&f).len(), 4);
 }

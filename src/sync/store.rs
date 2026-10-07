@@ -81,10 +81,53 @@ pub fn next_generation<C: ConnectionTrait>(db: &C, sync_dir_id: i32) -> Result<i
     )
 }
 
+/// The recorded name and (device, inode) of the pair's internal folder.
+/// A folder name and its (device, inode).
+pub type FolderIdentity = (String, (u64, u64));
+
+pub fn internal_dir<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+) -> Result<Option<FolderIdentity>, DbErr> {
+    let rows = query(
+        db,
+        "SELECT internal_name, internal_dev, internal_ino FROM sync_dirs WHERE id = ?",
+        vec![sync_dir_id.into()],
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let name: Option<String> = get(row, "internal_name")?;
+    let dev: Option<i64> = get(row, "internal_dev")?;
+    let ino: Option<i64> = get(row, "internal_ino")?;
+    Ok(match (name, dev, ino) {
+        (Some(name), Some(dev), Some(ino)) => Some((name, (from_db(dev), from_db(ino)))),
+        _ => None,
+    })
+}
+
+pub fn set_internal_dir<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    name: &str,
+    identity: (u64, u64),
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "UPDATE sync_dirs SET internal_name = ?, internal_dev = ?, internal_ino = ? WHERE id = ?",
+        vec![
+            name.into(),
+            to_db(identity.0).into(),
+            to_db(identity.1).into(),
+            sync_dir_id.into(),
+        ],
+    )
+    .map(|_| ())
+}
+
 // ---------------------------------------------------------------- baselines
 
 pub const SYNCED: &str = "synced";
-pub const NEEDS_VERIFICATION: &str = "needs_verification";
 
 /// The last common contents of an item, and what each side looked like then.
 #[derive(Clone, Debug, PartialEq)]
@@ -698,6 +741,43 @@ pub fn mark_recovery<C: ConnectionTrait>(db: &C, id: i64, column: &str) -> Resul
         _ => "UPDATE recovery_items SET pruned_at = ? WHERE id = ?",
     };
     exec(db, sql, vec![now().into(), id.into()]).map(|_| ())
+}
+
+/// Operations whose preserved versions must not be pruned: unresolved
+/// conflicts and operations that did not finish.
+pub fn protected_operations<C: ConnectionTrait>(
+    db: &C,
+    pair_uuid: &str,
+) -> Result<std::collections::HashSet<String>, DbErr> {
+    query(
+        db,
+        "SELECT op_id AS id FROM conflicts WHERE pair_uuid = ? AND acknowledged = 0
+         UNION SELECT id FROM operations WHERE pair_uuid = ? AND state NOT IN ('complete', 'failed')",
+        vec![pair_uuid.into(), pair_uuid.into()],
+    )?
+    .iter()
+    .map(|row| get::<String>(row, "id"))
+    .collect()
+}
+
+pub fn recovery_by_id<C: ConnectionTrait>(
+    db: &C,
+    pair_uuid: &str,
+    id: i64,
+) -> Result<Option<RecoveryItem>, DbErr> {
+    Ok(list_recovery(db, pair_uuid)?
+        .into_iter()
+        .find(|item| item.id == id))
+}
+
+pub fn conflict_by_id<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    id: i64,
+) -> Result<Option<ConflictRecord>, DbErr> {
+    Ok(open_conflicts(db, sync_dir_id)?
+        .into_iter()
+        .find(|record| record.id == id))
 }
 
 // ------------------------------------------------------------- capabilities

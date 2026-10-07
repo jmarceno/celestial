@@ -217,6 +217,16 @@ impl Fixture {
         assert_eq!(self.model.error_dir_count(), 0, "{:?}", self.errors());
     }
 
+    /// No problems besides informational conflict records.
+    pub fn assert_no_errors_except_conflicts(&self) {
+        let errors: Vec<_> = self
+            .errors()
+            .into_iter()
+            .filter(|err| !matches!(err.error, SyncError::Conflict { .. }))
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
     pub fn seed(&mut self, name: &str) {
         fs::write(self.local.join(name), "original").unwrap();
         set_time(&self.local.join(name), 1_700_000_000);

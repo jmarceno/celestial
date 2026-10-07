@@ -112,11 +112,11 @@ ApplicationWindow {
                 if (root.popupMode === "auth") root.closeDialog()
                 return
             }
-            if (kind === "conflict" || kind === "confirm-dismiss") {
+            if (kind === "conflict-info" || kind === "confirm-dismiss") {
                 root.popupMode = kind
                 root.popupTitle = title
-                root.popupBody = kind === "conflict" ? "Which item would you like to keep?" : ""
                 root.popupRef = root.parse(body, {})
+                root.popupBody = kind === "conflict-info" ? (root.popupRef.text || "") : ""
                 dialog.open()
                 return
             }
@@ -414,6 +414,45 @@ ApplicationWindow {
                         }
                     }
                 }
+                Label {
+                    text: "Preserved versions"
+                    color: root.theme.textSecondary
+                    font.pixelSize: 13
+                    font.bold: true
+                    visible: root.detail && root.detail.recovery && root.detail.recovery.length > 0
+                }
+                Repeater {
+                    model: root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : []
+                    Rectangle {
+                        required property var modelData
+                        width: root.width - root.theme.sidebarWidth - 44
+                        implicitHeight: recoveryRow.implicitHeight + 16
+                        radius: root.theme.radiusSm
+                        color: root.theme.cardBg
+                        border.color: root.theme.borderSubtle
+                        RowLayout {
+                            id: recoveryRow
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.margins: 8
+                            spacing: 8
+                            Column {
+                                Layout.fillWidth: true
+                                spacing: 2
+                                Label { text: modelData.rel + " (" + modelData.side + ")"; color: root.theme.textPrimary; font.pixelSize: 13; elide: Text.ElideMiddle; width: parent.width }
+                                Label { text: modelData.reason + " · " + modelData.when; color: root.theme.textMuted; font.pixelSize: 12; elide: Text.ElideRight; width: parent.width }
+                            }
+                            Button {
+                                text: "Restore"
+                                flat: true
+                                contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
+                                background: Rectangle { color: "transparent" }
+                                onClicked: root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, modelData.id)
+                            }
+                        }
+                    }
+                }
                 Label { text: "File/folder exclusions"; color: root.theme.textSecondary; font.pixelSize: 13; font.bold: true }
                 Label {
                     text: "One glob per line, stored in .sync-exclude.lst inside the local folder."
@@ -577,7 +616,7 @@ ApplicationWindow {
                 Layout.bottomMargin: 18
                 Item { Layout.fillWidth: true }
                 Button {
-                    text: root.popupMode === "auth" || root.popupMode === "conflict" ? "Cancel" : (root.popupMode === "fatal" ? "Quit" : "Close")
+                    text: root.popupMode === "auth" ? "Cancel" : (root.popupMode === "fatal" ? "Quit" : "Close")
                     flat: true
                     contentItem: Label { text: parent.text; color: root.theme.textSecondary; font.pixelSize: 13 }
                     background: Rectangle { color: "transparent" }
@@ -589,8 +628,8 @@ ApplicationWindow {
                     }
                 }
                 PrimaryButton {
-                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync" : (root.popupMode === "conflict" ? "Keep local" : "Confirm"))
-                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict"
+                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync" : (root.popupMode === "conflict-info" ? "Acknowledge" : "Confirm"))
+                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info"
                     onClicked: {
                         if (root.popupMode === "login") {
                             root.controller.submitLogin(JSON.stringify({
@@ -617,17 +656,17 @@ ApplicationWindow {
                         } else if (root.popupMode === "confirm-dismiss") {
                             root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
                             root.closeDialog()
-                        } else if (root.popupMode === "conflict") {
-                            root.controller.chooseConflict(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id, true)
+                        } else if (root.popupMode === "conflict-info") {
+                            root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
                             root.closeDialog()
                         }
                     }
                 }
                 PrimaryButton {
-                    text: "Keep remote"
-                    visible: root.popupMode === "conflict"
+                    text: "Delete everywhere"
+                    visible: root.popupMode === "conflict-info" && root.popupRef && root.popupRef.canDelete === true
                     onClicked: {
-                        root.controller.chooseConflict(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id, false)
+                        root.controller.confirmDeletion(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.conflictId, root.popupRef.token)
                         root.closeDialog()
                     }
                 }

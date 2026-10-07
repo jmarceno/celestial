@@ -3,11 +3,11 @@
 mod capabilities;
 mod engine;
 pub mod model;
+mod observe;
 mod pass;
 mod reconcile;
-// The reconciliation engine builds on these in the following changes.
-#[allow(dead_code)]
-mod observe;
+mod recovery;
+// The operation journal is used by crash recovery in the next change.
 #[allow(dead_code)]
 mod store;
 #[cfg(test)]
@@ -44,12 +44,21 @@ pub enum Command {
         remote_path: String,
         id: u64,
     },
-    ChooseConflict {
+    /// Delete an item on both sides after an edit/delete outcome. `token`
+    /// is what was shown; the action is refused if either side changed.
+    ConfirmDeletion {
         remote: String,
         local: String,
         remote_path: String,
         id: u64,
-        keep_local: bool,
+        token: String,
+    },
+    /// Put a preserved version back.
+    Restore {
+        remote: String,
+        local: String,
+        remote_path: String,
+        recovery_id: i64,
     },
     DismissError {
         remote: String,

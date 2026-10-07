@@ -152,7 +152,14 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         }
         apply_deletes(&mut model, &db, &mut queue, shared);
         shared.publish(&mut model);
-        apply_between_passes(shared, &db, &mut model, &mut queue, &mut schedule);
+        apply_between_passes(
+            shared,
+            &db,
+            &mut model,
+            &mut queue,
+            &mut schedule,
+            &mut capabilities,
+        );
         if shared.quit_requested() {
             break;
         }
@@ -384,9 +391,41 @@ fn sync_pair(
         }
     }
     if matches!(sync_dir.exists(db), Ok(true)) {
+        refresh_recovery(model, &pair);
         model.mark_finished(&remote.name, names.0, names.1);
         shared.publish(model);
     }
+}
+
+/// Show the pair's preserved versions so they can be restored.
+fn refresh_recovery(model: &mut Model, pair: &Pair) {
+    let items = match pass::recovery_list(pair) {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!("could not list preserved versions: {err}");
+            return;
+        }
+    };
+    let values = items
+        .iter()
+        .take(50)
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "rel": item.rel,
+                "side": item.side,
+                "reason": item.reason,
+                "size": item.size,
+                "when": super::observe::Stamp::new(item.created_at, 0).to_string(),
+            })
+        })
+        .collect();
+    model.set_recovery(
+        &pair.remote.name,
+        &pair.dir.local_path,
+        &pair.dir.remote_path,
+        values,
+    );
 }
 
 struct WorkerHooks<'a> {
@@ -567,7 +606,10 @@ fn process_deletions(model: &mut Model, db: &DatabaseConnection, shared: &Shared
             tx.commit().await
         });
         match result {
-            Ok(()) => model.remove_dir(&remote_name, &local, &remote_path),
+            Ok(()) => {
+                model.remove_dir(&remote_name, &local, &remote_path);
+                note_preserved(db, shared, &remote_name, &local);
+            }
             Err(err) => shared.dialog("error", "Could not stop synchronization", err.to_string()),
         }
     }
@@ -604,6 +646,30 @@ fn process_deletions(model: &mut Model, db: &DatabaseConnection, shared: &Shared
     }
 }
 
+/// Stopping a pair keeps its preserved versions; say where they are.
+fn note_preserved(db: &DatabaseConnection, shared: &Shared, remote: &str, local: &str) {
+    let count = store::query(
+        db,
+        "SELECT COUNT(*) AS n FROM recovery_items WHERE remote_name = ? AND local_root = ? AND pruned_at IS NULL",
+        vec![remote.into(), local.into()],
+    )
+    .ok()
+    .and_then(|rows| rows.first().and_then(|row| row.try_get::<i64>("", "n").ok()))
+    .unwrap_or(0);
+    if count > 0 {
+        shared.dialog(
+            "info",
+            tr::tr!("Preserved versions were kept"),
+            tr::tr!(
+                "{} preserved versions of this folder remain in its '.celestial-' folder and in '{}:{}'. They are not deleted automatically.",
+                count,
+                remote,
+                super::recovery::REMOTE_RECOVERY_ROOT
+            ),
+        );
+    }
+}
+
 async fn forget_pair_state(tx: &DatabaseTransaction, sync_dir_id: i32) -> Result<(), DbErr> {
     // Recovery records and incomplete operations are kept: they are keyed by
     // the pair's identity so preserved versions are never silently dropped.
@@ -625,7 +691,7 @@ fn find_pair(
     remote: &str,
     local: &str,
     remote_path: &str,
-) -> Option<SyncDirsModel> {
+) -> Option<(RemotesModel, SyncDirsModel)> {
     let remote = util::await_future(
         RemotesEntity::find()
             .filter(RemotesColumn::Name.eq(remote))
@@ -633,7 +699,7 @@ fn find_pair(
     )
     .ok()
     .flatten()?;
-    util::await_future(
+    let dir = util::await_future(
         SyncDirsEntity::find()
             .filter(SyncDirsColumn::RemoteId.eq(remote.id))
             .filter(SyncDirsColumn::LocalPath.eq(local))
@@ -641,7 +707,28 @@ fn find_pair(
             .one(db),
     )
     .ok()
-    .flatten()
+    .flatten()?;
+    Some((remote, dir))
+}
+
+/// The capabilities of a remote, probing it when they are not known yet.
+fn caps_for(
+    db: &DatabaseConnection,
+    capabilities: &mut HashMap<String, Capabilities>,
+    remote: &str,
+) -> Result<Capabilities, String> {
+    if let Some(caps) = capabilities.get(remote) {
+        return Ok(caps.clone());
+    }
+    let caps = match capabilities::probe(db, remote, "unknown") {
+        Ok(caps) => caps,
+        // Offline: the capabilities recorded earlier still describe it.
+        Err(err) => store::load_capabilities(db, remote)
+            .map_err(|db_err| db_err.to_string())?
+            .ok_or(err)?,
+    };
+    capabilities.insert(remote.to_owned(), caps.clone());
+    Ok(caps)
 }
 
 fn apply_between_passes(
@@ -650,6 +737,7 @@ fn apply_between_passes(
     model: &mut Model,
     queue: &mut VecDeque<Command>,
     schedule: &mut Schedule,
+    capabilities: &mut HashMap<String, Capabilities>,
 ) {
     while let Some(cmd) = queue.pop_front() {
         if shared.quit_requested() {
@@ -697,9 +785,88 @@ fn apply_between_passes(
                 local,
                 remote_path,
                 id,
-            } => activate_error(shared, model, &remote, &local, &remote_path, id),
-            Command::ChooseConflict { .. } => {
-                tracing::info!("ignoring an outdated conflict choice");
+            } => activate_error(
+                shared,
+                db,
+                model,
+                capabilities,
+                &remote,
+                &local,
+                &remote_path,
+                id,
+            ),
+            Command::ConfirmDeletion {
+                remote,
+                local,
+                remote_path,
+                id,
+                token,
+            } => {
+                let result = find_pair(db, &remote, &local, &remote_path)
+                    .ok_or_else(|| tr::tr!("The synced folder no longer exists."))
+                    .and_then(|(remote, dir)| {
+                        let caps = caps_for(db, capabilities, &remote.name)?;
+                        let id = i64::try_from(id).map_err(|err| err.to_string())?;
+                        let record = store::conflict_by_id(db, dir.id, id)
+                            .map_err(|err| err.to_string())?
+                            .ok_or_else(|| tr::tr!("This item was already resolved."))?;
+                        let pair = Pair {
+                            db,
+                            remote: &remote,
+                            dir: &dir,
+                            caps: &caps,
+                        };
+                        pass::delete_everywhere(&pair, &record.rel, &token)?;
+                        store::acknowledge_conflict(db, dir.id, id)
+                            .map_err(|err| err.to_string())?;
+                        schedule.wake(dir.id);
+                        refresh_recovery(model, &pair);
+                        Ok(record.rel)
+                    });
+                match result {
+                    Ok(rel) => shared.dialog(
+                        "info",
+                        tr::tr!("Deleted"),
+                        tr::tr!(
+                            "'{}' was deleted on both sides. Both versions were preserved and can be restored.",
+                            rel
+                        ),
+                    ),
+                    Err(err) => shared.dialog("error", tr::tr!("Nothing was deleted"), err),
+                }
+            }
+            Command::Restore {
+                remote,
+                local,
+                remote_path,
+                recovery_id,
+            } => {
+                let result = find_pair(db, &remote, &local, &remote_path)
+                    .ok_or_else(|| tr::tr!("The synced folder no longer exists."))
+                    .and_then(|(remote, dir)| {
+                        let caps = caps_for(db, capabilities, &remote.name)?;
+                        let pair = Pair {
+                            db,
+                            remote: &remote,
+                            dir: &dir,
+                            caps: &caps,
+                        };
+                        let rel = pass::restore(&pair, recovery_id)?;
+                        schedule.wake(dir.id);
+                        refresh_recovery(model, &pair);
+                        Ok(rel)
+                    });
+                match result {
+                    Ok(rel) => shared.dialog(
+                        "info",
+                        tr::tr!("Restored"),
+                        tr::tr!(
+                            "'{}' was restored; the version it replaced was preserved. The restored version is synchronized next.",
+                            rel
+                        ),
+                    ),
+                    Err(err) => shared.dialog("error", tr::tr!("Nothing was restored"), err),
+                }
             }
         }
         shared.publish(model);
@@ -720,7 +887,7 @@ fn dismiss_error(
     let Some(dismissed) = model.dismiss_error(remote, local, remote_path, id) else {
         return;
     };
-    let Some(sync_dir) = find_pair(db, remote, local, remote_path) else {
+    let Some((_, sync_dir)) = find_pair(db, remote, local, remote_path) else {
         return;
     };
     let result = match &dismissed.error {
@@ -728,6 +895,9 @@ fn dismiss_error(
             store::retry_now(db, sync_dir.id, rel)
         }
         SyncError::Item { rel, .. } => store::clear_item_state(db, sync_dir.id, rel),
+        SyncError::Conflict { id, .. } => {
+            store::acknowledge_conflict(db, sync_dir.id, *id).map(|_| ())
+        }
         SyncError::General(..) => Ok(()),
     };
     if let Err(err) = result {
@@ -736,9 +906,12 @@ fn dismiss_error(
     schedule.wake(sync_dir.id);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn activate_error(
     shared: &Shared,
+    db: &DatabaseConnection,
     model: &mut Model,
+    capabilities: &mut HashMap<String, Capabilities>,
     remote_name: &str,
     local: &str,
     remote_path: &str,
@@ -747,6 +920,44 @@ fn activate_error(
     let Some(stored) = model.error_by_id(remote_name, local, remote_path, id) else {
         return;
     };
+    if let SyncError::Conflict {
+        id: conflict_id,
+        rel,
+        kind,
+        detail,
+    } = &stored.error
+    {
+        // Bind a deletion to exactly what is shown now.
+        let token = (kind == "edit_delete")
+            .then(|| {
+                let (remote, dir) = find_pair(db, remote_name, local, remote_path)?;
+                let caps = caps_for(db, capabilities, &remote.name).ok()?;
+                let pair = Pair {
+                    db,
+                    remote: &remote,
+                    dir: &dir,
+                    caps: &caps,
+                };
+                pass::item_token(&pair, rel).ok()
+            })
+            .flatten();
+        shared.dialog(
+            "conflict-info",
+            model::conflict_title(kind, rel),
+            json!({
+                "remote": remote_name,
+                "local": local,
+                "remotePath": remote_path,
+                "id": id,
+                "conflictId": conflict_id,
+                "text": model::conflict_summary(kind, detail),
+                "canDelete": token.is_some(),
+                "token": token.unwrap_or_default(),
+            })
+            .to_string(),
+        );
+        return;
+    }
     let title = match &stored.error {
         SyncError::General(..) => tr::tr!("Would you like to dismiss this error?"),
         SyncError::Item { state, reason, .. } if state == store::RETRYING => tr::tr!(
@@ -757,6 +968,7 @@ fn activate_error(
             "{}\n\nNothing was changed. Check this item again now?",
             reason
         ),
+        SyncError::Conflict { .. } => return,
     };
     shared.dialog(
         "confirm-dismiss",
