@@ -33,12 +33,18 @@ pub fn spawn(
         .name("celeste-sync".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(&shared, rx)));
-            let failure = match result {
-                Ok(Ok(())) => None,
-                Ok(Err(message)) => Some(message),
-                Err(payload) => Some(panic_message(payload)),
-            };
-            if let Some(message) = failure {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => {
+                    tracing::error!("sync worker could not start: {message}");
+                    shared.dialog(
+                        "fatal",
+                        tr::tr!("Unable to start synchronization"),
+                        message,
+                    );
+                }
+                Err(payload) => {
+                    let message = panic_message(payload);
                 tracing::error!("sync worker panicked: {message}");
                 shared.dialog(
                     "fatal",
@@ -48,6 +54,7 @@ pub fn spawn(
                         tr::tr!("An unknown error has occurred while running. This is an internal issue with Celeste and should be reported.\n\nThe following backtrace may help with debugging the issue - note that it may contain information such as login tokens/keys, so avoid posting the information publicly:")
                     ),
                 );
+                }
             }
             shared.stopped.store(true, Ordering::Relaxed);
         })
