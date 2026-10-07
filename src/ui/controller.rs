@@ -4,8 +4,8 @@
 //! The sync worker owns rclone and the database.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::QString;
@@ -235,7 +235,11 @@ impl qobject::AppController {
                     }
                 }
             }
-            if rt.activations.as_ref().is_some_and(|rx| rx.try_iter().count() > 0) {
+            if rt
+                .activations
+                .as_ref()
+                .is_some_and(|rx| rx.try_iter().count() > 0)
+            {
                 show = true;
                 activate = true;
             }

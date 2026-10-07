@@ -10,8 +10,8 @@ pub struct Model {
     pub sync_dir_id: i32,
     /// The local item being synced, as an absolute path with no '/' at the end.
     pub local_path: String,
-    /// The remote path being synced, relative to the directory of the matching
-    /// `SyncDirs::sync_dir` specified by `Self::sync_dir_id`.
+    /// The remote path being synced, relative to the provider root (including
+    /// the configured sync folder prefix).
     pub remote_path: String,
     /// The local UNIX timestamp of the item when last synced.
     pub last_local_timestamp: i32,

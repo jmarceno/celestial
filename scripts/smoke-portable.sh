@@ -20,6 +20,8 @@ SANDBOX="$(mktemp -d -t "$APP-smoke-XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT
 export XDG_CACHE_HOME="$SANDBOX/cache" XDG_CONFIG_HOME="$SANDBOX/config"
 export XDG_DATA_HOME="$SANDBOX/data" XDG_RUNTIME_DIR="$SANDBOX/runtime"
+# Override an inherited test/config path as well, so a smoke cannot open real accounts.
+export CELESTE_CONFIG_DIR="$SANDBOX/config/celeste"
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
 
 echo "--- first launch (clean extraction) ---"
@@ -42,7 +44,7 @@ fi
 echo "--- headless GUI start ---"
 LOG="$SANDBOX/gui.log"
 # The watchdog exits 2 within 10 s if QML fails; success = bootstrap log line.
-QT_QPA_PLATFORM=offscreen CELESTE_LOG=info timeout 8 "$ABS_RUN" >"$LOG" 2>&1 || true
+DISPLAY="${DISPLAY:-:0}" QT_QPA_PLATFORM=offscreen CELESTE_LOG=info timeout 8 "$ABS_RUN" >"$LOG" 2>&1 || true
 if ! grep -q "QML bootstrap complete" "$LOG"; then
   cat "$LOG" >&2
   echo "error: QML UI did not load" >&2

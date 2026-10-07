@@ -1,4 +1,4 @@
-//! Field checks that used to live on the GTK login rows.
+//! Validate cloud login fields.
 
 use crate::rclone;
 use regex::Regex;
@@ -16,10 +16,7 @@ pub struct LoginRequest {
 }
 
 pub fn validate_name(name: &str) -> Result<(), String> {
-    let existing: Vec<String> = rclone::get_remotes()
-        .iter()
-        .map(|config| config.remote_name())
-        .collect();
+    let existing = rclone::get_remotes()?;
     if existing.iter().any(|n| n == name) {
         return Err(tr::tr!("Name already exists."));
     }
@@ -77,7 +74,7 @@ pub fn validate_totp(code: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check a login request the same way the old form did before submit.
+/// Check a login request before creating its remote.
 pub fn validate(req: &LoginRequest) -> Result<(), String> {
     validate_name(&req.name)?;
     match req.kind.as_str() {

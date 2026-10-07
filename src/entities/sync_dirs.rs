@@ -21,14 +21,10 @@ impl Model {
     // See if this item still exists in the database (i.e. the struct was created
     // and the item was later deleted).
     pub fn exists(&self, db: &DatabaseConnection) -> bool {
-        util::await_future(
-            Entity::find()
-                .filter(Column::LocalPath.eq(self.local_path.clone()))
-                .filter(Column::RemotePath.eq(self.remote_path.clone()))
-                .one(db),
-        )
-        .unwrap()
-        .is_some()
+        util::await_future(Entity::find_by_id(self.id).one(db))
+            .ok()
+            .flatten()
+            .is_some()
     }
 }
 

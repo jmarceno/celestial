@@ -10,9 +10,9 @@
 # and execs the app; later launches reuse that tree. Needs nothing on the
 # host beyond a kernel, glibc and a GPU/display stack.
 #
-# The bundle inherits the glibc floor of the machine that built it, so
-# release builds MUST use --container (Ubuntu 22.04, glibc 2.35). A native
-# build is fine for local testing.
+# The binary is compiled by cargo remote. Its glibc and Qt requirements
+# must match the libraries used for packaging; --container cannot lower
+# the ABI requirements of a binary already compiled on rust-builder.
 #
 # Usage:
 #   ./scripts/build-portable.sh [--container] [--rebuild-image]
@@ -78,16 +78,13 @@ if [[ "$CONTAINER" -eq 1 ]]; then
     INNER_ARGS+=(--output-dir "/workspace/${OUTPUT_DIR#"$PROJECT_ROOT"/}")
   fi
   echo "--- Building portable bundle inside $IMAGE ---"
-  # Named volumes keep cargo's registry and target dir across runs, so
-  # rebuilds are incremental. The target dir is NOT the host's target/
-  # (different glibc / Qt: mixing them causes confusing link errors).
+  "$PROJECT_ROOT/scripts/build-native.sh" --release --stage "${STAGE:-$PROJECT_ROOT/build/stage}"
+  # Compilation stays on rust-builder; the container only bundles libraries.
   docker run --rm \
     -v "$PROJECT_ROOT:/workspace" \
-    -v "$APP-portable-cargo:/opt/cargo/registry" \
-    -v "$APP-portable-target:/workspace-target" \
-    -e CARGO_TARGET_DIR=/workspace-target \
     ${APP_VERSION:+-e APP_VERSION="$APP_VERSION"} \
     -e PORTABLE_CHOWN_TO="$(id -u):$(id -g)" \
+    -e CELESTE_PACKAGE_STAGED=1 \
     -w /workspace "$IMAGE" ./scripts/build-portable.sh "${INNER_ARGS[@]}"
   exit $?
 fi
@@ -115,9 +112,11 @@ done
 QMAKE="${QMAKE:-$(command -v qmake6 || command -v qmake || true)}"
 [[ -n "$QMAKE" ]] || die "qmake6/qmake not found"
 
-# Always re-stage: cargo makes a no-op rebuild cheap, and a stale stage is
+# Always re-stage from the remote build: a stale stage is
 # how an old binary ends up in a new bundle.
-"$PROJECT_ROOT/scripts/build-native.sh" --release --stage "$STAGE"
+if [[ "${CELESTE_PACKAGE_STAGED:-0}" != 1 ]]; then
+  "$PROJECT_ROOT/scripts/build-native.sh" --release --stage "$STAGE"
+fi
 [[ -x "$STAGE/bin/$APP" ]] || die "staged binary missing at $STAGE/bin/$APP"
 
 rm -rf "$PAYLOAD"
@@ -148,6 +147,9 @@ for cat in platforms platforminputcontexts platformthemes imageformats iconengin
     cp -a "$QT_PLUGINS_DIR/$cat/." "$PAYLOAD/plugins/$cat/"
   fi
 done
+# Qt Quick uses the Basic style; GTK platform themes add an unused toolkit.
+rm -f "$PAYLOAD/plugins/platformthemes/libqgtk"*
+
 # Optional KDE image codecs often link against libs absent from the build
 # host; Qt's built-in image plugins cover normal use.
 rm -f "$PAYLOAD/plugins/imageformats/kimg_"*
@@ -237,7 +239,7 @@ echo "  max GLIBC required:   ${GLIBC_FLOOR:-none}"
 echo "  max GLIBCXX required: $(max_sym GLIBCXX || true)"
 if [[ -n "$GLIBC_FLOOR" && "$(printf '%s\n%s\n' "$GLIBC_BASELINE" "$GLIBC_FLOOR" | sort -Vu | tail -n1)" != "$GLIBC_BASELINE" ]]; then
   echo "  WARNING: bundle needs $GLIBC_FLOOR (> $GLIBC_BASELINE); it will not run on older distros."
-  echo "  WARNING: use --container for release builds."
+  echo "  WARNING: the ABI floor is determined by rust-builder, even with --container."
 fi
 
 # --- verify ---------------------------------------------------------------

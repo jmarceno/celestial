@@ -1,10 +1,6 @@
-//! The sync loop from the GTK app, with widget updates replaced by [`Model`].
-//!
-//! Decisions about which copy wins are unchanged. Dialogs are reported to the
-//! window and applied on a later pass, at the same points the old loop was
-//! free to take a click.
+//! Two-way synchronization worker. The Qt window communicates through [`Model`].
 
-use super::model::{self, Model, SyncError, FILE_IGNORE_NAME};
+use super::model::{self, FILE_IGNORE_NAME, Model, SyncError};
 use super::{Command, Shared};
 use crate::{
     entities::{
@@ -16,11 +12,12 @@ use crate::{
     rclone::{self, RcloneListFilter},
     util,
 };
-use sea_orm::{entity::prelude::*, ActiveValue, Database, DatabaseConnection};
+use sea_orm::TransactionTrait;
+use sea_orm::{ActiveValue, Database, DatabaseConnection, entity::prelude::*};
 use serde_json::json;
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     path::{Path, PathBuf},
     sync::atomic::Ordering,
@@ -36,8 +33,12 @@ pub fn spawn(
         .name("celeste-sync".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(&shared, rx)));
-            if let Err(payload) = result {
-                let message = panic_message(payload);
+            let failure = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(message)) => Some(message),
+                Err(payload) => Some(panic_message(payload)),
+            };
+            if let Some(message) = failure {
                 tracing::error!("sync worker panicked: {message}");
                 shared.dialog(
                     "fatal",
@@ -65,20 +66,21 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(), String> {
     let mut config = util::get_config_dir();
-    fs::create_dir_all(&config).map_err(|err| {
-        tr::tr!("Unable to create Celeste's config directory [{}].", err)
-    })?;
+    fs::create_dir_all(&config)
+        .map_err(|err| tr::tr!("Unable to create Celeste's config directory [{}].", err))?;
     config.push("rclone.conf");
     librclone::initialize();
-    librclone::rpc("config/setpath", json!({ "path": config.display().to_string() }).to_string())
-        .map_err(|err| format!("Could not set the rclone config path: {err}"))?;
+    librclone::rpc(
+        "config/setpath",
+        json!({ "path": config.display().to_string() }).to_string(),
+    )
+    .map_err(|err| format!("Could not set the rclone config path: {err}"))?;
 
     let mut db_path = util::get_config_dir();
     db_path.push("celeste.db");
     if !db_path.exists() {
-        File::create(&db_path).map_err(|err| {
-            tr::tr!("Unable to create Celeste's database file [{}].", err)
-        })?;
+        File::create(&db_path)
+            .map_err(|err| tr::tr!("Unable to create Celeste's database file [{}].", err))?;
     }
     let db = util::await_future(Database::connect(format!("sqlite://{}", db_path.display())))
         .map_err(|err| tr::tr!("Unable to connect to database [{}].", err))?;
@@ -91,14 +93,17 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
 
     let mut queue = VecDeque::new();
     let mut prompted_login = false;
-    let please_resolve = format!(" {}", tr::tr!("Please resolve the reported syncing issues."));
+    let please_resolve = format!(
+        " {}",
+        tr::tr!("Please resolve the reported syncing issues.")
+    );
 
     loop {
         pump(&rx, &mut queue);
         if shared.quit_requested() {
             break;
         }
-        apply_deletes(&mut model, &db, &mut queue);
+        apply_deletes(&mut model, &db, &mut queue, shared);
         shared.publish(&mut model);
         apply_between_passes(shared, &db, &mut model, &mut queue, &please_resolve);
         if shared.quit_requested() {
@@ -108,11 +113,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         let remotes = util::await_future(RemotesEntity::find().all(&db)).unwrap_or_default();
         if remotes.is_empty() {
             model.remotes.clear();
-            shared.set_tray(
-                &mut model,
-                tr::tr!("Awaiting sync checks..."),
-                "loading",
-            );
+            shared.set_tray(&mut model, tr::tr!("Awaiting sync checks..."), "loading");
             if !prompted_login {
                 prompted_login = true;
                 shared.dialog("login", tr::tr!("Log in"), "");
@@ -126,7 +127,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
 
         for remote in remotes {
             pump(&rx, &mut queue);
-            apply_deletes(&mut model, &db, &mut queue);
+            apply_deletes(&mut model, &db, &mut queue, shared);
             if shared.quit_requested() {
                 break;
             }
@@ -146,11 +147,28 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                     break;
                 }
                 pump(&rx, &mut queue);
-                apply_deletes(&mut model, &db, &mut queue);
+                apply_deletes(&mut model, &db, &mut queue, shared);
                 if !sync_dir.exists(&db) {
                     continue;
                 }
-                let should_sync = directory_changed(&db, &remote, &sync_dir);
+                if model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path)
+                    || !pair_roots_available(&db, &remote, &sync_dir, &mut model, shared)
+                {
+                    continue;
+                }
+                let should_sync = match directory_changed(&db, &remote, &sync_dir) {
+                    Ok(changed) => changed,
+                    Err(err) => {
+                        record_error(
+                            &mut model,
+                            shared,
+                            &remote.name,
+                            &sync_dir,
+                            SyncError::General(sync_dir.local_path.clone(), err),
+                        );
+                        continue;
+                    }
+                };
                 if !should_sync {
                     model.set_status(
                         &remote.name,
@@ -173,10 +191,12 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                     tr::tr!("Syncing '{}'...", remote.name),
                     "syncing",
                 );
-                if model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path) {
-                    continue;
-                }
-                model.set_phase(&remote.name, &sync_dir.local_path, &sync_dir.remote_path, "syncing");
+                model.set_phase(
+                    &remote.name,
+                    &sync_dir.local_path,
+                    &sync_dir.remote_path,
+                    "syncing",
+                );
                 model.set_status(
                     &remote.name,
                     &sync_dir.local_path,
@@ -185,7 +205,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 );
                 shared.publish(&mut model);
 
-                let synced: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+                let synced: RefCell<HashSet<(String, String)>> = RefCell::new(HashSet::new());
                 sync_local_directory(
                     Path::new(&sync_dir.local_path),
                     &remote,
@@ -198,7 +218,10 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                     &mut queue,
                     &please_resolve,
                 );
-                if sync_dir.exists(&db) && !shared.quit_requested() {
+                if sync_dir.exists(&db)
+                    && !shared.quit_requested()
+                    && !model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path)
+                {
                     sync_remote_directory(
                         &sync_dir.remote_path,
                         &remote,
@@ -287,7 +310,12 @@ fn wait_command(
     }
 }
 
-fn apply_deletes(model: &mut Model, db: &DatabaseConnection, queue: &mut VecDeque<Command>) {
+fn apply_deletes(
+    model: &mut Model,
+    db: &DatabaseConnection,
+    queue: &mut VecDeque<Command>,
+    shared: &Shared,
+) {
     let mut kept = VecDeque::new();
     while let Some(cmd) = queue.pop_front() {
         match cmd {
@@ -302,60 +330,73 @@ fn apply_deletes(model: &mut Model, db: &DatabaseConnection, queue: &mut VecDequ
         }
     }
     *queue = kept;
-    process_deletions(model, db);
+    process_deletions(model, db, shared);
 }
 
-fn process_deletions(model: &mut Model, db: &DatabaseConnection) {
+fn process_deletions(model: &mut Model, db: &DatabaseConnection, shared: &Shared) {
     while !model.dir_deletions.is_empty() {
         let (remote_name, local, remote_path) = model.dir_deletions.remove(0);
-        model.remove_dir(&remote_name, &local, &remote_path);
-        util::await_future(async {
-            let Some(sync_dir) = SyncDirsEntity::find()
-                .filter(SyncDirsColumn::LocalPath.eq(local.clone()))
-                .filter(SyncDirsColumn::RemotePath.eq(remote_path.clone()))
-                .one(db)
-                .await
-                .ok()
-                .flatten()
-            else {
-                return;
-            };
-            let _ = SyncItemsEntity::delete_many()
-                .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
-                .exec(db)
-                .await;
-            let _ = sync_dir.delete(db).await;
+        let result: Result<(), DbErr> = util::await_future(async {
+            let tx = db.begin().await?;
+            if let Some(remote) = RemotesEntity::find()
+                .filter(RemotesColumn::Name.eq(remote_name.as_str()))
+                .one(&tx)
+                .await?
+            {
+                if let Some(dir) = SyncDirsEntity::find()
+                    .filter(SyncDirsColumn::RemoteId.eq(remote.id))
+                    .filter(SyncDirsColumn::LocalPath.eq(local.as_str()))
+                    .filter(SyncDirsColumn::RemotePath.eq(remote_path.as_str()))
+                    .one(&tx)
+                    .await?
+                {
+                    SyncItemsEntity::delete_many()
+                        .filter(SyncItemsColumn::SyncDirId.eq(dir.id))
+                        .exec(&tx)
+                        .await?;
+                    dir.delete(&tx).await?;
+                }
+            }
+            tx.commit().await
         });
+        match result {
+            Ok(()) => model.remove_dir(&remote_name, &local, &remote_path),
+            Err(err) => shared.dialog("error", "Could not stop synchronization", err.to_string()),
+        }
     }
-
     while !model.remote_deletions.is_empty() {
         let remote_name = model.remote_deletions.remove(0);
-        model.remove_remote(&remote_name);
-        util::await_future(async {
-            let Some(db_remote) = RemotesEntity::find()
-                .filter(RemotesColumn::Name.eq(remote_name.clone()))
-                .one(db)
-                .await
-                .ok()
-                .flatten()
-            else {
-                return;
-            };
-            let sync_dirs = SyncDirsEntity::find()
-                .filter(SyncDirsColumn::RemoteId.eq(db_remote.id))
-                .all(db)
-                .await
-                .unwrap_or_default();
-            for sync_dir in sync_dirs {
-                let _ = SyncItemsEntity::delete_many()
-                    .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
-                    .exec(db)
-                    .await;
-                let _ = sync_dir.delete(db).await;
+        let result: Result<(), DbErr> = util::await_future(async {
+            let tx = db.begin().await?;
+            if let Some(remote) = RemotesEntity::find()
+                .filter(RemotesColumn::Name.eq(remote_name.as_str()))
+                .one(&tx)
+                .await?
+            {
+                let dirs = SyncDirsEntity::find()
+                    .filter(SyncDirsColumn::RemoteId.eq(remote.id))
+                    .all(&tx)
+                    .await?;
+                for dir in dirs {
+                    SyncItemsEntity::delete_many()
+                        .filter(SyncItemsColumn::SyncDirId.eq(dir.id))
+                        .exec(&tx)
+                        .await?;
+                    dir.delete(&tx).await?;
+                }
+                remote.delete(&tx).await?;
             }
-            let _ = db_remote.delete(db).await;
+            tx.commit().await
         });
-        let _ = rclone::sync::delete_config(&remote_name);
+        match result {
+            Ok(()) => {
+                model.remove_remote(&remote_name);
+                if let Err(err) = rclone::sync::delete_config(&remote_name) {
+                    shared.dialog("error", "Could not remove remote configuration", err.error);
+                }
+            }
+            Err(err) => shared.dialog("error", "Could not remove remote", err.to_string()),
+        }
     }
 }
 
@@ -374,7 +415,7 @@ fn apply_between_passes(
             Command::Quit => shared.quit.store(true, Ordering::Relaxed),
             Command::DeleteRemote(name) => {
                 model.remote_deletions.push(name);
-                process_deletions(model, db);
+                process_deletions(model, db, shared);
             }
             Command::StopDir {
                 remote,
@@ -382,7 +423,7 @@ fn apply_between_passes(
                 remote_path,
             } => {
                 model.dir_deletions.push((remote, local, remote_path));
-                process_deletions(model, db);
+                process_deletions(model, db, shared);
             }
             Command::SaveExclusions { local, text } => {
                 if let Err(err) = model::write_exclusions(&local, &text) {
@@ -391,9 +432,9 @@ fn apply_between_passes(
             }
             Command::ListDirs { remote, path } => {
                 let names = list_dir_names(&remote, &path);
-                let _ = shared
-                    .notices
-                    .send(super::Notice::Suggestions(serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())));
+                let _ = shared.notices.send(super::Notice::Suggestions(
+                    serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()),
+                ));
             }
             Command::AddDir {
                 remote,
@@ -414,7 +455,16 @@ fn apply_between_passes(
                 local,
                 remote_path,
                 id,
-            } => activate_error(shared, db, model, &remote, &local, &remote_path, id, please_resolve),
+            } => activate_error(
+                shared,
+                db,
+                model,
+                &remote,
+                &local,
+                &remote_path,
+                id,
+                please_resolve,
+            ),
             Command::ChooseConflict {
                 remote,
                 local,
@@ -454,7 +504,9 @@ fn submit_login(shared: &Shared, db: &DatabaseConnection, model: &mut Model, req
         shared.dialog(
             "auth",
             tr::tr!("Authenticating to {}...", label),
-            tr::tr!("Follow the link that opened in your browser, and come back once you've finished."),
+            tr::tr!(
+                "Follow the link that opened in your browser, and come back once you've finished."
+            ),
         );
     });
     match result {
@@ -478,6 +530,24 @@ fn add_dir(
     local_raw: &str,
     remote_raw: &str,
 ) {
+    if !Path::new(local_raw).is_absolute() {
+        shared.dialog(
+            "error",
+            tr::tr!("The specified local directory needs to be an absolute path"),
+            "",
+        );
+        return;
+    }
+    let Some(db_remote) = util::await_future(
+        RemotesEntity::find()
+            .filter(RemotesColumn::Name.eq(remote_name))
+            .one(db),
+    )
+    .ok()
+    .flatten() else {
+        shared.dialog("error", tr::tr!("Unable to log in"), remote_name.to_owned());
+        return;
+    };
     let local_text = format!("/{}", util::strip_slashes(local_raw));
     let remote_text = util::strip_slashes(remote_raw);
     let local_path = Path::new(&local_text);
@@ -498,10 +568,15 @@ fn add_dir(
             );
             return;
         }
+        Ok(Some(item)) if !item.is_dir => {
+            shared.dialog("error", "The specified remote path is not a directory", "");
+            return;
+        }
         Ok(Some(_)) => {}
     }
     let existing = util::await_future(
         SyncDirsEntity::find()
+            .filter(SyncDirsColumn::RemoteId.eq(db_remote.id))
             .filter(SyncDirsColumn::LocalPath.eq(local_text.clone()))
             .filter(SyncDirsColumn::RemotePath.eq(remote_text.clone()))
             .one(db),
@@ -538,16 +613,6 @@ fn add_dir(
         );
         return;
     }
-    let Some(db_remote) = util::await_future(
-        RemotesEntity::find()
-            .filter(RemotesColumn::Name.eq(remote_name))
-            .one(db),
-    )
-    .ok()
-    .flatten() else {
-        shared.dialog("error", tr::tr!("Unable to log in"), remote_name.to_owned());
-        return;
-    };
     if util::await_future(
         SyncDirsActiveModel {
             remote_id: ActiveValue::Set(db_remote.id),
@@ -638,8 +703,24 @@ fn choose_conflict(
         copy_remote_to_local(shared, remote_name, &local_item, &remote_item)
     };
     if copied {
-        let _ = update_item_timestamps(db, remote_name, &local_item, &remote_item);
-        model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+        if update_item_timestamps(
+            db,
+            remote_name,
+            local,
+            remote_path,
+            &local_item,
+            &remote_item,
+        )
+        .is_ok()
+        {
+            model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+        } else {
+            shared.dialog(
+                "error",
+                "Synchronization history",
+                "Could not save the conflict resolution; the error is retained",
+            );
+        }
     }
 }
 
@@ -662,7 +743,10 @@ fn resolve_conflict_probe(
         Err(err) => {
             shared.dialog(
                 "error",
-                tr::tr!("Unable to fetch data for '{}' from the remote.", remote_item),
+                tr::tr!(
+                    "Unable to fetch data for '{}' from the remote.",
+                    remote_item
+                ),
                 err.error,
             );
             return;
@@ -684,8 +768,17 @@ fn resolve_conflict_probe(
             tr::tr!("Only the local item exists now, so it will be synced to the remote."),
         );
         if copy_local_to_remote(shared, remote_name, local_item, remote_item) {
-            let _ = update_item_timestamps(db, remote_name, local_item, remote_item);
-            model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+            if update_item_timestamps(db, remote_name, local, remote_path, local_item, remote_item)
+                .is_ok()
+            {
+                model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+            } else {
+                shared.dialog(
+                    "error",
+                    "Synchronization history",
+                    "Could not save the conflict resolution; the error is retained",
+                );
+            }
         }
         return;
     }
@@ -696,8 +789,17 @@ fn resolve_conflict_probe(
             tr::tr!("Only the remote item exists now, so it will be synced to the local machine."),
         );
         if copy_remote_to_local(shared, remote_name, local_item, remote_item) {
-            let _ = update_item_timestamps(db, remote_name, local_item, remote_item);
-            model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+            if update_item_timestamps(db, remote_name, local, remote_path, local_item, remote_item)
+                .is_ok()
+            {
+                model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+            } else {
+                shared.dialog(
+                    "error",
+                    "Synchronization history",
+                    "Could not save the conflict resolution; the error is retained",
+                );
+            }
         }
         return;
     }
@@ -712,7 +814,12 @@ fn resolve_conflict_probe(
     );
 }
 
-fn copy_local_to_remote(shared: &Shared, remote_name: &str, local_item: &str, remote_item: &str) -> bool {
+fn copy_local_to_remote(
+    shared: &Shared,
+    remote_name: &str,
+    local_item: &str,
+    remote_item: &str,
+) -> bool {
     if let Err(err) = rclone::sync::copy_to_remote(local_item, remote_name, remote_item) {
         shared.dialog(
             "error",
@@ -729,7 +836,12 @@ fn copy_local_to_remote(shared: &Shared, remote_name: &str, local_item: &str, re
     }
 }
 
-fn copy_remote_to_local(shared: &Shared, remote_name: &str, local_item: &str, remote_item: &str) -> bool {
+fn copy_remote_to_local(
+    shared: &Shared,
+    remote_name: &str,
+    local_item: &str,
+    remote_item: &str,
+) -> bool {
     if let Err(err) = rclone::sync::copy_to_local(local_item, remote_name, remote_item) {
         shared.dialog(
             "error",
@@ -749,6 +861,8 @@ fn copy_remote_to_local(shared: &Shared, remote_name: &str, local_item: &str, re
 fn update_item_timestamps(
     db: &DatabaseConnection,
     remote_name: &str,
+    local_root: &str,
+    remote_root: &str,
     local_item: &str,
     remote_item: &str,
 ) -> Result<(), ()> {
@@ -765,8 +879,25 @@ fn update_item_timestamps(
         .ok_or(())?
         .mod_time
         .unix_timestamp();
+    let remote = util::await_future(
+        RemotesEntity::find()
+            .filter(RemotesColumn::Name.eq(remote_name))
+            .one(db),
+    )
+    .map_err(|_| ())?
+    .ok_or(())?;
+    let sync_dir = util::await_future(
+        SyncDirsEntity::find()
+            .filter(SyncDirsColumn::RemoteId.eq(remote.id))
+            .filter(SyncDirsColumn::LocalPath.eq(local_root))
+            .filter(SyncDirsColumn::RemotePath.eq(remote_root))
+            .one(db),
+    )
+    .map_err(|_| ())?
+    .ok_or(())?;
     let model = util::await_future(
         SyncItemsEntity::find()
+            .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
             .filter(SyncItemsColumn::LocalPath.eq(local_item))
             .filter(SyncItemsColumn::RemotePath.eq(remote_item))
             .one(db),
@@ -780,146 +911,308 @@ fn update_item_timestamps(
     Ok(())
 }
 
-fn directory_changed(db: &DatabaseConnection, remote: &RemotesModel, sync_dir: &SyncDirsModel) -> bool {
-    let local_glob = format!("{}/**/*", sync_dir.local_path);
-    if let Ok(paths) = glob::glob(&local_glob) {
-        for maybe_path in paths {
-            let Ok(path) = maybe_path else {
-                return true;
-            };
-            let Ok(file) = File::open(&path) else {
-                return true;
-            };
-            let Ok(metadata) = file.metadata() else {
-                return true;
-            };
-            let Ok(modified) = metadata.modified() else {
-                return true;
-            };
-            let Ok(current_timestamp) = modified.duration_since(SystemTime::UNIX_EPOCH) else {
-                return true;
-            };
-            let current_timestamp = current_timestamp.as_secs();
-            let maybe_db_sync_item = util::await_future(
-                SyncItemsEntity::find()
-                    .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
-                    .filter(SyncItemsColumn::LocalPath.eq(path.display().to_string()))
-                    .one(db),
-            )
-            .ok()
-            .flatten();
-            let Some(db_sync_item) = maybe_db_sync_item else {
-                return true;
-            };
-            if current_timestamp != u64::try_from(db_sync_item.last_local_timestamp).unwrap_or(0) {
-                return true;
-            }
-        }
-    } else {
-        return true;
+fn pair_roots_available(
+    db: &DatabaseConnection,
+    remote: &RemotesModel,
+    sync_dir: &SyncDirsModel,
+    model: &mut Model,
+    shared: &Shared,
+) -> bool {
+    if !sync_dir.exists(db) {
+        return false;
     }
-
-    if let Ok(paths) = rclone::sync::list(&remote.name, &sync_dir.remote_path, true, RcloneListFilter::All)
-    {
-        for path in paths {
-            let stripped_path = if path.name.contains('/') {
-                path.name
-                    .strip_suffix(&format!("{}/", sync_dir.remote_path))
-                    .unwrap_or(path.name.as_str())
-                    .to_string()
-            } else {
-                path.name.clone()
-            };
-            let maybe_db_sync_item = util::await_future(
-                SyncItemsEntity::find()
-                    .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
-                    .filter(SyncItemsColumn::RemotePath.eq(stripped_path))
-                    .one(db),
-            )
-            .ok()
-            .flatten();
-            let Some(db_sync_item) = maybe_db_sync_item else {
-                return true;
-            };
-            if path.mod_time.unix_timestamp() != i64::from(db_sync_item.last_remote_timestamp) {
-                return true;
-            }
-        }
-    } else {
-        return true;
+    if let Err(err) = fs::read_dir(&sync_dir.local_path) {
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(
+                sync_dir.local_path.clone(),
+                format!("Local sync folder is unavailable: {err}"),
+            ),
+        );
+        return false;
     }
+    match rclone::sync::stat(&remote.name, &sync_dir.remote_path) {
+        Ok(Some(item)) if item.is_dir => true,
+        result => {
+            let message = match result {
+                Err(err) => err.error,
+                _ => "Remote sync folder is unavailable; automatic deletion is paused".into(),
+            };
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(sync_dir.remote_path.clone(), message),
+            );
+            false
+        }
+    }
+}
 
-    let sync_items = util::await_future(
+fn directory_changed(
+    db: &DatabaseConnection,
+    remote: &RemotesModel,
+    sync_dir: &SyncDirsModel,
+) -> Result<bool, String> {
+    // A complete observation uses one DB read and one recursive remote listing.
+    let rows = util::await_future(
         SyncItemsEntity::find()
             .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
             .all(db),
     )
-    .unwrap_or_default();
-    for sync_item in sync_items {
-        let remote_path = if !sync_dir.remote_path.is_empty() {
-            format!("{}/{}", sync_dir.remote_path, sync_item.remote_path)
-        } else {
-            sync_item.remote_path.clone()
-        };
-        let maybe_remote_timestamp = rclone::sync::stat(&remote.name, &remote_path)
-            .ok()
-            .flatten()
-            .map(|remote_item| remote_item.mod_time.unix_timestamp());
-        if !Path::new(&sync_item.local_path).exists() && maybe_remote_timestamp.is_none() {
-            util::await_future(async {
-                if let Some(row) = SyncItemsEntity::find()
-                    .filter(SyncItemsColumn::Id.eq(sync_item.id))
-                    .one(db)
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    let _ = row.delete(db).await;
-                }
-            });
+    .map_err(|err| err.to_string())?;
+    let local_items = local_tree(Path::new(&sync_dir.local_path)).map_err(|err| err.to_string())?;
+    let remote_items = rclone::sync::list(
+        &remote.name,
+        &sync_dir.remote_path,
+        true,
+        RcloneListFilter::All,
+    )
+    .map_err(|err| err.error)?;
+    let ignore_globs = load_ignore_globs(&Path::new(&sync_dir.local_path).join(FILE_IGNORE_NAME))?;
+    let local_rows: HashMap<_, _> = rows
+        .iter()
+        .map(|row| (row.local_path.as_str(), row))
+        .collect();
+    let remote_rows: HashMap<_, _> = rows
+        .iter()
+        .map(|row| (row.remote_path.as_str(), row))
+        .collect();
+    let mut local_seen = HashSet::new();
+    let mut remote_seen = HashSet::new();
+    for (path, metadata) in local_items {
+        let path = path.to_str().ok_or("Local path is not valid UTF-8")?;
+        let relative = Path::new(path)
+            .strip_prefix(&sync_dir.local_path)
+            .map_err(|err| err.to_string())?;
+        if is_ignored(&relative.to_string_lossy(), &ignore_globs) {
             continue;
         }
-        let Some(remote_timestamp) = maybe_remote_timestamp else {
-            return true;
+        let Some(row) = local_rows.get(path) else {
+            return Ok(true);
         };
-        let local_timestamp = match fs::metadata(&sync_item.local_path) {
-            Ok(metadata) => metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs()),
-            Err(_) => None,
+        let timestamp = metadata
+            .modified()
+            .map_err(|err| err.to_string())?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|err| err.to_string())?
+            .as_secs();
+        if i64::try_from(timestamp).ok() != Some(i64::from(row.last_local_timestamp)) {
+            return Ok(true);
+        }
+        local_seen.insert(path.to_owned());
+    }
+    for item in remote_items {
+        let local_path =
+            util::local_path_for_remote(&sync_dir.local_path, &sync_dir.remote_path, &item.path)
+                .ok_or("Remote path is outside the synced folder")?;
+        let relative = Path::new(&local_path)
+            .strip_prefix(&sync_dir.local_path)
+            .map_err(|err| err.to_string())?;
+        if is_ignored(&relative.to_string_lossy(), &ignore_globs) {
+            continue;
+        }
+        let Some(row) = remote_rows.get(item.path.as_str()) else {
+            return Ok(true);
         };
-        let Some(local_timestamp) = local_timestamp else {
-            return true;
-        };
-        if i64::try_from(local_timestamp).ok() != Some(i64::from(sync_item.last_local_timestamp))
-            || remote_timestamp != i64::from(sync_item.last_remote_timestamp)
-        {
-            return true;
+        if item.mod_time.unix_timestamp() != i64::from(row.last_remote_timestamp) {
+            return Ok(true);
+        }
+        remote_seen.insert(item.path);
+    }
+    let mut absent = Vec::new();
+    for row in &rows {
+        let relative = Path::new(&row.local_path)
+            .strip_prefix(&sync_dir.local_path)
+            .map_err(|err| err.to_string())?;
+        if is_ignored(&relative.to_string_lossy(), &ignore_globs) {
+            continue;
+        }
+        let local_exists = local_seen.contains(&row.local_path);
+        let remote_exists = remote_seen.contains(&row.remote_path);
+        if local_exists != remote_exists {
+            return Ok(true);
+        }
+        if !local_exists {
+            absent.push(row.id);
         }
     }
-    false
+    // Retire history only after BOTH complete observations succeeded. This
+    // prevents a later recreated file from being mistaken for an old deletion.
+    if !absent.is_empty() {
+        util::await_future(
+            SyncItemsEntity::delete_many()
+                .filter(SyncItemsColumn::Id.is_in(absent))
+                .exec(db),
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(false)
 }
 
-fn load_ignore_globs(ignore_file: &Path) -> Vec<glob::Pattern> {
-    if !ignore_file.is_file() {
-        return Vec::new();
+// Read metadata without opening file contents or interpreting folder names as globs.
+// Symlinks are not followed: paths inside a pair must stay inside that pair.
+fn local_tree(root: &Path) -> Result<Vec<(PathBuf, fs::Metadata)>, std::io::Error> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut items = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for item in fs::read_dir(dir)? {
+            let item = item?;
+            let metadata = fs::symlink_metadata(item.path())?;
+            if metadata.is_dir() {
+                pending.push(item.path());
+            }
+            items.push((item.path(), metadata));
+        }
     }
-    let Ok(_lock) = file_lock::FileLock::lock(
-        ignore_file,
-        true,
-        file_lock::FileOptions::new().read(true).write(true),
-    ) else {
-        return Vec::new();
-    };
-    let Ok(content) = fs::read_to_string(ignore_file) else {
-        return Vec::new();
-    };
-    content
+    Ok(items)
+}
+
+fn load_ignore_globs(ignore_file: &Path) -> Result<Vec<glob::Pattern>, String> {
+    match fs::metadata(ignore_file) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.to_string()),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("Exclusion rules are not a regular file".into());
+        }
+        Ok(_) => {}
+    }
+    let _lock =
+        file_lock::FileLock::lock(ignore_file, true, file_lock::FileOptions::new().read(true))
+            .map_err(|err| err.to_string())?;
+    fs::read_to_string(ignore_file)
+        .map_err(|err| err.to_string())?
         .lines()
-        .filter_map(|line| glob::Pattern::new(line).ok())
+        .filter(|line| !line.is_empty())
+        .map(|line| glob::Pattern::new(line).map_err(|err| format!("{line}: {err}")))
         .collect()
+}
+
+fn is_ignored(relative: &str, patterns: &[glob::Pattern]) -> bool {
+    if relative == FILE_IGNORE_NAME {
+        return true;
+    }
+    let mut path = relative;
+    loop {
+        if patterns.iter().any(|pattern| pattern.matches(path)) {
+            return true;
+        }
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            return false;
+        };
+        path = parent;
+    }
+}
+
+fn validate_local_path(root: &Path, path: &Path) -> Result<(), String> {
+    let relative = path.strip_prefix(root).map_err(|err| err.to_string())?;
+    let mut current = root.to_path_buf();
+    for part in relative.components() {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("Symbolic links inside a synced folder are not followed".into());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Ok(())
+}
+
+// Directory mtimes do not prove that their contents are unchanged. Before a
+// recursive deletion, require every descendant to have an unchanged baseline.
+fn remove_unchanged_local(
+    db: &DatabaseConnection,
+    sync_dir: &SyncDirsModel,
+    root: &Path,
+) -> std::io::Result<()> {
+    let rows = util::await_future(
+        SyncItemsEntity::find()
+            .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
+            .all(db),
+    )
+    .map_err(std::io::Error::other)?;
+    let rows: HashMap<_, _> = rows
+        .iter()
+        .map(|row| (row.local_path.as_str(), row))
+        .collect();
+    let patterns = load_ignore_globs(&Path::new(&sync_dir.local_path).join(FILE_IGNORE_NAME))
+        .map_err(std::io::Error::other)?;
+    for (path, metadata) in local_tree(root)? {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| std::io::Error::other("Non-UTF-8 path"))?;
+        let relative = path
+            .strip_prefix(&sync_dir.local_path)
+            .map_err(std::io::Error::other)?;
+        let unchanged = rows.get(path_text).is_some_and(|row| {
+            metadata.is_dir()
+                || metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .is_some_and(|time| {
+                        i64::try_from(time.as_secs()).ok()
+                            == Some(i64::from(row.last_local_timestamp))
+                    })
+        });
+        if !unchanged
+            || metadata.file_type().is_symlink()
+            || is_ignored(&relative.to_string_lossy(), &patterns)
+        {
+            return Err(std::io::Error::other(
+                "Folder contains changed, untracked or excluded items; automatic deletion is paused",
+            ));
+        }
+    }
+    fs::remove_dir_all(root)
+}
+
+fn purge_unchanged_remote(
+    db: &DatabaseConnection,
+    sync_dir: &SyncDirsModel,
+    remote: &RemotesModel,
+    root: &str,
+) -> Result<(), rclone::RcloneError> {
+    let rows = util::await_future(
+        SyncItemsEntity::find()
+            .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
+            .all(db),
+    )
+    .map_err(|err| rclone::RcloneError {
+        error: err.to_string(),
+    })?;
+    let rows: HashMap<_, _> = rows
+        .iter()
+        .map(|row| (row.remote_path.as_str(), row))
+        .collect();
+    let patterns = load_ignore_globs(&Path::new(&sync_dir.local_path).join(FILE_IGNORE_NAME))
+        .map_err(|error| rclone::RcloneError { error })?;
+    for item in rclone::sync::list(&remote.name, root, true, RcloneListFilter::All)? {
+        let local_path =
+            util::local_path_for_remote(&sync_dir.local_path, &sync_dir.remote_path, &item.path)
+                .ok_or_else(|| rclone::RcloneError {
+                    error: "Remote path is outside the synced folder".into(),
+                })?;
+        let relative = Path::new(&local_path)
+            .strip_prefix(&sync_dir.local_path)
+            .map_err(|err| rclone::RcloneError {
+                error: err.to_string(),
+            })?;
+        let unchanged = rows.get(item.path.as_str()).is_some_and(|row| {
+            item.is_dir || item.mod_time.unix_timestamp() == i64::from(row.last_remote_timestamp)
+        });
+        if !unchanged || is_ignored(&relative.to_string_lossy(), &patterns) {
+            return Err(rclone::RcloneError { error: "Folder contains changed, untracked or excluded items; automatic deletion is paused".into() });
+        }
+    }
+    rclone::sync::purge(&remote.name, root)
 }
 
 fn note_progress(
@@ -959,7 +1252,7 @@ struct Walk<'a> {
     db: &'a DatabaseConnection,
     model: &'a mut Model,
     shared: &'a Shared,
-    synced: &'a RefCell<Vec<(String, String)>>,
+    synced: &'a RefCell<HashSet<(String, String)>>,
     rx: &'a crossbeam_channel::Receiver<Command>,
     queue: &'a mut VecDeque<Command>,
     please_resolve: &'a str,
@@ -987,7 +1280,7 @@ fn checkpoint(walk: &mut Walk<'_>) {
         }
     }
     *walk.queue = kept;
-    process_deletions(walk.model, walk.db);
+    process_deletions(walk.model, walk.db, walk.shared);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -998,7 +1291,7 @@ fn sync_local_directory(
     db: &DatabaseConnection,
     model: &mut Model,
     shared: &Shared,
-    synced: &RefCell<Vec<(String, String)>>,
+    synced: &RefCell<HashSet<(String, String)>>,
     rx: &crossbeam_channel::Receiver<Command>,
     queue: &mut VecDeque<Command>,
     please_resolve: &str,
@@ -1049,10 +1342,20 @@ fn sync_local_directory(
             return;
         }
     };
-    let ignore_globs = load_ignore_globs(&PathBuf::from(format!(
-        "{}/{}",
-        sync_dir.local_path, FILE_IGNORE_NAME
-    )));
+    let ignore_globs =
+        match load_ignore_globs(&Path::new(&sync_dir.local_path).join(FILE_IGNORE_NAME)) {
+            Ok(patterns) => patterns,
+            Err(err) => {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(FILE_IGNORE_NAME.into(), err),
+                );
+                return;
+            }
+        };
 
     for item in directory {
         if shared.quit_requested() {
@@ -1081,7 +1384,7 @@ fn sync_local_directory(
             queue,
             please_resolve,
         } = walk;
-        if !sync_dir.exists(db) {
+        if !sync_dir.exists(db) || shared.quit_requested() {
             break;
         }
         let item = match item {
@@ -1097,29 +1400,33 @@ fn sync_local_directory(
                 continue;
             }
         };
-        let local_path = item.path().to_str().unwrap_or("").to_owned();
-        let remote_path = {
-            let Some(local_path_stripped) =
-                local_path.strip_prefix(&format!("{}/", sync_dir.local_path))
-            else {
-                continue;
-            };
-            let stripped_path = local_path_stripped.strip_suffix('/').unwrap_or(local_path_stripped);
-            if sync_dir.remote_path.is_empty() {
-                stripped_path.to_owned()
-            } else {
-                format!("{}/{}", sync_dir.remote_path, stripped_path)
-            }
+        let Ok(file_type) = item.file_type() else {
+            continue;
         };
-        let stripped_remote_path =
-            if remote_path.contains('/') && sync_dir.remote_path.contains('/') {
-                remote_path
-                    .strip_prefix(&format!("{}/", sync_dir.remote_path))
-                    .unwrap_or(&remote_path)
-                    .to_owned()
-            } else {
-                remote_path.clone()
-            };
+        if !file_type.is_file() && !file_type.is_dir() {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(
+                    item.path().display().to_string(),
+                    "Only regular files and directories can be synchronized".into(),
+                ),
+            );
+            continue;
+        }
+        let local_path = item.path().to_str().unwrap_or("").to_owned();
+        let stripped_remote_path = item
+            .path()
+            .strip_prefix(&sync_dir.local_path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let remote_path = if sync_dir.remote_path.is_empty() {
+            stripped_remote_path.clone()
+        } else {
+            format!("{}/{}", sync_dir.remote_path, stripped_remote_path)
+        };
         note_progress(
             model,
             shared,
@@ -1128,10 +1435,15 @@ fn sync_local_directory(
             db,
             tr::tr!("Checking '{}' for changes...", util::fmt_home(&local_path)),
         );
-        if ignore_globs.iter().any(|pattern| pattern.matches(&stripped_remote_path)) {
+        if is_ignored(&stripped_remote_path, &ignore_globs) {
             continue;
         }
-        synced.borrow_mut().push((local_path.clone(), remote_path.clone()));
+        if !synced
+            .borrow_mut()
+            .insert((local_path.clone(), remote_path.clone()))
+        {
+            continue;
+        }
 
         let get_local_file_timestamp = || {
             item.metadata()
@@ -1146,7 +1458,10 @@ fn sync_local_directory(
                 shared,
                 &remote.name,
                 sync_dir,
-                SyncError::General(local_path, "Could not read the local modification time".into()),
+                SyncError::General(
+                    local_path,
+                    "Could not read the local modification time".into(),
+                ),
             );
             continue;
         };
@@ -1163,27 +1478,56 @@ fn sync_local_directory(
                 continue;
             }
         };
-        let remote_utc_timestamp = remote_item.as_ref().map(|item| item.mod_time.unix_timestamp());
-        let db_item = util::await_future(
+        if item.file_type().is_ok_and(|kind| kind.is_dir())
+            && remote_item.as_ref().is_some_and(|remote| remote.is_dir)
+        {
+            sync_local_directory(
+                &item.path(),
+                remote,
+                sync_dir,
+                db,
+                model,
+                shared,
+                synced,
+                rx,
+                queue,
+                please_resolve,
+            );
+        }
+        let remote_utc_timestamp = remote_item
+            .as_ref()
+            .map(|item| item.mod_time.unix_timestamp());
+        let db_item = match util::await_future(
             SyncItemsEntity::find()
+                .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
                 .filter(SyncItemsColumn::LocalPath.eq(local_path.clone()))
                 .filter(SyncItemsColumn::RemotePath.eq(remote_path.clone()))
                 .one(db),
-        )
-        .ok()
-        .flatten();
+        ) {
+            Ok(item) => item,
+            Err(err) => {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(local_path.clone(), err.to_string()),
+                );
+                continue;
+            }
+        };
 
         let push_failed = |model: &mut Model, path: String, err: String| {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(path, err));
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(path, err),
+            );
         };
 
         if let Some(db_model) = db_item {
-            let update_db_item = |local_timestamp: i32, remote_timestamp: i32| {
-                let mut active: SyncItemsActiveModel = db_model.clone().into();
-                active.last_local_timestamp = ActiveValue::Set(local_timestamp);
-                active.last_remote_timestamp = ActiveValue::Set(remote_timestamp);
-                let _ = util::await_future(active.update(db));
-            };
             if local_utc_timestamp > db_model.last_local_timestamp as u64
                 && remote_utc_timestamp.is_some_and(|remote_timestamp| {
                     remote_timestamp != db_model.last_remote_timestamp as i64
@@ -1201,27 +1545,77 @@ fn sync_local_directory(
                     }
                 }
             } else if local_utc_timestamp > db_model.last_local_timestamp as u64 {
-                if let Ok(rclone_item) = push_local(item.file_type().ok(), &item, &local_path, &remote_path, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve, remote_item.as_ref()) {
-                    let Some(local_ts) = get_local_file_timestamp() else { continue };
-                    update_db_item(
+                if let Ok(rclone_item) = push_local(
+                    item.file_type().ok(),
+                    &item,
+                    &local_path,
+                    &remote_path,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                    remote_item.as_ref(),
+                ) {
+                    let Some(local_ts) = get_local_file_timestamp() else {
+                        continue;
+                    };
+                    save_baseline(
+                        db,
+                        model,
+                        shared,
+                        remote,
+                        sync_dir,
+                        &db_model,
                         i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                        i32::try_from(rclone_item.mod_time.unix_timestamp()).unwrap_or(db_model.last_remote_timestamp),
+                        i32::try_from(rclone_item.mod_time.unix_timestamp())
+                            .unwrap_or(db_model.last_remote_timestamp),
                     );
                 }
             } else if let Some(remote_timestamp) = remote_utc_timestamp.filter(|remote_timestamp| {
                 *remote_timestamp > db_model.last_remote_timestamp as i64
             }) {
-                if pull_local(item.file_type().ok(), &item, &local_path, &remote_path, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve, remote_item.as_ref()).is_ok() {
+                if pull_local(
+                    item.file_type().ok(),
+                    &item,
+                    &local_path,
+                    &remote_path,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                    remote_item.as_ref(),
+                )
+                .is_ok()
+                {
                     if let Some(local_ts) = get_local_file_timestamp() {
-                        update_db_item(
+                        save_baseline(
+                            db,
+                            model,
+                            shared,
+                            remote,
+                            sync_dir,
+                            &db_model,
                             i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                            i32::try_from(remote_timestamp).unwrap_or(db_model.last_remote_timestamp),
+                            i32::try_from(remote_timestamp)
+                                .unwrap_or(db_model.last_remote_timestamp),
                         );
                     }
                 }
-            } else if remote_item.is_none() && local_utc_timestamp == db_model.last_local_timestamp as u64 {
+            } else if remote_item.is_none()
+                && local_utc_timestamp == db_model.last_local_timestamp as u64
+            {
                 let removed = if item.path().is_dir() {
-                    fs::remove_dir_all(&local_path)
+                    remove_unchanged_local(db, sync_dir, Path::new(&local_path))
                 } else {
                     fs::remove_file(&local_path)
                 };
@@ -1241,7 +1635,13 @@ fn sync_local_directory(
                 })
             {
                 let remote_timestamp = remote_utc_timestamp.unwrap_or(0);
-                update_db_item(
+                save_baseline(
+                    db,
+                    model,
+                    shared,
+                    remote,
+                    sync_dir,
+                    &db_model,
                     i32::try_from(local_utc_timestamp).unwrap_or(db_model.last_local_timestamp),
                     i32::try_from(remote_timestamp).unwrap_or(db_model.last_remote_timestamp),
                 );
@@ -1256,15 +1656,82 @@ fn sync_local_directory(
             }
         } else if let Some(remote_timestamp) = remote_utc_timestamp {
             let pushed = if local_utc_timestamp > remote_timestamp as u64 {
-                push_local(item.file_type().ok(), &item, &local_path, &remote_path, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve, remote_item.as_ref()).is_ok()
+                push_local(
+                    item.file_type().ok(),
+                    &item,
+                    &local_path,
+                    &remote_path,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                    remote_item.as_ref(),
+                )
+                .is_ok()
             } else {
-                pull_local(item.file_type().ok(), &item, &local_path, &remote_path, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve, remote_item.as_ref()).is_ok()
+                pull_local(
+                    item.file_type().ok(),
+                    &item,
+                    &local_path,
+                    &remote_path,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                    remote_item.as_ref(),
+                )
+                .is_ok()
             };
             if pushed {
-                record_new_item(db, model, shared, remote, sync_dir, &local_path, &remote_path, local_utc_timestamp);
+                record_new_item(
+                    db,
+                    model,
+                    shared,
+                    remote,
+                    sync_dir,
+                    &local_path,
+                    &remote_path,
+                    local_utc_timestamp,
+                );
             }
-        } else if push_local(item.file_type().ok(), &item, &local_path, &remote_path, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve, remote_item.as_ref()).is_ok() {
-            record_new_item(db, model, shared, remote, sync_dir, &local_path, &remote_path, local_utc_timestamp);
+        } else if push_local(
+            item.file_type().ok(),
+            &item,
+            &local_path,
+            &remote_path,
+            remote,
+            sync_dir,
+            db,
+            model,
+            shared,
+            synced,
+            rx,
+            queue,
+            please_resolve,
+            remote_item.as_ref(),
+        )
+        .is_ok()
+        {
+            record_new_item(
+                db,
+                model,
+                shared,
+                remote,
+                sync_dir,
+                &local_path,
+                &remote_path,
+                local_utc_timestamp,
+            );
         }
     }
 }
@@ -1280,37 +1747,87 @@ fn push_local(
     db: &DatabaseConnection,
     model: &mut Model,
     shared: &Shared,
-    synced: &RefCell<Vec<(String, String)>>,
+    synced: &RefCell<HashSet<(String, String)>>,
     rx: &crossbeam_channel::Receiver<Command>,
     queue: &mut VecDeque<Command>,
     please_resolve: &str,
     remote_item: Option<&rclone::RcloneRemoteItem>,
 ) -> Result<rclone::RcloneRemoteItem, ()> {
     let Some(file_type) = file_type else {
-        record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path.into(), "Could not read the file type".into()));
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(local_path.into(), "Could not read the file type".into()),
+        );
         return Err(());
     };
     if let Some(rclone_item) = remote_item {
-        let same_type = file_type.is_dir() && rclone_item.is_dir;
+        let same_type = file_type.is_dir() == rclone_item.is_dir;
         if !same_type {
-            if let Err(err) = rclone::sync::purge(&remote.name, remote_path) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path.into(), err.error));
+            let removed = if rclone_item.is_dir {
+                purge_unchanged_remote(db, sync_dir, remote, remote_path)
+            } else {
+                rclone::sync::delete(&remote.name, remote_path)
+            };
+            if let Err(err) = removed {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(remote_path.into(), err.error),
+                );
                 return Err(());
             }
         }
     }
     if file_type.is_dir() {
         if let Err(err) = rclone::sync::mkdir(&remote.name, remote_path) {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path.into(), err.error));
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(remote_path.into(), err.error),
+            );
             return Err(());
         }
-        sync_local_directory(item.path().as_path(), remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve);
-        note_progress(model, shared, &remote.name, sync_dir, db, tr::tr!("Checking '{}' for changes...", util::fmt_home(local_path)));
+        sync_local_directory(
+            item.path().as_path(),
+            remote,
+            sync_dir,
+            db,
+            model,
+            shared,
+            synced,
+            rx,
+            queue,
+            please_resolve,
+        );
+        note_progress(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            db,
+            tr::tr!("Checking '{}' for changes...", util::fmt_home(local_path)),
+        );
     } else if let Err(err) = rclone::sync::copy_to_remote(local_path, &remote.name, remote_path) {
-        record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path.into(), err.error));
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(local_path.into(), err.error),
+        );
         return Err(());
     }
-    rclone::sync::stat(&remote.name, remote_path).ok().flatten().ok_or(())
+    rclone::sync::stat(&remote.name, remote_path)
+        .ok()
+        .flatten()
+        .ok_or(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1324,7 +1841,7 @@ fn pull_local(
     db: &DatabaseConnection,
     model: &mut Model,
     shared: &Shared,
-    synced: &RefCell<Vec<(String, String)>>,
+    synced: &RefCell<HashSet<(String, String)>>,
     rx: &crossbeam_channel::Receiver<Command>,
     queue: &mut VecDeque<Command>,
     please_resolve: &str,
@@ -1336,26 +1853,93 @@ fn pull_local(
     let Some(remote_item) = remote_item else {
         return Err(());
     };
-    let same_type = file_type.is_dir() && remote_item.is_dir;
+    let same_type = file_type.is_dir() == remote_item.is_dir;
     if !same_type {
         let removed = if file_type.is_dir() {
-            fs::remove_dir_all(item.path())
+            remove_unchanged_local(db, sync_dir, &item.path())
         } else {
             fs::remove_file(item.path())
         };
         if let Err(err) = removed {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path.into(), err.to_string()));
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(local_path.into(), err.to_string()),
+            );
             return Err(());
         }
     }
-    if file_type.is_dir() {
-        sync_local_directory(item.path().as_path(), remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve);
-        note_progress(model, shared, &remote.name, sync_dir, db, tr::tr!("Checking '{}' for changes...", util::fmt_home(local_path)));
+    if remote_item.is_dir {
+        fs::create_dir_all(item.path()).map_err(|err| {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(local_path.into(), err.to_string()),
+            );
+        })?;
+        sync_local_directory(
+            item.path().as_path(),
+            remote,
+            sync_dir,
+            db,
+            model,
+            shared,
+            synced,
+            rx,
+            queue,
+            please_resolve,
+        );
+        note_progress(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            db,
+            tr::tr!("Checking '{}' for changes...", util::fmt_home(local_path)),
+        );
     } else if let Err(err) = rclone::sync::copy_to_local(local_path, &remote.name, remote_path) {
-        record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path.into(), err.error));
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(remote_path.into(), err.error),
+        );
         return Err(());
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_baseline(
+    db: &DatabaseConnection,
+    model: &mut Model,
+    shared: &Shared,
+    remote: &RemotesModel,
+    sync_dir: &SyncDirsModel,
+    row: &crate::entities::SyncItemsModel,
+    local_timestamp: i32,
+    remote_timestamp: i32,
+) {
+    let mut active: SyncItemsActiveModel = row.clone().into();
+    active.last_local_timestamp = ActiveValue::Set(local_timestamp);
+    active.last_remote_timestamp = ActiveValue::Set(remote_timestamp);
+    if let Err(err) = util::await_future(active.update(db)) {
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(
+                row.local_path.clone(),
+                format!("Could not save synchronization history: {err}"),
+            ),
+        );
+    }
 }
 
 fn delete_db_entry(db: &DatabaseConnection, sync_dir_id: i32, local_path: &str, remote_path: &str) {
@@ -1383,30 +1967,76 @@ fn record_new_item(
     sync_dir: &SyncDirsModel,
     local_path: &str,
     remote_path: &str,
-    local_utc_timestamp: u64,
+    _local_utc_timestamp: u64,
 ) {
+    let Some(local_utc_timestamp) = fs::metadata(local_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|time| time.as_secs())
+    else {
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(
+                local_path.into(),
+                "Could not read the local modification time after sync".into(),
+            ),
+        );
+        return;
+    };
     let remote_item = match rclone::sync::stat(&remote.name, remote_path) {
         Ok(Some(item)) => item,
         Ok(None) => {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path.into(), "Remote item disappeared after sync".into()));
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(
+                    remote_path.into(),
+                    "Remote item disappeared after sync".into(),
+                ),
+            );
             return;
         }
         Err(err) => {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path.into(), err.error));
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(remote_path.into(), err.error),
+            );
             return;
         }
     };
-    let _ = util::await_future(
+    if let Err(err) = util::await_future(
         SyncItemsActiveModel {
             sync_dir_id: ActiveValue::Set(sync_dir.id),
             local_path: ActiveValue::Set(local_path.to_owned()),
             remote_path: ActiveValue::Set(remote_path.to_owned()),
             last_local_timestamp: ActiveValue::Set(i32::try_from(local_utc_timestamp).unwrap_or(0)),
-            last_remote_timestamp: ActiveValue::Set(i32::try_from(remote_item.mod_time.unix_timestamp()).unwrap_or(0)),
+            last_remote_timestamp: ActiveValue::Set(
+                i32::try_from(remote_item.mod_time.unix_timestamp()).unwrap_or(0),
+            ),
             ..Default::default()
         }
         .insert(db),
-    );
+    ) {
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(
+                local_path.to_owned(),
+                format!("Could not save synchronization history: {err}"),
+            ),
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1417,7 +2047,7 @@ fn sync_remote_directory(
     db: &DatabaseConnection,
     model: &mut Model,
     shared: &Shared,
-    synced: &RefCell<Vec<(String, String)>>,
+    synced: &RefCell<HashSet<(String, String)>>,
     rx: &crossbeam_channel::Receiver<Command>,
     queue: &mut VecDeque<Command>,
     please_resolve: &str,
@@ -1446,10 +2076,20 @@ fn sync_remote_directory(
         please_resolve,
     } = walk;
 
-    let ignore_globs = load_ignore_globs(&PathBuf::from(format!(
-        "{}/{}",
-        sync_dir.local_path, FILE_IGNORE_NAME
-    )));
+    let ignore_globs =
+        match load_ignore_globs(&Path::new(&sync_dir.local_path).join(FILE_IGNORE_NAME)) {
+            Ok(patterns) => patterns,
+            Err(err) => {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(FILE_IGNORE_NAME.into(), err),
+                );
+                return;
+            }
+        };
     note_progress(
         model,
         shared,
@@ -1461,7 +2101,13 @@ fn sync_remote_directory(
     let items = match rclone::sync::list(&remote.name, remote_dir, false, RcloneListFilter::All) {
         Ok(items) => items,
         Err(err) => {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_dir.to_owned(), err.error));
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(remote_dir.to_owned(), err.error),
+            );
             return;
         }
     };
@@ -1493,74 +2139,254 @@ fn sync_remote_directory(
             queue,
             please_resolve,
         } = walk;
-        if !sync_dir.exists(db) {
+        if !sync_dir.exists(db) || shared.quit_requested() {
             break;
         }
-        if ignore_globs.iter().any(|pattern| pattern.matches(&item.path)) {
-            continue;
-        }
         let remote_path_string = item.path.clone();
-        let Some(local_path_string) = util::local_path_for_remote(&sync_dir.local_path, &sync_dir.remote_path, &item.path) else {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(item.path.clone(), "Remote path is outside the synced folder".into()));
+        let Some(local_path_string) =
+            util::local_path_for_remote(&sync_dir.local_path, &sync_dir.remote_path, &item.path)
+        else {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(
+                    item.path.clone(),
+                    "Remote path is outside the synced folder".into(),
+                ),
+            );
             continue;
         };
-        note_progress(model, shared, &remote.name, sync_dir, db, tr::tr!("Checking '{}' on remote for changes...", &remote_path_string));
-        if synced.borrow().iter().any(|(local, remote_path)| local == &local_path_string && remote_path == &remote_path_string) {
+        let relative = Path::new(&local_path_string)
+            .strip_prefix(&sync_dir.local_path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if ignore_globs
+            .iter()
+            .any(|pattern| pattern.matches(&relative))
+        {
+            continue;
+        }
+        note_progress(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            db,
+            tr::tr!(
+                "Checking '{}' on remote for changes...",
+                &remote_path_string
+            ),
+        );
+        if let Err(err) = validate_local_path(
+            Path::new(&sync_dir.local_path),
+            Path::new(&local_path_string),
+        ) {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(local_path_string.clone(), err),
+            );
+            continue;
+        }
+        if item.is_dir && Path::new(&local_path_string).is_dir() {
+            sync_remote_directory(
+                &item.path,
+                remote,
+                sync_dir,
+                db,
+                model,
+                shared,
+                synced,
+                rx,
+                queue,
+                please_resolve,
+            );
+        }
+        if synced
+            .borrow()
+            .contains(&(local_path_string.clone(), remote_path_string.clone()))
+        {
             continue;
         }
         let local_path = Path::new(&local_path_string);
         let remote_timestamp = item.mod_time.unix_timestamp();
-        let local_timestamp = local_path.metadata().ok().and_then(|metadata| {
-            metadata.modified().ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs())
-        });
-        let db_item = util::await_future(
+        if let Err(err) = validate_local_path(Path::new(&sync_dir.local_path), local_path) {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(local_path_string.clone(), err),
+            );
+            continue;
+        }
+        let local_timestamp = match fs::metadata(local_path) {
+            Ok(metadata) => match metadata.modified().and_then(|time| {
+                time.duration_since(SystemTime::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)
+            }) {
+                Ok(time) => Some(time.as_secs()),
+                Err(err) => {
+                    record_error(
+                        model,
+                        shared,
+                        &remote.name,
+                        sync_dir,
+                        SyncError::General(local_path_string.clone(), err.to_string()),
+                    );
+                    continue;
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(local_path_string.clone(), err.to_string()),
+                );
+                continue;
+            }
+        };
+        let db_item = match util::await_future(
             SyncItemsEntity::find()
+                .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
                 .filter(SyncItemsColumn::LocalPath.eq(local_path_string.clone()))
                 .filter(SyncItemsColumn::RemotePath.eq(remote_path_string.clone()))
                 .one(db),
-        )
-        .ok()
-        .flatten();
+        ) {
+            Ok(item) => item,
+            Err(err) => {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(local_path_string.clone(), err.to_string()),
+                );
+                continue;
+            }
+        };
 
         if let Some(db_model) = db_item {
-            let update_db_item = |local_ts: i32, remote_ts: i32| {
-                let mut active: SyncItemsActiveModel = db_model.clone().into();
-                active.last_local_timestamp = ActiveValue::Set(local_ts);
-                active.last_remote_timestamp = ActiveValue::Set(remote_ts);
-                let _ = util::await_future(active.update(db));
-            };
             if local_timestamp.is_some_and(|l_timestamp| {
                 l_timestamp > db_model.last_local_timestamp as u64
                     && remote_timestamp != db_model.last_remote_timestamp as i64
             }) {
                 if !local_path.is_dir() || !item.is_dir {
-                    record_error(model, shared, &remote.name, sync_dir, SyncError::BothMoreCurrent(local_path_string.clone(), remote_path_string.clone()));
+                    record_error(
+                        model,
+                        shared,
+                        &remote.name,
+                        sync_dir,
+                        SyncError::BothMoreCurrent(
+                            local_path_string.clone(),
+                            remote_path_string.clone(),
+                        ),
+                    );
                 }
                 continue;
             } else if local_timestamp
                 .is_some_and(|l_timestamp| l_timestamp > db_model.last_local_timestamp as u64)
             {
-                if let Some(rclone_item) = push_remote(&item, local_path, &local_path_string, &remote_path_string, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve) {
-                    let Some(local_ts) = local_path.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()) else { continue };
-                    update_db_item(
+                if let Some(rclone_item) = push_remote(
+                    &item,
+                    local_path,
+                    &local_path_string,
+                    &remote_path_string,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                ) {
+                    let Some(local_ts) = local_path
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                    else {
+                        continue;
+                    };
+                    save_baseline(
+                        db,
+                        model,
+                        shared,
+                        remote,
+                        sync_dir,
+                        &db_model,
                         i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                        i32::try_from(rclone_item.mod_time.unix_timestamp()).unwrap_or(db_model.last_remote_timestamp),
+                        i32::try_from(rclone_item.mod_time.unix_timestamp())
+                            .unwrap_or(db_model.last_remote_timestamp),
                     );
                 }
                 continue;
             } else if remote_timestamp > db_model.last_remote_timestamp as i64 {
-                if pull_remote(&item, local_path, &local_path_string, &remote_path_string, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve) {
-                    if let Some(local_ts) = local_path.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()) {
-                        update_db_item(
+                if pull_remote(
+                    &item,
+                    local_path,
+                    &local_path_string,
+                    &remote_path_string,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                ) {
+                    if let Some(local_ts) = local_path
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                    {
+                        save_baseline(
+                            db,
+                            model,
+                            shared,
+                            remote,
+                            sync_dir,
+                            &db_model,
                             i32::try_from(local_ts).unwrap_or(db_model.last_local_timestamp),
-                            i32::try_from(remote_timestamp).unwrap_or(db_model.last_remote_timestamp),
+                            i32::try_from(remote_timestamp)
+                                .unwrap_or(db_model.last_remote_timestamp),
                         );
                     }
                 }
-            } else if !local_path.exists() && remote_timestamp == db_model.last_remote_timestamp as i64 {
-                if let Err(err) = rclone::sync::purge(&remote.name, &remote_path_string) {
-                    record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.clone(), err.error));
-                    delete_db_entry(db, sync_dir.id, &local_path_string, &remote_path_string);
+                continue;
+            } else if !local_path.exists()
+                && remote_timestamp == db_model.last_remote_timestamp as i64
+            {
+                let result = if item.is_dir {
+                    purge_unchanged_remote(db, sync_dir, remote, &remote_path_string)
+                } else {
+                    rclone::sync::delete(&remote.name, &remote_path_string)
+                };
+                match result {
+                    Ok(()) => {
+                        delete_db_entry(db, sync_dir.id, &local_path_string, &remote_path_string)
+                    }
+                    Err(err) => record_error(
+                        model,
+                        shared,
+                        &remote.name,
+                        sync_dir,
+                        SyncError::General(remote_path_string.clone(), err.error),
+                    ),
                 }
                 continue;
             } else if local_timestamp.is_some_and(|l_timestamp| {
@@ -1572,44 +2398,132 @@ fn sync_remote_directory(
                 *l_timestamp == db_model.last_local_timestamp as u64
                     && remote_timestamp < db_model.last_remote_timestamp as i64
             }) {
-                update_db_item(
+                save_baseline(
+                    db,
+                    model,
+                    shared,
+                    remote,
+                    sync_dir,
+                    &db_model,
                     i32::try_from(l_timestamp).unwrap_or(db_model.last_local_timestamp),
                     i32::try_from(remote_timestamp).unwrap_or(db_model.last_remote_timestamp),
                 );
                 continue;
             } else {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.clone(), "Could not decide which copy is newer".into()));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(
+                        remote_path_string.clone(),
+                        "Could not decide which copy is newer".into(),
+                    ),
+                );
                 continue;
             }
         } else if let Some(l_timestamp) = local_timestamp {
             let ok = if l_timestamp > remote_timestamp as u64 {
-                push_remote(&item, local_path, &local_path_string, &remote_path_string, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve).is_some()
+                push_remote(
+                    &item,
+                    local_path,
+                    &local_path_string,
+                    &remote_path_string,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                )
+                .is_some()
             } else {
-                pull_remote(&item, local_path, &local_path_string, &remote_path_string, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve)
+                pull_remote(
+                    &item,
+                    local_path,
+                    &local_path_string,
+                    &remote_path_string,
+                    remote,
+                    sync_dir,
+                    db,
+                    model,
+                    shared,
+                    synced,
+                    rx,
+                    queue,
+                    please_resolve,
+                )
             };
             if !ok {
                 continue;
             }
-        } else if !pull_remote(&item, local_path, &local_path_string, &remote_path_string, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve) {
+        } else if !pull_remote(
+            &item,
+            local_path,
+            &local_path_string,
+            &remote_path_string,
+            remote,
+            sync_dir,
+            db,
+            model,
+            shared,
+            synced,
+            rx,
+            queue,
+            please_resolve,
+        ) {
             continue;
         }
 
-        let Some(l_timestamp) = local_path.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()) else {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path_string.clone(), "Could not read the local modification time".into()));
+        let Some(l_timestamp) = local_path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+        else {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(
+                    local_path_string.clone(),
+                    "Could not read the local modification time".into(),
+                ),
+            );
             continue;
         };
         let r_timestamp = match rclone::sync::stat(&remote.name, &remote_path_string) {
             Ok(Some(found)) => found.mod_time.unix_timestamp(),
             Ok(None) => {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.clone(), "Remote item disappeared after sync".into()));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(
+                        remote_path_string.clone(),
+                        "Remote item disappeared after sync".into(),
+                    ),
+                );
                 continue;
             }
             Err(err) => {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.clone(), err.error));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(remote_path_string.clone(), err.error),
+                );
                 continue;
             }
         };
-        let _ = util::await_future(
+        if let Err(err) = util::await_future(
             SyncItemsActiveModel {
                 sync_dir_id: ActiveValue::Set(sync_dir.id),
                 local_path: ActiveValue::Set(local_path_string.clone()),
@@ -1619,7 +2533,18 @@ fn sync_remote_directory(
                 ..Default::default()
             }
             .insert(db),
-        );
+        ) {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(
+                    local_path_string.clone(),
+                    format!("Could not save synchronization history: {err}"),
+                ),
+            );
+        }
     }
 }
 
@@ -1634,7 +2559,7 @@ fn push_remote(
     db: &DatabaseConnection,
     model: &mut Model,
     shared: &Shared,
-    synced: &RefCell<Vec<(String, String)>>,
+    synced: &RefCell<HashSet<(String, String)>>,
     rx: &crossbeam_channel::Receiver<Command>,
     queue: &mut VecDeque<Command>,
     please_resolve: &str,
@@ -1642,28 +2567,67 @@ fn push_remote(
     if local_path.is_dir() {
         if !item.is_dir {
             if let Err(err) = rclone::sync::delete(&remote.name, remote_path_string) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.into(), err.error));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(remote_path_string.into(), err.error),
+                );
                 return None;
             }
             if let Err(err) = rclone::sync::mkdir(&remote.name, remote_path_string) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.into(), err.error));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(remote_path_string.into(), err.error),
+                );
                 return None;
             }
         }
-        sync_remote_directory(&item.path, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve);
+        sync_remote_directory(
+            &item.path,
+            remote,
+            sync_dir,
+            db,
+            model,
+            shared,
+            synced,
+            rx,
+            queue,
+            please_resolve,
+        );
     } else {
         if item.is_dir {
-            if let Err(err) = rclone::sync::purge(&remote.name, remote_path_string) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.into(), err.error));
+            if let Err(err) = purge_unchanged_remote(db, sync_dir, remote, remote_path_string) {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(remote_path_string.into(), err.error),
+                );
                 return None;
             }
         }
-        if let Err(err) = rclone::sync::copy_to_remote(local_path_string, &remote.name, remote_path_string) {
-            record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.into(), err.error));
+        if let Err(err) =
+            rclone::sync::copy_to_remote(local_path_string, &remote.name, remote_path_string)
+        {
+            record_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                SyncError::General(remote_path_string.into(), err.error),
+            );
             return None;
         }
     }
-    rclone::sync::stat(&remote.name, remote_path_string).ok().flatten()
+    rclone::sync::stat(&remote.name, remote_path_string)
+        .ok()
+        .flatten()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1677,24 +2641,42 @@ fn pull_remote(
     db: &DatabaseConnection,
     model: &mut Model,
     shared: &Shared,
-    synced: &RefCell<Vec<(String, String)>>,
+    synced: &RefCell<HashSet<(String, String)>>,
     rx: &crossbeam_channel::Receiver<Command>,
     queue: &mut VecDeque<Command>,
     please_resolve: &str,
 ) -> bool {
     if local_path.exists() {
         if local_path.is_dir() && !item.is_dir {
-            if let Err(err) = fs::remove_dir_all(local_path) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path_string.into(), err.to_string()));
+            if let Err(err) = remove_unchanged_local(db, sync_dir, local_path) {
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(local_path_string.into(), err.to_string()),
+                );
                 return false;
             }
         } else if !local_path.is_dir() && item.is_dir {
             if let Err(err) = fs::remove_file(local_path) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path_string.into(), err.to_string()));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(local_path_string.into(), err.to_string()),
+                );
                 return false;
             }
             if let Err(err) = fs::create_dir(local_path) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path_string.into(), err.to_string()));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(local_path_string.into(), err.to_string()),
+                );
                 return false;
             }
         }
@@ -1702,13 +2684,38 @@ fn pull_remote(
     if item.is_dir {
         if !local_path.exists() {
             if let Err(err) = fs::create_dir(local_path) {
-                record_error(model, shared, &remote.name, sync_dir, SyncError::General(local_path_string.into(), err.to_string()));
+                record_error(
+                    model,
+                    shared,
+                    &remote.name,
+                    sync_dir,
+                    SyncError::General(local_path_string.into(), err.to_string()),
+                );
                 return false;
             }
         }
-        sync_remote_directory(&item.path, remote, sync_dir, db, model, shared, synced, rx, queue, please_resolve);
-    } else if let Err(err) = rclone::sync::copy_to_local(local_path_string, &remote.name, remote_path_string) {
-        record_error(model, shared, &remote.name, sync_dir, SyncError::General(remote_path_string.into(), err.error));
+        sync_remote_directory(
+            &item.path,
+            remote,
+            sync_dir,
+            db,
+            model,
+            shared,
+            synced,
+            rx,
+            queue,
+            please_resolve,
+        );
+    } else if let Err(err) =
+        rclone::sync::copy_to_local(local_path_string, &remote.name, remote_path_string)
+    {
+        record_error(
+            model,
+            shared,
+            &remote.name,
+            sync_dir,
+            SyncError::General(remote_path_string.into(), err.error),
+        );
         return false;
     }
     true
@@ -1733,3 +2740,7 @@ impl KindLabel for LoginRequest {
         .to_owned()
     }
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;

@@ -147,7 +147,7 @@ pub fn refresh_stale_entries() {
         let Some(target) = exec_target(&contents) else {
             continue;
         };
-        // Bare names (`Exec=skeleton`) resolve via PATH; leave them alone.
+        // Bare names (`Exec=celeste`) resolve via PATH; leave them alone.
         let target = Path::new(&target);
         if !target.is_absolute() || target.is_file() {
             continue;

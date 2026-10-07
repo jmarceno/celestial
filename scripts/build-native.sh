@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Native build: cargo build + stage the binary, desktop entry and icon.
+# Remote build: copy back and stage the binary, desktop entry and icon.
 #
 # Usage:
 #   ./scripts/build-native.sh [--debug|--release] [--stage <absolute-path>] [--features <feats>]
@@ -46,10 +46,10 @@ echo "=== build-native ($BUILD_TYPE) -> $STAGE ==="
 CARGO_ARGS=(build --locked)
 [[ "$BUILD_TYPE" == "release" ]] && CARGO_ARGS+=(--release)
 [[ -n "$FEATURES" ]] && CARGO_ARGS+=(--features "$FEATURES")
-(cd "$PROJECT_ROOT" && cargo "${CARGO_ARGS[@]}")
+(cd "$PROJECT_ROOT" && cargo remote -h -- "${CARGO_ARGS[@]}")
 
-# Respect CARGO_TARGET_DIR (the container build uses a volume).
-TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+# cargo remote copies back only the finished executable.
+TARGET_DIR="$PROJECT_ROOT/target"
 BIN="$TARGET_DIR/$BUILD_TYPE/$APP"
 [[ -x "$BIN" ]] || { echo "error: binary missing: $BIN" >&2; exit 1; }
 
@@ -57,8 +57,8 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" \
          "$STAGE/share/icons/hicolor/scalable/apps" "$STAGE/share/doc/$APP"
 install -m 0755 "$BIN" "$STAGE/bin/$APP"
-install -m 0644 "$PROJECT_ROOT/packaging/desktop/$APP.desktop" "$STAGE/share/applications/$APP.desktop"
-install -m 0644 "$PROJECT_ROOT/assets/$APP.svg" "$STAGE/share/icons/hicolor/scalable/apps/$APP.svg"
+install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celeste.desktop" "$STAGE/share/applications/com.hunterwittenborn.Celeste.desktop"
+install -m 0644 "$PROJECT_ROOT/assets/com.hunterwittenborn.Celeste-regular.svg" "$STAGE/share/icons/hicolor/scalable/apps/com.hunterwittenborn.Celeste.svg"
 for f in LICENSE THIRD_PARTY_LICENSES.md; do
   [[ -f "$PROJECT_ROOT/$f" ]] && install -m 0644 "$PROJECT_ROOT/$f" "$STAGE/share/doc/$APP/$f"
 done

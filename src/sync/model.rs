@@ -4,7 +4,7 @@
 
 use crate::util;
 use indexmap::IndexMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,7 +116,13 @@ impl Model {
             .and_then(|dirs| dirs.get_mut(&(local.to_owned(), remote_path.to_owned())))
     }
 
-    pub fn set_status(&mut self, remote: &str, local: &str, remote_path: &str, status: String) -> bool {
+    pub fn set_status(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        status: String,
+    ) -> bool {
         let Some(dir) = self.dir_mut(remote, local, remote_path) else {
             return false;
         };
@@ -147,7 +153,13 @@ impl Model {
             .count() as i32
     }
 
-    pub fn add_error(&mut self, remote: &str, local: &str, remote_path: &str, error: SyncError) -> bool {
+    pub fn add_error(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        error: SyncError,
+    ) -> bool {
         let id = self.next_error_id;
         self.next_error_id += 1;
         let Some(dir) = self.dir_mut(remote, local, remote_path) else {
@@ -310,12 +322,8 @@ pub fn write_exclusions(local_path: &str, text: &str) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
     use std::io::{Seek, Write};
-    lock.file
-        .set_len(0)
-        .map_err(|err| err.to_string())?;
-    lock.file
-        .rewind()
-        .map_err(|err| err.to_string())?;
+    lock.file.set_len(0).map_err(|err| err.to_string())?;
+    lock.file.rewind().map_err(|err| err.to_string())?;
     lock.file
         .write_all(body.join("\n").as_bytes())
         .map_err(|err| err.to_string())?;

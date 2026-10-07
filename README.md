@@ -1,67 +1,27 @@
-> [!WARNING]
-> makedeb is currently unmaintained: https://hunterwittenborn.com/blog/stepping-back-from-open-source/
-
 # Celeste
-<a href="https://flathub.org/apps/details/com.hunterwittenborn.Celeste"><img width="150" src="https://flathub.org/assets/badges/flathub-badge-i-en.svg" /></a>
-<a href="https://snapcraft.io/celeste"><img width="150" src="https://snapcraft.io/static/images/badges/en/snap-store-black.svg" /></a>
 
-Celeste is a GUI file synchronization client that can connect to virtually any cloud provider.
+Celeste synchronizes folders in both directions between your computer and cloud storage, using Rust, Qt Quick and rclone. A system tray icon keeps synchronization running when the window is closed.
 
-- Backed by [rclone](https://rclone.org/), giving you a reliable and battle-tested way to sync your files anywhere
-- A Qt Quick interface in the same style as the other desktop apps, with a system tray icon that keeps syncing when the window is closed
-- Written in Rust, making Celeste ***blazingly fast*** to use
+Supported providers: Dropbox, Google Drive, Nextcloud, Owncloud, pCloud, Proton Drive and WebDAV.
 
-![](/assets/main-window.png)
-
-## Features
-- Two-way sync
-- Asking what to do when a local and remote file have both been updated since last sync
-- Ability to exclude files/folders from sync
-- Connecting to multiple cloud providers at the same time
-
-## Supported cloud providers
-Celeste can currently connect to the following cloud providers:
-- Dropbox
-- Google Drive
-- Nextcloud
-- Owncloud
-- pCloud
-- Proton Drive
-- WebDAV
+The app reports conflicts when both copies have changed and supports exclusions stored in `.sync-exclude.lst` in each local folder.
 
 ## Installation
-Celeste can be installed via the methods listed below:
 
-### Flatpak
-Celeste is available on [Flathub](https://flathub.org/apps/details/com.hunterwittenborn.Celeste). First make sure you have [set up Flatpak](https://flatpak.org/setup/) on your system, and then run the following:
+Build the portable executable following [BUILDING.md](BUILDING.md), then install it:
 
 ```sh
-flatpak install flathub com.hunterwittenborn.Celeste
+./scripts/install.sh build/portable/Celeste-0.8.3-x86_64-portable.run
 ```
 
-### Snap
-Celeste is available on the [Snap Store](https://snapcraft.io/celeste), which can be installed on any system that has Snap installed.
+Add `--autostart` to start Celeste at login. Launch `celeste` to open the window or `celeste --background` to start in the tray.
 
-```sh
-snap install celeste
-```
+## Configuration
 
-### Prebuilt-MPR (Debian/Ubuntu)
-If you're on Ubuntu 22.10 or later, you can install Celeste from the Prebuilt-MPR. First make sure [the Prebuilt-MPR is set up](https://docs.makedeb.org/prebuilt-mpr/getting-started/) on your system, and then run the following:
+Configuration and synchronization history remain in `$XDG_CONFIG_HOME/celeste` (normally `~/.config/celeste`): `rclone.conf` and `celeste.db`. Keep both when backing up or moving the application.
 
-```sh
-sudo apt install celeste
-```
+See [the synchronization audit](docs/synchronization-audit.md) for the monitoring implementation and remaining limitations.
 
-## Support
-Celeste has multiple communication rooms available if you need assistance, want to talk about the project, or to just hang around with some fellow users:
-- Discord: https://discord.gg/FtNhPepvj7
-- Matrix: https://matrix.to/#/#celeste:gnome.org
+## License and origin
 
-**Bugs and features can be discussed in the rooms if you feel like there's information that should be talked about, but such should ultimately fall into the [issue tracker](https://github.com/hwittenborn/celeste/issues).**
-
-## Contributing
-Instructions still largely need to be written up - if you'd like to help with that, feel free to submit a PR!
-
-### Translating
-Celeste uses [Weblate](https://weblate.org) to manage translations. See <https://hosted.weblate.org/projects/celeste/celeste> if you'd like to assist in translating.
+Celeste is licensed under GPL-3.0-or-later. This Qt Quick application is derived from [Hunter Wittenborn's Celeste](https://github.com/hwittenborn/celeste); the original copyright and license are retained.

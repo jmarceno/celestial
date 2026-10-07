@@ -6,11 +6,10 @@ pub mod validate;
 use crate::{
     entities::{RemotesActiveModel, RemotesModel},
     login::oauth::AuthType,
-    rclone,
-    util,
+    rclone, util,
 };
-use sea_orm::{entity::prelude::*, ActiveValue, DatabaseConnection};
-use serde_json::{json, Value};
+use sea_orm::{ActiveValue, DatabaseConnection, entity::prelude::*};
+use serde_json::{Value, json};
 use std::sync::atomic::AtomicBool;
 
 pub use validate::LoginRequest;
@@ -157,14 +156,11 @@ pub fn create_remote(
     }
     let config_name = req.name.clone();
     let body = config_body(req, token.as_deref())?;
-    util::run_in_background(|| librclone::rpc("config/create", body.to_string()))
+    librclone::rpc("config/create", body.to_string())
         .map_err(|err| format!("Could not save the remote: {err}"))?;
 
     if let Err(err) = can_login(&config_name) {
-        let name = config_name.clone();
-        util::run_in_background(move || {
-            let _ = librclone::rpc("config/delete", json!({ "name": name }).to_string());
-        });
+        let _ = librclone::rpc("config/delete", json!({ "name": config_name }).to_string());
         return Err(err);
     }
 

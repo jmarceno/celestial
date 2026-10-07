@@ -12,14 +12,6 @@ pub fn await_future<F: Future>(future: F) -> F::Output {
     futures::executor::block_on(future)
 }
 
-/// Run a closure away from the GUI thread.
-///
-/// Callers of rclone already run on the sync worker. The closure runs inline
-/// there so librclone stays on that one thread.
-pub fn run_in_background<T, F: FnOnce() -> T>(f: F) -> T {
-    f()
-}
-
 fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_default()
 }
@@ -74,21 +66,26 @@ pub fn local_path_for_remote(
     remote_root: &str,
     remote_item_path: &str,
 ) -> Option<String> {
+    // Remote paths are relative; reject traversal before joining the local root.
+    if remote_item_path.starts_with('/') || remote_item_path.contains('\0') {
+        return None;
+    }
+    if remote_item_path
+        .split('/')
+        .any(|part| part == ".." || part == ".")
+    {
+        return None;
+    }
     let relative = if remote_root.is_empty() {
         remote_item_path
-    } else if remote_item_path == remote_root {
-        ""
     } else {
-        let prefix = format!("{remote_root}/");
-        remote_item_path.strip_prefix(&prefix)?
+        remote_item_path.strip_prefix(&format!("{remote_root}/"))?
     };
-    let relative = relative.trim_matches('/');
-    let local_root = local_root.trim_end_matches('/');
     if relative.is_empty() {
-        Some(local_root.to_owned())
-    } else {
-        Some(format!("{local_root}/{relative}"))
+        return None;
     }
+    let root = local_root.trim_end_matches('/');
+    Some(format!("{root}/{relative}"))
 }
 
 /// Strip the slashes from the beginning and end of a string.
@@ -103,16 +100,6 @@ pub fn strip_slashes(string: &str) -> String {
         None => stripped_prefix,
     }
 }
-
-/// Macro to get the title of a window.
-#[macro_export]
-macro_rules! get_title {
-    ($($arg:tt)*) => {
-        tr::tr!($($arg)*) + " - Celeste"
-    }
-}
-
-pub use crate::get_title;
 
 #[cfg(test)]
 mod tests {
@@ -131,6 +118,23 @@ mod tests {
         assert_eq!(
             local_path_for_remote("/home/user/Google", "", "AsciiArt.txt").as_deref(),
             Some("/home/user/Google/AsciiArt.txt")
+        );
+    }
+
+    #[test]
+    fn rejects_traversal_and_root_entries() {
+        for path in [
+            "docs/../outside",
+            "docs/./file",
+            "docs",
+            "docs/",
+            "/absolute",
+        ] {
+            assert_eq!(local_path_for_remote("/local", "docs", path), None);
+        }
+        assert_eq!(
+            local_path_for_remote("/", "", "file").as_deref(),
+            Some("/file")
         );
     }
 

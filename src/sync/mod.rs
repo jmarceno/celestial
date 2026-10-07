@@ -6,8 +6,8 @@ pub mod model;
 pub use engine::spawn;
 
 use crate::login::LoginRequest;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub enum Command {

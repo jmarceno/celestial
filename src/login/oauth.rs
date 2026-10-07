@@ -8,13 +8,13 @@ use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
-use rocket::response::{content::RawHtml, Responder};
+use rocket::response::{Responder, content::RawHtml};
 use std::{
     io::{BufRead, BufReader},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
@@ -161,7 +161,11 @@ pub fn authorize(
         rocket::build()
             .mount(
                 "/",
-                rocket::routes![get_google_drive, get_google_signin_png, get_google_drive_png],
+                rocket::routes![
+                    get_google_drive,
+                    get_google_signin_png,
+                    get_google_drive_png
+                ],
             )
             .launch(),
     );

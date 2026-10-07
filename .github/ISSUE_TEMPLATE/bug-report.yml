@@ -16,9 +16,8 @@ body:
       label: Installation Source
       description: Where did you install Celeste from?
       options:
-        - Flatpak
-        - Snap
-        - Prebuilt-MPR
+        - Portable executable
+        - Built from source
         - Other (specify the source in the bug description above)
     validations:
       required: true

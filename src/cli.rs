@@ -1,4 +1,4 @@
-//! Command line. No subcommand launches the GUI, matching the old desktop entry.
+//! Command line. No subcommand launches the Qt Quick window.
 
 use clap::{Parser, Subcommand};
 
@@ -19,11 +19,6 @@ pub struct Cli {
 pub enum Commands {
     /// Start the GUI (default).
     App,
-    /// Previous entry point used by the panic wrapper. Same as launching the GUI.
-    RunGui {
-        #[arg(long)]
-        background: bool,
-    },
     /// Add the app-menu entry (and optionally start at login) for this binary.
     Install {
         #[arg(long)]
@@ -35,16 +30,9 @@ pub enum Commands {
     Paths,
 }
 
-pub fn background_requested(cli: &Cli) -> bool {
-    match &cli.command {
-        Some(Commands::RunGui { background }) => *background || cli.background,
-        _ => cli.background,
-    }
-}
-
 pub fn run(cmd: Commands) -> i32 {
     match cmd {
-        Commands::App | Commands::RunGui { .. } => unreachable!("handled in main"),
+        Commands::App => unreachable!("handled in main"),
         Commands::Install { autostart } => {
             let exe = desktop::resolve_binary_path();
             let mut ok = report(desktop::write_menu_entry(&exe), "menu entry");

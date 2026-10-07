@@ -1,180 +1,20 @@
 //! Structs and functions for use with Rclone RPC calls.
-use crate::util;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
 use time::OffsetDateTime;
 
-/// Get a remote from the config file.
-pub fn get_remote<T: ToString>(remote: T) -> Option<Remote> {
-    let remote = remote.to_string();
-
-    let config_str = util::run_in_background(|| {
-        librclone::rpc("config/get", json!({ "name": remote }).to_string()).unwrap()
-    });
-    let config: HashMap<String, String> = serde_json::from_str(&config_str).unwrap();
-
-    match config["type"].as_str() {
-        "dropbox" => Some(Remote::Dropbox(DropboxRemote {
-            remote_name: remote,
-            client_id: config["client_id"].clone(),
-            client_secret: config["client_secret"].clone(),
-        })),
-        "drive" => Some(Remote::GDrive(GDriveRemote {
-            remote_name: remote,
-            client_id: config["client_id"].clone(),
-            client_secret: config["client_secret"].clone(),
-        })),
-        "pcloud" => Some(Remote::PCloud(PCloudRemote {
-            remote_name: remote,
-            client_id: config["client_id"].clone(),
-            client_secret: config["client_secret"].clone(),
-        })),
-        "protondrive" => Some(Remote::ProtonDrive(ProtonDriveRemote {
-            remote_name: remote,
-            username: config["username"].clone(),
-        })),
-        "webdav" => {
-            let vendor = match config["vendor"].as_str() {
-                "nextcloud" => WebDavVendors::Nextcloud,
-                "owncloud" => WebDavVendors::Owncloud,
-                "webdav" => WebDavVendors::WebDav,
-                _ => unreachable!(),
-            };
-
-            Some(Remote::WebDav(WebDavRemote {
-                remote_name: remote,
-                user: config["user"].clone(),
-                pass: config["pass"].clone(),
-                url: config["user"].clone(),
-                vendor,
-            }))
-        }
-        _ => None,
+/// List configured remote names without reading credentials or assuming a provider.
+pub fn get_remotes() -> Result<Vec<String>, String> {
+    let response = librclone::rpc("config/listremotes", json!({}).to_string())?;
+    #[derive(Deserialize)]
+    struct Names {
+        remotes: Vec<String>,
     }
+    serde_json::from_str::<Names>(&response)
+        .map(|names| names.remotes)
+        .map_err(|err| err.to_string())
 }
 
-/// Get all the remotes from the config file.
-pub fn get_remotes() -> Vec<Remote> {
-    let configs_str = util::run_in_background(move || {
-        librclone::rpc("config/listremotes", json!({}).to_string())
-            .unwrap_or_else(|_| unreachable!())
-    });
-    let configs = {
-        let config: HashMap<String, Vec<String>> = serde_json::from_str(&configs_str).unwrap();
-        config.get("remotes").unwrap().to_owned()
-    };
-    let mut celeste_configs = vec![];
-
-    for config in configs {
-        celeste_configs.push(get_remote(&config).unwrap());
-    }
-
-    celeste_configs
-}
-
-/// The types of remotes in the config.
-#[derive(Clone)]
-pub enum Remote {
-    Dropbox(DropboxRemote),
-    GDrive(GDriveRemote),
-    PCloud(PCloudRemote),
-    ProtonDrive(ProtonDriveRemote),
-    WebDav(WebDavRemote),
-}
-
-impl Remote {
-    pub fn remote_name(&self) -> String {
-        match self {
-            Remote::Dropbox(remote) => remote.remote_name.clone(),
-            Remote::GDrive(remote) => remote.remote_name.clone(),
-            Remote::PCloud(remote) => remote.remote_name.clone(),
-            Remote::ProtonDrive(remote) => remote.remote_name.clone(),
-            Remote::WebDav(remote) => remote.remote_name.clone(),
-        }
-    }
-}
-
-// The Dropbox remote type.
-#[derive(Clone, Debug)]
-pub struct DropboxRemote {
-    /// The name of the remote.
-    pub remote_name: String,
-    /// The client id.
-    pub client_id: String,
-    /// The client secret.
-    pub client_secret: String,
-}
-
-// The Google Drive remote type.
-#[derive(Clone, Debug)]
-pub struct GDriveRemote {
-    /// The name of the remote.
-    pub remote_name: String,
-    /// The client id.
-    pub client_id: String,
-    /// The client secret.
-    pub client_secret: String,
-}
-
-// The pCloud remote type.
-#[derive(Clone, Debug)]
-pub struct PCloudRemote {
-    /// The name of the remote.
-    pub remote_name: String,
-    /// The client id.
-    pub client_id: String,
-    /// The client secret.
-    pub client_secret: String,
-}
-
-// The Proton Drive remote type.
-#[derive(Clone, Debug)]
-pub struct ProtonDriveRemote {
-    /// The name of the remote.
-    pub remote_name: String,
-    /// the username.
-    pub username: String,
-}
-
-// The WebDav remote type.
-#[derive(Clone, Debug)]
-pub struct WebDavRemote {
-    /// The name of the remote.
-    pub remote_name: String,
-    /// The username for the remote.
-    pub user: String,
-    /// The password for the remote.
-    pub pass: String,
-    /// The URL for the remote.
-    pub url: String,
-    /// The vendor of the remote.
-    pub vendor: WebDavVendors,
-}
-
-/// Possible WebDav vendors.
-#[derive(Clone, Debug)]
-pub enum WebDavVendors {
-    Nextcloud,
-    Owncloud,
-    GDrive,
-    PCloud,
-    WebDav,
-}
-
-impl std::fmt::Display for WebDavVendors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Nextcloud => "Nextcloud",
-            Self::Owncloud => "Owncloud",
-            Self::GDrive => "Google Drive",
-            Self::PCloud => "pCloud",
-            Self::WebDav => "WebDav",
-        })
-    }
-}
-
-/// Error returned from Rclone.
 #[derive(Clone, Deserialize, Debug)]
 pub struct RcloneError {
     pub error: String,
@@ -214,15 +54,9 @@ pub enum RcloneListFilter {
     All,
     /// Only return directories.
     Dirs,
-    /// Only return files.
-    #[allow(dead_code)]
-    Files,
 }
 
-/// Functions for syncing to a remote.
-/// All functions in this module automatically run under
-/// [`util::run_in_background`], so they don't need to be wrapped around
-/// such to be ran during UI execution.
+/// Functions called synchronously on the synchronization worker.
 pub mod sync {
     use super::{RcloneError, RcloneList, RcloneListFilter, RcloneRemoteItem, RcloneStat};
     use crate::util;
@@ -240,7 +74,7 @@ pub mod sync {
     fn run<T: ToString>(method: T, input: T) -> Result<String, String> {
         let method = method.to_string();
         let input = input.to_string();
-        util::run_in_background(|| librclone::rpc(method, input))
+        librclone::rpc(method, input)
     }
 
     /// Common function for some of the below command.
@@ -297,7 +131,6 @@ pub mod sync {
         let opts = match filter {
             RcloneListFilter::All => json!({ "recurse": recursive }),
             RcloneListFilter::Dirs => json!({"dirsOnly": true, "recurse": recursive}),
-            RcloneListFilter::Files => json!({"filesOnly": true, "recurse": recursive}),
         };
 
         let resp = run(
@@ -323,7 +156,7 @@ pub mod sync {
 
     /// Delete a file.
     pub fn delete(remote_name: &str, path: &str) -> Result<(), RcloneError> {
-        common("operations/delete", remote_name, path)
+        common("operations/deletefile", remote_name, path)
     }
     /// Remove a directory and all of its contents.
     pub fn purge(remote_name: &str, path: &str) -> Result<(), RcloneError> {
