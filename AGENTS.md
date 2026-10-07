@@ -20,3 +20,14 @@ Read these two files directly. A search that stays inside this repo will not see
 - `~/.ssh/config`, host `rust-builder` — `192.168.0.65`, user `builder`, key `~/.ssh/id_ed25519`.
 
 If `cargo remote` fails, report the command's error. Do not switch to a local `cargo build`, `cargo test`, or `cargo clippy`.
+
+## After every commit
+
+After every commit you MUST ALWAYS build a fresh release binary and delete the debug binaries. Debug builds must not take up local disk space.
+
+```bash
+bash scripts/build-run.sh
+rm -rf target/debug
+```
+
+`scripts/build-run.sh` builds the release remotely and leaves only `target/release/celestial` and `target/release/celestial.run`. `cargo remote -- test`, `build` and `clippy` copy debug binaries back into `target/debug`, so remove that folder even if you did not build it explicitly. If the release build fails, report the error instead of committing more work on top of it.
