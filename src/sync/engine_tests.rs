@@ -824,3 +824,118 @@ fn timestamps_after_2038_are_recorded() {
     assert_eq!(row.last_remote_timestamp, 4_000_000_000);
     assert!(!directory_changed(&f.db, &f.remote, &f.dir).unwrap());
 }
+
+impl Fixture {
+    fn conflict(&mut self) -> u64 {
+        self.seed("file.txt");
+        fs::write(self.local.join("file.txt"), "local edit").unwrap();
+        set_time(&self.local.join("file.txt"), 1_700_000_100);
+        let remote_file = self.remote_root.join("sandbox/file.txt");
+        fs::write(&remote_file, "remote edit").unwrap();
+        set_time(&remote_file, 1_700_000_200);
+        self.probed_pass();
+        let errors = &self.model.remotes[&self.remote.name]
+            [&(self.dir.local_path.clone(), self.dir.remote_path.clone())]
+            .errors;
+        assert_eq!(errors.len(), 1);
+        errors[0].id
+    }
+
+    fn activate(&mut self, id: u64) {
+        let (name, local, remote_path) = self.pair();
+        activate_error(
+            &self.shared,
+            &self.db,
+            &mut self.model,
+            &name,
+            &local,
+            &remote_path,
+            id,
+            "resolve",
+        );
+    }
+
+    fn choose(&mut self, id: u64, keep_local: bool) {
+        let (name, local, remote_path) = self.pair();
+        choose_conflict(
+            &self.shared,
+            &self.db,
+            &mut self.model,
+            &name,
+            &local,
+            &remote_path,
+            id,
+            keep_local,
+            "resolve",
+        );
+    }
+
+    fn pair(&self) -> (String, String, String) {
+        (
+            self.remote.name.clone(),
+            self.dir.local_path.clone(),
+            self.dir.remote_path.clone(),
+        )
+    }
+}
+
+#[test]
+fn conflict_choice_copies_the_versions_shown() {
+    let mut f = Fixture::new();
+    let id = f.conflict();
+    f.activate(id);
+    f.choose(id, true);
+    f.assert_no_errors();
+    assert_eq!(
+        fs::read_to_string(f.remote_root.join("sandbox/file.txt")).unwrap(),
+        "local edit"
+    );
+    assert!(!directory_changed(&f.db, &f.remote, &f.dir).unwrap());
+}
+
+#[test]
+fn conflict_choice_is_refused_after_an_item_changes() {
+    let mut f = Fixture::new();
+    let id = f.conflict();
+    f.activate(id);
+    let remote_file = f.remote_root.join("sandbox/file.txt");
+    fs::write(&remote_file, "newer remote edit").unwrap();
+    set_time(&remote_file, 1_700_000_300);
+    f.choose(id, true);
+    assert_eq!(
+        fs::read_to_string(&remote_file).unwrap(),
+        "newer remote edit"
+    );
+    assert_eq!(f.model.error_dir_count(), 1);
+    // Reviewing again shows the current versions, which can then be chosen.
+    f.activate(id);
+    f.choose(id, true);
+    f.assert_no_errors();
+    assert_eq!(fs::read_to_string(&remote_file).unwrap(), "local edit");
+}
+
+#[test]
+fn conflict_choice_without_a_prompt_does_nothing() {
+    let mut f = Fixture::new();
+    let id = f.conflict();
+    f.choose(id, false);
+    assert_eq!(f.model.error_dir_count(), 1);
+    assert_eq!(
+        fs::read_to_string(f.local.join("file.txt")).unwrap(),
+        "local edit"
+    );
+}
+
+#[test]
+fn conflict_choice_refuses_a_symlinked_local_item() {
+    let mut f = Fixture::new();
+    let id = f.conflict();
+    f.activate(id);
+    let outside = f._temp.path().join("outside.txt");
+    fs::write(&outside, "outside data").unwrap();
+    fs::remove_file(f.local.join("file.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, f.local.join("file.txt")).unwrap();
+    f.choose(id, false);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside data");
+    assert_eq!(f.model.error_dir_count(), 1);
+}

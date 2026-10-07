@@ -5,6 +5,7 @@
 use crate::util;
 use indexmap::IndexMap;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +18,10 @@ pub enum SyncError {
     General(String, String),
     BothMoreCurrent(String, String),
 }
+
+/// Kind (`true` for a folder) and modification time of one side of a conflict,
+/// or `None` when that side does not exist.
+pub type ItemVersion = Option<(bool, i64)>;
 
 #[derive(Clone, Debug)]
 pub struct StoredError {
@@ -70,6 +75,8 @@ pub struct Model {
     next_error_id: u64,
     pub remote_deletions: Vec<String>,
     pub dir_deletions: Vec<(String, String, String)>,
+    /// The (local, remote) versions shown in an open conflict prompt, by error ID.
+    pub conflict_versions: HashMap<u64, (ItemVersion, ItemVersion)>,
 }
 
 impl Default for Model {
@@ -87,6 +94,7 @@ impl Model {
             next_error_id: 1,
             remote_deletions: Vec::new(),
             dir_deletions: Vec::new(),
+            conflict_versions: HashMap::new(),
         }
     }
 
@@ -179,6 +187,7 @@ impl Model {
         id: u64,
         please_resolve: &str,
     ) -> bool {
+        self.conflict_versions.remove(&id);
         let Some(dir) = self.dir_mut(remote, local, remote_path) else {
             return false;
         };

@@ -697,6 +697,28 @@ fn choose_conflict(
     else {
         return;
     };
+    // Only act on the versions the person saw when they chose.
+    let Some(shown) = model.conflict_versions.remove(&id) else {
+        return;
+    };
+    let current = match observe_conflict(remote_name, local, remote_path, &local_item, &remote_item)
+    {
+        Ok(current) => current,
+        Err(err) => {
+            shared.dialog("error", tr::tr!("File Update"), err);
+            return;
+        }
+    };
+    if current != shown {
+        shared.dialog(
+            "info",
+            tr::tr!("File Update"),
+            tr::tr!(
+                "One of the items changed after the question was shown. Open the error again to review the current versions."
+            ),
+        );
+        return;
+    }
     let copied = if keep_local {
         copy_local_to_remote(shared, remote_name, &local_item, &remote_item)
     } else {
@@ -724,6 +746,49 @@ fn choose_conflict(
     }
 }
 
+/// Observe both sides of a conflict, refusing items that are no longer
+/// inside the pair or that are reached through a symbolic link.
+fn observe_conflict(
+    remote_name: &str,
+    local_root: &str,
+    remote_root: &str,
+    local_item: &str,
+    remote_item: &str,
+) -> Result<(model::ItemVersion, model::ItemVersion), String> {
+    if util::local_path_for_remote(local_root, remote_root, remote_item).as_deref()
+        != Some(local_item)
+    {
+        return Err("The conflicting items are no longer inside the synced folder".into());
+    }
+    validate_local_path(Path::new(local_root), Path::new(local_item))?;
+    let local_version = match fs::symlink_metadata(local_item) {
+        Ok(metadata) => {
+            let timestamp = metadata
+                .modified()
+                .map_err(|err| err.to_string())?
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|err| err.to_string())?
+                .as_secs();
+            Some((
+                metadata.is_dir(),
+                i64::try_from(timestamp).map_err(|err| err.to_string())?,
+            ))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.to_string()),
+    };
+    let remote_version = rclone::sync::stat(remote_name, remote_item)
+        .map_err(|err| {
+            tr::tr!(
+                "Unable to fetch data for '{}' from the remote.",
+                remote_item
+            ) + "\n\n"
+                + &err.error
+        })?
+        .map(|item| (item.is_dir, item.mod_time.unix_timestamp()));
+    Ok((local_version, remote_version))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_conflict_probe(
     shared: &Shared,
@@ -737,81 +802,80 @@ fn resolve_conflict_probe(
     remote_item: &str,
     please_resolve: &str,
 ) {
-    let local_path = Path::new(local_item);
-    let remote_stat = match rclone::sync::stat(remote_name, remote_item) {
-        Ok(item) => item,
+    let versions = match observe_conflict(remote_name, local, remote_path, local_item, remote_item)
+    {
+        Ok(versions) => versions,
         Err(err) => {
+            shared.dialog("error", tr::tr!("File Update"), err);
+            return;
+        }
+    };
+    if matches!(versions, (Some((true, _)), _) | (_, Some((true, _)))) {
+        shared.dialog(
+            "error",
+            tr::tr!("File Update"),
+            tr::tr!(
+                "A file and a folder share this name. Rename or remove one of them, then dismiss this error."
+            ),
+        );
+        model.conflict_versions.remove(&id);
+        return;
+    }
+    let copied = match versions {
+        (None, None) => {
             shared.dialog(
-                "error",
+                "info",
+                tr::tr!("File Update"),
+                tr::tr!("Neither the local item or remote item exists anymore. This error will now be removed."),
+            );
+            model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+            return;
+        }
+        (Some(_), None) => {
+            shared.dialog(
+                "info",
+                tr::tr!("File Update"),
+                tr::tr!("Only the local item exists now, so it will be synced to the remote."),
+            );
+            copy_local_to_remote(shared, remote_name, local_item, remote_item)
+        }
+        (None, Some(_)) => {
+            shared.dialog(
+                "info",
+                tr::tr!("File Update"),
                 tr::tr!(
-                    "Unable to fetch data for '{}' from the remote.",
+                    "Only the remote item exists now, so it will be synced to the local machine."
+                ),
+            );
+            copy_remote_to_local(shared, remote_name, local_item, remote_item)
+        }
+        (Some(_), Some(_)) => {
+            model.conflict_versions.insert(id, versions);
+            shared.dialog(
+                "conflict",
+                tr::tr!(
+                    "Both the local item '{}' and remote item '{}' have been updated since the last sync.",
+                    util::fmt_home(local_item),
                     remote_item
                 ),
-                err.error,
+                error_ref(remote_name, local, remote_path, id),
             );
             return;
         }
     };
-    if !local_path.exists() && remote_stat.is_none() {
-        shared.dialog(
-            "info",
-            tr::tr!("File Update"),
-            tr::tr!("Neither the local item or remote item exists anymore. This error will now be removed."),
-        );
-        model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
-        return;
-    }
-    if local_path.exists() && remote_stat.is_none() {
-        shared.dialog(
-            "info",
-            tr::tr!("File Update"),
-            tr::tr!("Only the local item exists now, so it will be synced to the remote."),
-        );
-        if copy_local_to_remote(shared, remote_name, local_item, remote_item) {
-            if update_item_timestamps(db, remote_name, local, remote_path, local_item, remote_item)
-                .is_ok()
-            {
-                model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
-            } else {
-                shared.dialog(
-                    "error",
-                    "Synchronization history",
-                    "Could not save the conflict resolution; the error is retained",
-                );
-            }
+    if copied {
+        if update_item_timestamps(db, remote_name, local, remote_path, local_item, remote_item)
+            .is_ok()
+        {
+            model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
+        } else {
+            shared.dialog(
+                "error",
+                "Synchronization history",
+                "Could not save the conflict resolution; the error is retained",
+            );
         }
-        return;
     }
-    if !local_path.exists() && remote_stat.is_some() {
-        shared.dialog(
-            "info",
-            tr::tr!("File Update"),
-            tr::tr!("Only the remote item exists now, so it will be synced to the local machine."),
-        );
-        if copy_remote_to_local(shared, remote_name, local_item, remote_item) {
-            if update_item_timestamps(db, remote_name, local, remote_path, local_item, remote_item)
-                .is_ok()
-            {
-                model.dismiss_error(remote_name, local, remote_path, id, please_resolve);
-            } else {
-                shared.dialog(
-                    "error",
-                    "Synchronization history",
-                    "Could not save the conflict resolution; the error is retained",
-                );
-            }
-        }
-        return;
-    }
-    shared.dialog(
-        "conflict",
-        tr::tr!(
-            "Both the local item '{}' and remote item '{}' have been updated since the last sync.",
-            util::fmt_home(local_item),
-            remote_item
-        ),
-        error_ref(remote_name, local, remote_path, id),
-    );
 }
 
 fn copy_local_to_remote(
