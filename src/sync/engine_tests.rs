@@ -980,7 +980,16 @@ fn watched_pair_skips_the_local_scan_until_an_event_arrives() {
     let mut watcher = watch::LocalWatcher::new();
     watcher.sync_pairs(&[(f.dir.id, f.local.clone())]);
     // First check scans and verifies the local tree.
-    assert!(!pair_changed(&f.db, &f.remote, &f.dir, &mut watcher).unwrap());
+    assert!(
+        !pair_changed(
+            &f.db,
+            &f.remote,
+            &f.dir,
+            watcher.local_unchanged(f.dir.id, &f.local),
+            &mut watcher
+        )
+        .unwrap()
+    );
     // A change the watcher cannot see (simulated by editing the history) is
     // not rescanned while the pair is quiet...
     util::await_future(f.db.execute(sea_orm::Statement::from_string(
@@ -988,16 +997,44 @@ fn watched_pair_skips_the_local_scan_until_an_event_arrives() {
         "UPDATE sync_items SET last_local_timestamp = 1".to_owned(),
     )))
     .unwrap();
-    assert!(!pair_changed(&f.db, &f.remote, &f.dir, &mut watcher).unwrap());
+    assert!(
+        !pair_changed(
+            &f.db,
+            &f.remote,
+            &f.dir,
+            watcher.local_unchanged(f.dir.id, &f.local),
+            &mut watcher
+        )
+        .unwrap()
+    );
     // ...but a local event triggers a full scan.
     fs::write(f.local.join("other.txt"), "new").unwrap();
     let mut changed = false;
     for _ in 0..40 {
         thread::sleep(Duration::from_millis(50));
-        if pair_changed(&f.db, &f.remote, &f.dir, &mut watcher).unwrap() {
+        if pair_changed(
+            &f.db,
+            &f.remote,
+            &f.dir,
+            watcher.local_unchanged(f.dir.id, &f.local),
+            &mut watcher,
+        )
+        .unwrap()
+        {
             changed = true;
             break;
         }
     }
     assert!(changed);
+}
+
+#[test]
+fn remote_checks_are_due_once_per_interval() {
+    let mut checks = RemoteChecks::default();
+    assert!(checks.due(1));
+    checks.done(1);
+    assert!(!checks.due(1));
+    assert!(checks.due(2));
+    checks.forget(1);
+    assert!(checks.due(1));
 }

@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::Ordering,
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub fn spawn(
@@ -107,6 +107,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
     let mut queue = VecDeque::new();
     let mut prompted_login = false;
     let mut watcher = watch::LocalWatcher::new();
+    let mut remote_checks = RemoteChecks::default();
     let please_resolve = format!(
         " {}",
         tr::tr!("Please resolve the reported syncing issues.")
@@ -171,22 +172,34 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 if !sync_dir.exists(&db) {
                     continue;
                 }
-                if model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path)
-                    || !pair_roots_available(&db, &remote, &sync_dir, &mut model, shared)
-                {
+                if model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path) {
+                    // Check the remote again as soon as the errors are dismissed.
+                    remote_checks.forget(sync_dir.id);
                     continue;
                 }
-                let should_sync = match pair_changed(&db, &remote, &sync_dir, &mut watcher) {
-                    Ok(changed) => changed,
-                    Err(err) => {
-                        record_error(
-                            &mut model,
-                            shared,
-                            &remote.name,
-                            &sync_dir,
-                            SyncError::General(sync_dir.local_path.clone(), err),
-                        );
+                let local_quiet =
+                    watcher.local_unchanged(sync_dir.id, Path::new(&sync_dir.local_path));
+                let should_sync = if local_quiet && !remote_checks.due(sync_dir.id) {
+                    false
+                } else {
+                    if !pair_roots_available(&db, &remote, &sync_dir, &mut model, shared) {
                         continue;
+                    }
+                    match pair_changed(&db, &remote, &sync_dir, local_quiet, &mut watcher) {
+                        Ok(changed) => {
+                            remote_checks.done(sync_dir.id);
+                            changed
+                        }
+                        Err(err) => {
+                            record_error(
+                                &mut model,
+                                shared,
+                                &remote.name,
+                                &sync_dir,
+                                SyncError::General(sync_dir.local_path.clone(), err),
+                            );
+                            continue;
+                        }
                     }
                 };
                 if !should_sync {
@@ -260,6 +273,9 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 }
                 if !sync_dir.exists(&db) {
                     continue;
+                }
+                if model.has_errors(&remote.name, &sync_dir.local_path, &sync_dir.remote_path) {
+                    remote_checks.forget(sync_dir.id);
                 }
                 model.mark_finished(
                     &remote.name,
@@ -1039,15 +1055,41 @@ fn pair_roots_available(
 
 const REMOTE_EMPTIED: &str = "Every synced item is missing from the remote folder while the local folder still has them. Automatic deletion is paused; check the remote. To delete everything intentionally, remove the items on both sides.";
 
-/// Decide whether a pair needs a pass, scanning the local tree only when the
-/// watcher cannot vouch that it still matches the history.
+/// How often a pair with no local changes lists its remote folder. Local
+/// changes are still picked up on the next pass.
+const REMOTE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// When each pair's remote folder was last listed successfully.
+#[derive(Default)]
+struct RemoteChecks(HashMap<i32, Instant>);
+
+impl RemoteChecks {
+    fn due(&self, id: i32) -> bool {
+        self.0
+            .get(&id)
+            .is_none_or(|at| at.elapsed() >= REMOTE_CHECK_INTERVAL)
+    }
+
+    fn done(&mut self, id: i32) {
+        self.0.insert(id, Instant::now());
+    }
+
+    fn forget(&mut self, id: i32) {
+        self.0.remove(&id);
+    }
+}
+
+/// Decide whether a pair needs a pass. `local_quiet` comes from
+/// [`watch::LocalWatcher::local_unchanged`]; the local tree is scanned only
+/// when the watcher cannot vouch that it still matches the history.
 fn pair_changed(
     db: &DatabaseConnection,
     remote: &RemotesModel,
     sync_dir: &SyncDirsModel,
+    local_quiet: bool,
     watcher: &mut watch::LocalWatcher,
 ) -> Result<bool, String> {
-    if watcher.local_unchanged(sync_dir.id, Path::new(&sync_dir.local_path)) {
+    if local_quiet {
         return remote_changed(db, remote, sync_dir);
     }
     let changed = directory_changed(db, remote, sync_dir)?;
