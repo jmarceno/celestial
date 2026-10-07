@@ -444,15 +444,43 @@ pub fn conflict_summary(kind: &str, detail: &str) -> String {
     )
 }
 
+/// Identity of a rules file: it is read again only when this changes.
+type RulesIdentity = (u64, u64, i64, i64, u64);
+
+type RulesCache = HashMap<String, (RulesIdentity, Vec<String>)>;
+
+static EXCLUSIONS: Mutex<Option<RulesCache>> = Mutex::new(None);
+
 pub fn read_exclusions(local_path: &str) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
     let path = Path::new(local_path).join(FILE_IGNORE_NAME);
+    let Ok(metadata) = fs::metadata(&path) else {
+        return Vec::new();
+    };
+    let identity = (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.size(),
+    );
+    let mut cache = EXCLUSIONS.lock().unwrap_or_else(|err| err.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some((known, lines)) = cache.get(local_path) {
+        if *known == identity {
+            return lines.clone();
+        }
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    text.lines()
+    let lines: Vec<String> = text
+        .lines()
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
-        .collect()
+        .collect();
+    cache.insert(local_path.to_owned(), (identity, lines.clone()));
+    lines
 }
 
 pub fn write_exclusions(local_path: &str, text: &str) -> Result<(), String> {
@@ -485,11 +513,15 @@ pub fn write_exclusions(local_path: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Snapshot slot the window reads. The worker bumps `generation` after each write.
+/// Snapshot slot the window reads. The worker bumps `generation` whenever
+/// the snapshot changes.
 #[derive(Clone)]
 pub struct SnapshotBus {
     pub json: Arc<Mutex<String>>,
     pub generation: Arc<AtomicU64>,
+    last_tray: Arc<Mutex<Option<(String, String)>>>,
+    /// Tray updates sent, for measurement.
+    pub tray_updates: Arc<AtomicU64>,
 }
 
 impl Default for SnapshotBus {
@@ -503,18 +535,70 @@ impl SnapshotBus {
         Self {
             json: Arc::new(Mutex::new("{}".into())),
             generation: Arc::new(AtomicU64::new(0)),
+            last_tray: Arc::new(Mutex::new(None)),
+            tray_updates: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn publish(&self, model: &Model) {
         let text = model.snapshot().to_string();
-        *self.json.lock().expect("snapshot") = text;
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        let mut json = self.json.lock().unwrap_or_else(|err| err.into_inner());
+        if *json != text {
+            *json = text;
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the tray shows something else than `message` and `phase`;
+    /// records them as shown when it does.
+    pub fn tray_changed(&self, message: &str, phase: &str) -> bool {
+        let mut last = self.last_tray.lock().unwrap_or_else(|err| err.into_inner());
+        if last
+            .as_ref()
+            .is_some_and(|(shown, shown_phase)| shown == message && shown_phase == phase)
+        {
+            return false;
+        }
+        *last = Some((message.to_owned(), phase.to_owned()));
+        self.tray_updates.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub fn load(&self) -> (u64, String) {
         let generation = self.generation.load(Ordering::Relaxed);
-        let text = self.json.lock().expect("snapshot").clone();
+        let text = self
+            .json
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
         (generation, text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identical_snapshots_and_tray_states_are_not_republished() {
+        let bus = SnapshotBus::new();
+        let model = Model::new();
+        bus.publish(&model);
+        bus.publish(&model);
+        assert_eq!(bus.generation.load(Ordering::Relaxed), 1);
+        assert!(bus.tray_changed("a", "done"));
+        assert!(!bus.tray_changed("a", "done"));
+        assert!(bus.tray_changed("a", "syncing"));
+        assert_eq!(bus.tray_updates.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn exclusions_are_reread_only_when_the_file_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_str().unwrap();
+        fs::write(temp.path().join(FILE_IGNORE_NAME), "*.tmp\n").unwrap();
+        assert_eq!(read_exclusions(root), vec!["*.tmp"]);
+        fs::write(temp.path().join(FILE_IGNORE_NAME), "*.tmp\n*.bak\n").unwrap();
+        assert_eq!(read_exclusions(root), vec!["*.tmp", "*.bak"]);
     }
 }

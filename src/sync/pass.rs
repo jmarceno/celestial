@@ -59,6 +59,21 @@ pub struct Report {
     pub aborted: bool,
     /// The local observation, reusable while the watcher sees no change.
     pub local_tree: Option<LocalTree>,
+    pub stats: Stats,
+}
+
+/// What a pass cost, for measurement and logging.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    pub local_items: usize,
+    pub remote_items: usize,
+    /// Bytes of local files read to compute hashes.
+    pub hashed_bytes: u64,
+    /// rclone RPCs: listings, stats, transfers and moves.
+    pub rpc_calls: u64,
+    /// Whether the local tree was walked (rather than reused).
+    pub walked: bool,
+    pub millis: u128,
 }
 
 impl Report {
@@ -301,6 +316,10 @@ pub fn run(
     hooks: &mut dyn Hooks,
     cached: Option<LocalTree>,
 ) -> Result<Report, String> {
+    let started = std::time::Instant::now();
+    let rpc_before = rclone::sync::RPC_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let hashed_before = observe::HASHED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let walked = cached.is_none();
     let root_path = Path::new(&pair.dir.local_path);
     let patterns = load_ignore_globs(&root_path.join(FILE_IGNORE_NAME))?;
     let cx = context(pair)?;
@@ -393,7 +412,14 @@ pub fn run(
     let now = store::now();
     let mut entries: Vec<Entry> = Vec::with_capacity(rels.len());
     let mut skip_under: Option<String> = None;
-    for rel in rels {
+    for (index, rel) in rels.into_iter().enumerate() {
+        // Deciding can hash files: stay responsive to stop and quit.
+        if index % 64 == 63 && !hooks.checkpoint() {
+            return Ok(Report {
+                aborted: true,
+                ..Report::default()
+            });
+        }
         if let Some(parent) = &skip_under {
             if rel.starts_with(&format!("{parent}/")) {
                 continue;
@@ -552,6 +578,16 @@ pub fn run(
             },
         ));
     }
+    report.stats = Stats {
+        local_items: local.items.len(),
+        remote_items: remote.items.len(),
+        hashed_bytes: observe::HASHED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+            - hashed_before,
+        rpc_calls: rclone::sync::RPC_CALLS.load(std::sync::atomic::Ordering::Relaxed) - rpc_before,
+        walked,
+        millis: started.elapsed().as_millis(),
+    };
+    tracing::debug!(pair = %pair.dir.local_path, stats = ?report.stats, actions = report.actions, "pass finished");
     report.local_tree = Some(local);
     Ok(report)
 }

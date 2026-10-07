@@ -94,8 +94,15 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// Publish the model. Identical snapshots and tray states are not sent
+    /// again, so idle loops cost the window and the tray nothing.
     pub fn publish(&self, model: &mut model::Model) {
-        (self.tray)(model.tray_message.clone(), model.tray_phase.clone());
+        if self
+            .bus
+            .tray_changed(&model.tray_message, &model.tray_phase)
+        {
+            (self.tray)(model.tray_message.clone(), model.tray_phase.clone());
+        }
         self.bus.publish(model);
     }
 

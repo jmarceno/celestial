@@ -1447,3 +1447,50 @@ fn an_offline_remote_pauses_the_pair_and_recovers_without_action() {
     f.assert_no_errors();
     assert_eq!(f.read_remote("file.txt"), "edited offline");
 }
+
+#[test]
+fn an_idle_pass_reads_no_contents_and_lists_once() {
+    let mut f = Fixture::new();
+    for index in 0..50 {
+        fs::write(f.local.join(format!("file{index}.txt")), "data").unwrap();
+        set_time(&f.local.join(format!("file{index}.txt")), 1_700_000_000);
+    }
+    f.pass();
+    f.assert_no_errors();
+    f.pass();
+    let stats = f.last.as_ref().unwrap().stats;
+    assert_eq!(f.last.as_ref().unwrap().actions, 0);
+    assert_eq!(stats.hashed_bytes, 0, "{stats:?}");
+    // One recursive listing; everything else is metadata already known.
+    assert!(stats.rpc_calls <= 2, "{stats:?}");
+    assert_eq!(stats.local_items, 50);
+}
+
+/// The audit's 20,000-file fixture. Run explicitly; results are recorded in
+/// docs/synchronization-validation.md.
+#[test]
+#[ignore]
+fn measure_twenty_thousand_files() {
+    let mut f = Fixture::new();
+    for dir in 0..100 {
+        fs::create_dir(f.local.join(format!("d{dir}"))).unwrap();
+        for file in 0..200 {
+            let path = f.local.join(format!("d{dir}/f{file}.txt"));
+            fs::write(&path, format!("{dir}/{file}")).unwrap();
+            set_time(&path, 1_700_000_000);
+        }
+    }
+    let started = std::time::Instant::now();
+    f.pass();
+    let first = started.elapsed();
+    f.assert_no_errors();
+    let initial = f.last.as_ref().unwrap().stats;
+    let started = std::time::Instant::now();
+    f.pass();
+    let idle = started.elapsed();
+    let idle_stats = f.last.as_ref().unwrap().stats;
+    println!("initial upload: {first:?} {initial:?}");
+    println!("idle pass: {idle:?} {idle_stats:?}");
+    assert_eq!(idle_stats.hashed_bytes, 0);
+    assert_eq!(f.last.as_ref().unwrap().actions, 0);
+}

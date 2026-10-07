@@ -429,6 +429,9 @@ pub fn collisions<'a>(
     blocked
 }
 
+/// Bytes of local files read for hashing, for measurement.
+pub static HASHED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Why hashing a local file did not produce a fingerprint.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HashError {
@@ -444,6 +447,7 @@ pub fn hash_local(path: &Path, algo: &str) -> Result<Option<Fingerprint>, HashEr
     let text = path
         .to_str()
         .ok_or_else(|| HashError::Failed(NON_UTF8.into()))?;
+    HASHED_BYTES.fetch_add(before.len(), Ordering::Relaxed);
     let value = rclone::sync::local_hash(text, algo).map_err(|err| HashError::Failed(err.error))?;
     let after = fs::symlink_metadata(path).map_err(|err| HashError::Failed(err.to_string()))?;
     if !LocalMeta::from_metadata(&before).same_tuple(&LocalMeta::from_metadata(&after)) {

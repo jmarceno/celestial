@@ -375,6 +375,7 @@ fn sync_pair(
         queue: &mut *queue,
         remote_name: &remote.name,
         sync_dir,
+        last_progress: None,
     };
     let started = Instant::now();
     let result = pass::run(&pair, &mut hooks, cached);
@@ -458,7 +459,13 @@ struct WorkerHooks<'a> {
     queue: &'a mut VecDeque<Command>,
     remote_name: &'a str,
     sync_dir: &'a SyncDirsModel,
+    /// When progress was last published; ordinary progress is throttled.
+    last_progress: Option<Instant>,
 }
+
+/// Ordinary progress is published at most this often; errors, conflicts,
+/// stop and quit are not throttled.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
 impl pass::Hooks for WorkerHooks<'_> {
     fn checkpoint(&mut self) -> bool {
@@ -489,12 +496,17 @@ impl pass::Hooks for WorkerHooks<'_> {
     }
 
     fn progress(&mut self, text: String) {
-        if self.model.set_status(
+        let changed = self.model.set_status(
             self.remote_name,
             &self.sync_dir.local_path,
             &self.sync_dir.remote_path,
             text,
-        ) {
+        );
+        let due = self
+            .last_progress
+            .is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL);
+        if changed && due {
+            self.last_progress = Some(Instant::now());
             self.shared.publish(self.model);
         }
     }
