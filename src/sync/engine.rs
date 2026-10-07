@@ -1,7 +1,7 @@
 //! Two-way synchronization worker. The Qt window communicates through [`Model`].
 
 use super::model::{self, FILE_IGNORE_NAME, Model, SyncError};
-use super::{Command, Shared};
+use super::{Command, Shared, watch};
 use crate::{
     entities::{
         RemotesColumn, RemotesEntity, RemotesModel, SyncDirsActiveModel, SyncDirsColumn,
@@ -106,6 +106,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
 
     let mut queue = VecDeque::new();
     let mut prompted_login = false;
+    let mut watcher = watch::LocalWatcher::new();
     let please_resolve = format!(
         " {}",
         tr::tr!("Please resolve the reported syncing issues.")
@@ -137,6 +138,12 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
             continue;
         }
         prompted_login = false;
+        let pairs: Vec<(i32, PathBuf)> = util::await_future(SyncDirsEntity::find().all(&db))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dir| (dir.id, PathBuf::from(dir.local_path)))
+            .collect();
+        watcher.sync_pairs(&pairs);
 
         for remote in remotes {
             pump(&rx, &mut queue);
@@ -169,7 +176,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 {
                     continue;
                 }
-                let should_sync = match directory_changed(&db, &remote, &sync_dir) {
+                let should_sync = match pair_changed(&db, &remote, &sync_dir, &mut watcher) {
                     Ok(changed) => changed,
                     Err(err) => {
                         record_error(
@@ -1030,6 +1037,88 @@ fn pair_roots_available(
     }
 }
 
+const REMOTE_EMPTIED: &str = "Every synced item is missing from the remote folder while the local folder still has them. Automatic deletion is paused; check the remote. To delete everything intentionally, remove the items on both sides.";
+
+/// Decide whether a pair needs a pass, scanning the local tree only when the
+/// watcher cannot vouch that it still matches the history.
+fn pair_changed(
+    db: &DatabaseConnection,
+    remote: &RemotesModel,
+    sync_dir: &SyncDirsModel,
+    watcher: &mut watch::LocalWatcher,
+) -> Result<bool, String> {
+    if watcher.local_unchanged(sync_dir.id, Path::new(&sync_dir.local_path)) {
+        return remote_changed(db, remote, sync_dir);
+    }
+    let changed = directory_changed(db, remote, sync_dir)?;
+    if !changed {
+        watcher.mark_verified(sync_dir.id);
+    }
+    Ok(changed)
+}
+
+/// The remote half of [`directory_changed`], for a pair whose local tree is
+/// known to match its history (so every tracked item exists locally).
+fn remote_changed(
+    db: &DatabaseConnection,
+    remote: &RemotesModel,
+    sync_dir: &SyncDirsModel,
+) -> Result<bool, String> {
+    let rows = util::await_future(
+        SyncItemsEntity::find()
+            .filter(SyncItemsColumn::SyncDirId.eq(sync_dir.id))
+            .all(db),
+    )
+    .map_err(|err| err.to_string())?;
+    let remote_items = rclone::sync::list(
+        &remote.name,
+        &sync_dir.remote_path,
+        true,
+        RcloneListFilter::All,
+    )
+    .map_err(|err| err.error)?;
+    let ignore_globs = load_ignore_globs(&Path::new(&sync_dir.local_path).join(FILE_IGNORE_NAME))?;
+    let ignored = |local_path: &str| -> Result<bool, String> {
+        let relative = Path::new(local_path)
+            .strip_prefix(&sync_dir.local_path)
+            .map_err(|err| err.to_string())?;
+        Ok(is_ignored(&relative.to_string_lossy(), &ignore_globs))
+    };
+    let remote_rows: HashMap<_, _> = rows
+        .iter()
+        .map(|row| (row.remote_path.as_str(), row))
+        .collect();
+    let mut remote_seen = HashSet::new();
+    for item in &remote_items {
+        let local_path =
+            util::local_path_for_remote(&sync_dir.local_path, &sync_dir.remote_path, &item.path)
+                .ok_or("Remote path is outside the synced folder")?;
+        if ignored(&local_path)? {
+            continue;
+        }
+        let Some(row) = remote_rows.get(item.path.as_str()) else {
+            return Ok(true);
+        };
+        if item.mod_time.unix_timestamp() != row.last_remote_timestamp {
+            return Ok(true);
+        }
+        remote_seen.insert(item.path.as_str());
+    }
+    let mut tracked = false;
+    let mut missing = false;
+    for row in &rows {
+        if ignored(&row.local_path)? {
+            continue;
+        }
+        tracked = true;
+        missing |= !remote_seen.contains(row.remote_path.as_str());
+    }
+    if tracked && remote_seen.is_empty() {
+        return Err(REMOTE_EMPTIED.into());
+    }
+    Ok(missing)
+}
+
 fn directory_changed(
     db: &DatabaseConnection,
     remote: &RemotesModel,
@@ -1096,7 +1185,7 @@ fn directory_changed(
         return Err("Every synced item is missing from the local folder while the remote still has them. Automatic deletion is paused; check that the local folder or its drive is mounted. To delete everything intentionally, remove the items on both sides.".into());
     }
     if remote_items_kept.is_empty() && local_tracked {
-        return Err("Every synced item is missing from the remote folder while the local folder still has them. Automatic deletion is paused; check the remote. To delete everything intentionally, remove the items on both sides.".into());
+        return Err(REMOTE_EMPTIED.into());
     }
     let mut local_seen = HashSet::new();
     let mut remote_seen = HashSet::new();

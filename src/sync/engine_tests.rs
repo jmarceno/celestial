@@ -939,3 +939,65 @@ fn conflict_choice_refuses_a_symlinked_local_item() {
     assert_eq!(fs::read_to_string(&outside).unwrap(), "outside data");
     assert_eq!(f.model.error_dir_count(), 1);
 }
+
+#[test]
+fn remote_probe_detects_remote_edits_and_deletions() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.seed("neighbor.txt");
+    assert!(!remote_changed(&f.db, &f.remote, &f.dir).unwrap());
+    let remote_file = f.remote_root.join("sandbox/file.txt");
+    fs::write(&remote_file, "remote edit").unwrap();
+    set_time(&remote_file, 1_700_000_100);
+    assert!(remote_changed(&f.db, &f.remote, &f.dir).unwrap());
+    fs::remove_file(&remote_file).unwrap();
+    assert!(remote_changed(&f.db, &f.remote, &f.dir).unwrap());
+}
+
+#[test]
+fn remote_probe_detects_new_items_and_skips_excluded_ones() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join(FILE_IGNORE_NAME), "*.tmp\n").unwrap();
+    f.seed("file.txt");
+    fs::write(f.remote_root.join("sandbox/scratch.tmp"), "excluded").unwrap();
+    assert!(!remote_changed(&f.db, &f.remote, &f.dir).unwrap());
+    fs::write(f.remote_root.join("sandbox/new.txt"), "new").unwrap();
+    assert!(remote_changed(&f.db, &f.remote, &f.dir).unwrap());
+}
+
+#[test]
+fn remote_probe_pauses_when_the_remote_is_emptied() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::remove_file(f.remote_root.join("sandbox/file.txt")).unwrap();
+    assert!(remote_changed(&f.db, &f.remote, &f.dir).is_err());
+}
+
+#[test]
+fn watched_pair_skips_the_local_scan_until_an_event_arrives() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    let mut watcher = watch::LocalWatcher::new();
+    watcher.sync_pairs(&[(f.dir.id, f.local.clone())]);
+    // First check scans and verifies the local tree.
+    assert!(!pair_changed(&f.db, &f.remote, &f.dir, &mut watcher).unwrap());
+    // A change the watcher cannot see (simulated by editing the history) is
+    // not rescanned while the pair is quiet...
+    util::await_future(f.db.execute(sea_orm::Statement::from_string(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE sync_items SET last_local_timestamp = 1".to_owned(),
+    )))
+    .unwrap();
+    assert!(!pair_changed(&f.db, &f.remote, &f.dir, &mut watcher).unwrap());
+    // ...but a local event triggers a full scan.
+    fs::write(f.local.join("other.txt"), "new").unwrap();
+    let mut changed = false;
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(50));
+        if pair_changed(&f.db, &f.remote, &f.dir, &mut watcher).unwrap() {
+            changed = true;
+            break;
+        }
+    }
+    assert!(changed);
+}

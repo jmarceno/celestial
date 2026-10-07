@@ -2,6 +2,7 @@
 
 mod engine;
 pub mod model;
+mod watch;
 
 pub use engine::spawn;
 

@@ -24,7 +24,7 @@ Configuration and synchronization history remain in `$XDG_CONFIG_HOME/celestial`
 
 The app was previously called Celeste. On first start, Celestial moves `~/.config/celeste` and `celeste.db` to the new names, and `celestial install` (or starting the portable bundle) replaces the old menu and autostart entries. `scripts/install.sh` also removes the old `~/.local/bin/celeste` launcher.
 
-See [the synchronization audit](docs/synchronization-audit.md) for the monitoring implementation and remaining limitations.
+Local folders are watched for changes, so an idle folder is not rescanned every check; the remote is still listed on every check. See [the synchronization audit](docs/synchronization-audit.md) for the monitoring implementation and remaining limitations.
 
 ## License and origin
 
