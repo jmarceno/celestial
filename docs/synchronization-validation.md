@@ -7,7 +7,7 @@ This record lists what was verified, how, and what remains unverified. Tests use
 ## Commands run
 
 ```sh
-cargo remote -h -- test --locked                 # 147 passed, 1 ignored (the 20,000-file measurement)
+cargo remote -h -- test --locked                 # 156 passed, 1 ignored (the 20,000-file measurement), after the audit below
 cargo remote -h -- clippy --locked --all-targets # clean with the manifest's deny settings
 bash scripts/build-run.sh                         # after every phase commit
 ./scripts/build-native.sh --release
@@ -19,6 +19,22 @@ git diff --check
 ```
 
 `cargo fmt` is not installed on this workstation; formatting used the builder's rustfmt 1.10 on a synchronized copy of the sources.
+
+## Post-implementation audit
+
+An audit of the implementation against the plan found the following defects. Each is fixed, and each listed test fails on the code before the fix and passes after it.
+
+| Finding | Fix | Regression test |
+| --- | --- | --- |
+| Without a hash and without modification-time support (generic WebDAV), the precision is rclone's 100-year sentinel, so any two files of equal size compared as equal contents: divergent versions were recorded as synchronized without a conflict. | When no shared hash exists and modification times are not usable evidence, equal-size versions are downloaded into staging and compared. | `without_hashes_or_times_equal_sizes_are_compared_by_contents` |
+| Keep both renamed one version but kept the item's history; if the copy that followed failed or was interrupted, the next pass saw a deletion that met an edit, restored it and recorded a spurious edit/delete outcome. A crash between the rename and its journal step also lost the conflict record. | The history of the renamed version is dropped with the rename; the replay recognises a completed rename by the copy, which carries the operation ID. | `an_interrupted_keep_both_is_not_mistaken_for_a_deletion` |
+| An internal folder whose inode changed (the synced folder copied or restored) or that belonged to a stopped or nested pair was synchronized as ordinary contents, uploading every preserved version. | A recorded internal folder carrying this pair's marker is adopted; any `.celestial-*` folder carrying a marker is never synchronized. | `a_copied_internal_folder_is_adopted_not_uploaded`, `internal_folders_of_stopped_pairs_are_never_uploaded` |
+| A remote Restore whose copy failed left the path empty after preserving the current version; the next pass propagated that as a deletion. A local Restore that displaced a concurrent edit kept it as an unrecorded copy. | The current version is moved back when the copy fails; the displaced edit gets a conflict record. | `a_failed_remote_restore_puts_the_current_version_back` |
+| An upload interrupted after preserving the remote version but before journaling that step left the remote path empty, so the next pass restored it as an edit/delete outcome. Versions moved back stayed in the Restore list although nothing was stored there any more. | Preservation journals replay first; the upload replay finds the preserved version in the inventory and moves it back; moved-back versions leave the inventory. | `upload_interrupted_while_preserving_puts_the_remote_version_back` |
+| A local file created while a new remote file was downloaded produced an extra conflict copy of the remote version, then a second one from the next pass's comparison. | The staged download is discarded and the next pass compares both versions once. | `a_local_file_created_during_a_download_is_compared_not_duplicated` |
+| A file renamed only in letter case on a case-insensitive remote was blocked forever with advice to rename one of two names that did not coexist. | A case-only rename of a synchronized file is propagated when the old name is deleted and the new one created on the other side; the new name waits if removing the old one fails. Anything else (for example an edit to the old name) stays blocked. | `letter_case_renames_on_case_insensitive_remotes_are_propagated`, `a_letter_case_rename_that_met_an_edit_stays_blocked` |
+| Uploads from a snapshot (remotes without a hash) carried the snapshot's creation time instead of the file's modification time. | The snapshot keeps the original modification time. | `uploads_to_remotes_without_hashes_use_a_snapshot` |
+| While a remote was unreachable at startup, its capabilities were probed on every worker loop (twice a second). | Recorded capabilities are used when the probe fails; an unknown remote is probed again on its check schedule. | Reviewed; not covered by a test because it needs the worker loop. |
 
 ## Gap register outcomes
 
@@ -72,6 +88,11 @@ The idle time includes the alias backend computing MD5 for every listed file, wh
 - Portable bundle built and smoke-tested: extraction, cache reuse, library closure and headless QML start passed.
 - Actual ABI floor: GLIBC_2.39, GLIBCXX_3.4.30, CXXABI_1.3.15 (determined by rust-builder).
 - Ubuntu 22.04 container bundling refuses the executable with explicit missing-version errors (GLIBC_2.38/2.39, CXXABI_1.3.15). Ubuntu 22.04 runtime support is not claimed.
+
+## Residual limits
+
+- Remote replacement moves the current version into recovery and then uploads, rather than passing `BackupDir` to `copyfile`; an edit another client makes between that move and the end of the upload is replaced (the documented residual remote window).
+- rclone reads and writes local files by path. Celestial checks the item's identity through the open pair root before and after each transfer and hash, so a folder swapped for a link is detected and the result is not recorded, but the transfer itself is not confined to the descriptor.
 
 ## Not verified
 

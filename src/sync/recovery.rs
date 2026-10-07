@@ -78,18 +78,29 @@ impl Internal {
 pub fn ensure_internal(db: &DatabaseConnection, dir: &SyncDirsModel) -> Result<Internal, String> {
     let pair_uuid = store::pair_uuid(db, dir.id).map_err(|err| err.to_string())?;
     let root = Path::new(&dir.local_path);
+    let root_dev = fs::metadata(root).map_err(|err| err.to_string())?.dev();
     let recorded = store::internal_dir(db, dir.id).map_err(|err| err.to_string())?;
     if let Some((name, identity)) = &recorded {
         let path = root.join(name);
         if let Ok(metadata) = fs::symlink_metadata(&path) {
             if metadata.is_dir()
-                && (metadata.dev(), metadata.ino()) == *identity
+                && metadata.dev() == root_dev
                 && fs::read_to_string(path.join(MARKER)).ok().as_deref() == Some(&pair_uuid)
             {
+                // The marker holds this pair's random identity, so the folder
+                // is ours even when copying or restoring the synced folder
+                // gave it a new inode; it is adopted rather than left to be
+                // synchronized as ordinary contents.
+                let current = (metadata.dev(), metadata.ino());
+                if current != *identity {
+                    store::set_internal_dir(db, dir.id, name, current)
+                        .map_err(|err| err.to_string())?;
+                    tracing::info!(path = %path.display(), "internal folder has a new identity; adopted by its marker");
+                }
                 let internal = Internal {
                     name: name.clone(),
                     path,
-                    identity: *identity,
+                    identity: current,
                     pair_uuid,
                 };
                 create_subfolders(&internal)?;
@@ -97,7 +108,6 @@ pub fn ensure_internal(db: &DatabaseConnection, dir: &SyncDirsModel) -> Result<I
             }
         }
     }
-    let root_dev = fs::metadata(root).map_err(|err| err.to_string())?.dev();
     for attempt in 0..100 {
         let name = if attempt == 0 {
             format!(".celestial-{}", &pair_uuid[..8.min(pair_uuid.len())])
@@ -142,6 +152,19 @@ pub fn ensure_internal(db: &DatabaseConnection, dir: &SyncDirsModel) -> Result<I
     Err(tr::tr!(
         "Could not find a free name for Celestial's internal folder."
     ))
+}
+
+/// Whether a local folder is an internal folder of any pair: this pair's
+/// before it was adopted, a stopped pair's, or a nested pair's. They carry
+/// Celestial's ownership marker and hold preserved versions, so they are
+/// never synchronized.
+pub fn is_marked_internal(path: &Path, metadata: &fs::Metadata) -> bool {
+    metadata.is_dir()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".celestial-"))
+        && fs::symlink_metadata(path.join(MARKER)).is_ok_and(|marker| marker.is_file())
 }
 
 fn create_subfolders(internal: &Internal) -> Result<(), String> {
@@ -445,8 +468,11 @@ impl Store<'_> {
     /// database write. Every step is idempotent. Anything that cannot be
     /// proven safe stays journaled and is reported.
     pub fn replay(&self) -> Result<usize, String> {
-        let ops = store::incomplete_operations(self.db, Some(self.dir.id))
+        let mut ops = store::incomplete_operations(self.db, Some(self.dir.id))
             .map_err(|err| err.to_string())?;
+        // Record interrupted preservations first, so the operations that
+        // started them can find what was preserved.
+        ops.sort_by_key(|op| !op.action.starts_with("preserve_"));
         let mut replayed = 0;
         for op in &ops {
             let text = |key: &str| op.payload[key].as_str().unwrap_or_default().to_owned();
@@ -521,10 +547,16 @@ impl Store<'_> {
                     self.abandon(&op.id, "interrupted; the item is checked again");
                 }
                 "upload" => {
-                    let backup = text("backup");
+                    // The step after preserving may not have been journaled:
+                    // the inventory knows what this operation preserved.
+                    let mut backup = text("backup");
+                    if backup.is_empty() {
+                        backup = store::recovery_of_op(self.db, &op.id, "remote", &op.rel)
+                            .map_err(|err| err.to_string())?
+                            .unwrap_or_default();
+                    }
                     let destination = text("remote");
-                    if op.state == "preserved"
-                        && !backup.is_empty()
+                    if !backup.is_empty()
                         && matches!(
                             rclone::sync::stat(&self.remote.name, &destination),
                             Ok(None)
@@ -534,6 +566,8 @@ impl Store<'_> {
                         // replaced it: put it back.
                         rclone::sync::move_on_remote(&self.remote.name, &backup, &destination)
                             .map_err(|err| err.error)?;
+                        store::forget_recovery(self.db, &op.id, &backup)
+                            .map_err(|err| err.to_string())?;
                     }
                     let snapshot = text("snapshot");
                     if !snapshot.is_empty() {
@@ -542,7 +576,35 @@ impl Store<'_> {
                     self.abandon(&op.id, "interrupted; the item is checked again");
                 }
                 "keep_both" => {
-                    if op.state == "renamed"
+                    // The copy's name carries the operation ID, so finding
+                    // it proves the rename happened even if the step after
+                    // it was not journaled.
+                    let copy = text("copy");
+                    let renamed = op.state == "renamed"
+                        || if text("side") == "local" {
+                            self.root
+                                .lstat(&copy)
+                                .map_err(|err| err.to_string())?
+                                .is_some()
+                        } else {
+                            rclone::sync::stat(
+                                &self.remote.name,
+                                &store::item_paths(self.dir, &copy).1,
+                            )
+                            .map_err(|err| err.error)?
+                            .is_some()
+                        };
+                    if renamed {
+                        // The history described the version that was renamed.
+                        if let Some(base) = store::load_baselines(self.db, self.dir)
+                            .map_err(|err| err.to_string())?
+                            .get(&op.rel)
+                        {
+                            store::delete_baseline(self.db, base.id)
+                                .map_err(|err| err.to_string())?;
+                        }
+                    }
+                    if renamed
                         && !store::conflict_for_op(self.db, &op.id)
                             .map_err(|err| err.to_string())?
                     {
@@ -559,7 +621,7 @@ impl Store<'_> {
                         )
                         .map_err(|err| err.to_string())?;
                     }
-                    if op.state == "renamed" {
+                    if renamed {
                         self.finish(&op.id)?;
                     } else {
                         self.abandon(&op.id, "interrupted before the rename");

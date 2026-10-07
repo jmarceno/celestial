@@ -230,7 +230,26 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
                 model.ensure_dir(&remote.name, &dir.local_path, &dir.remote_path);
             }
             if !capabilities.contains_key(&remote.name) {
-                match capabilities::probe(&db, &remote.name, &rclone_version) {
+                // An unreachable remote is probed again on its check
+                // schedule, not on every loop.
+                if !sync_dirs
+                    .iter()
+                    .any(|dir| schedule.remote_checks.due(dir.id))
+                {
+                    continue;
+                }
+                let probed = capabilities::probe(&db, &remote.name, &rclone_version).or_else(|err| {
+                    // Offline: the capabilities recorded earlier still
+                    // describe the remote, and the pass reports the outage.
+                    match store::load_capabilities(&db, &remote.name) {
+                        Ok(Some(caps)) => {
+                            tracing::warn!(remote = %remote.name, "could not read capabilities, using the recorded ones: {err}");
+                            Ok(caps)
+                        }
+                        _ => Err(err),
+                    }
+                });
+                match probed {
                     Ok(caps) => {
                         tracing::info!(remote = %remote.name, hash = ?caps.preferred_hash(), ?caps, "remote capabilities");
                         capabilities.insert(remote.name.clone(), caps);

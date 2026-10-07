@@ -1301,6 +1301,14 @@ fn uploads_to_remotes_without_hashes_use_a_snapshot() {
     f.pass();
     f.assert_no_errors();
     assert_eq!(f.read_remote("file.txt"), "content");
+    // The snapshot carries the original modification time.
+    assert_eq!(
+        fs::metadata(f.remote_file("file.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    );
     assert_eq!(staging_entries(&f), 0);
     let baseline = &store::load_baselines(&f.db, &f.dir).unwrap()["file.txt"];
     assert_eq!(baseline.fingerprint.as_ref().unwrap().algo, "md5");
@@ -1702,4 +1710,241 @@ fn versions_of_unresolved_conflicts_are_never_pruned() {
     .unwrap();
     f.pass();
     assert!(old.exists());
+}
+
+#[test]
+fn without_hashes_or_times_equal_sizes_are_compared_by_contents() {
+    // Generic WebDAV keeps neither hashes nor modification times, so equal
+    // sizes prove nothing: the remote version is downloaded and compared.
+    let mut f = Fixture::new();
+    f.caps.hashes.clear();
+    f.caps.set_modtime = false;
+    f.caps.precision_ns = rclone::MOD_TIME_NOT_SUPPORTED;
+    fs::write(f.local.join("same.txt"), "aaaa").unwrap();
+    set_time(&f.local.join("same.txt"), 1_600_000_000);
+    fs::write(f.remote_file("same.txt"), "aaaa").unwrap();
+    set_time(&f.remote_file("same.txt"), 1_700_000_000);
+    fs::write(f.local.join("differ.txt"), "aaaa").unwrap();
+    set_time(&f.local.join("differ.txt"), 1_700_000_000);
+    fs::write(f.remote_file("differ.txt"), "bbbb").unwrap();
+    set_time(&f.remote_file("differ.txt"), 1_700_000_000);
+    f.pass();
+    f.assert_no_errors_except_conflicts();
+    assert_eq!(conflicts(&f), 1);
+    let copy = only_conflict_copy(&f, "differ");
+    assert_eq!(f.read_local(&copy), "bbbb");
+    assert_eq!(f.read_remote(&copy), "bbbb");
+    assert_eq!(f.read_local("differ.txt"), "aaaa");
+    assert_eq!(f.read_remote("differ.txt"), "aaaa");
+    assert!(fs::read_dir(&f.local).unwrap().flatten().all(|entry| {
+        !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("same.txt.sync-conflict")
+    }));
+    assert_eq!(f.read_remote("same.txt"), "aaaa");
+    assert_eq!(staging_entries(&f), 0);
+    f.pass();
+    assert_eq!(f.last.as_ref().unwrap().actions, 0);
+}
+
+#[test]
+fn an_interrupted_keep_both_is_not_mistaken_for_a_deletion() {
+    // Interrupted right after the rename, before or after the history of
+    // the renamed version was dropped.
+    for point in ["keep_both:moved", "keep_both:renamed"] {
+        let mut f = Fixture::new();
+        f.seed("file.txt");
+        f.seed("other.txt");
+        fs::write(f.local.join("file.txt"), "local edit").unwrap();
+        set_time(&f.local.join("file.txt"), 1_700_000_100);
+        fs::write(f.remote_file("file.txt"), "remote edit!").unwrap();
+        set_time(&f.remote_file("file.txt"), 1_700_000_200);
+        crash_at(&mut f, point);
+        f.pass();
+        f.pass();
+        f.assert_no_errors_except_conflicts();
+        let records = store::open_conflicts(&f.db, f.dir.id).unwrap();
+        assert_eq!(records.len(), 1, "{point}: {records:?}");
+        assert_eq!(records[0].kind, "edit_edit");
+        let copy = only_conflict_copy(&f, "file");
+        assert_eq!(f.read_local(&copy), "local edit");
+        assert_eq!(f.read_remote(&copy), "local edit");
+        assert_eq!(f.read_local("file.txt"), "remote edit!");
+        assert_eq!(f.read_remote("file.txt"), "remote edit!");
+    }
+}
+
+fn internal_folders(f: &Fixture) -> Vec<String> {
+    fs::read_dir(&f.local)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(".celestial-"))
+        .collect()
+}
+
+#[test]
+fn internal_folders_of_stopped_pairs_are_never_uploaded() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::write(f.remote_file("file.txt"), "remote edit").unwrap();
+    f.pass();
+    f.assert_no_errors();
+    let old = internal_folders(&f);
+    assert_eq!(old.len(), 1);
+    // Stopping the pair and adding the folder again gives it a new identity
+    // and no history; the old internal folder still holds a version.
+    sql(
+        &f,
+        "UPDATE sync_dirs SET pair_uuid = 'feedfacefeedfacefeedfacefeedface', internal_name = NULL, internal_dev = NULL, internal_ino = NULL",
+    );
+    sql(&f, "DELETE FROM sync_items");
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(internal_folders(&f).len(), 2);
+    for name in internal_folders(&f) {
+        assert!(!f.remote_file(&name).exists(), "{name} was uploaded");
+    }
+    f.assert_clean();
+}
+
+#[test]
+fn a_copied_internal_folder_is_adopted_not_uploaded() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::write(f.remote_file("file.txt"), "remote edit").unwrap();
+    f.pass();
+    f.assert_no_errors();
+    let [name] = internal_folders(&f).try_into().unwrap();
+    // Restoring or copying the synced folder gives the internal folder a
+    // new inode; its marker still says whose it is.
+    let aside = f.temp.path().join("aside");
+    fs::rename(f.local.join(&name), &aside).unwrap();
+    let copied = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(&aside)
+        .arg(f.local.join(&name))
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(internal_folders(&f), vec![name.clone()]);
+    assert!(!f.remote_file(&name).exists());
+    let items = recovered(&f);
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        fs::read_to_string(&items[0].stored_path).unwrap(),
+        "original"
+    );
+    f.assert_clean();
+}
+
+#[test]
+fn letter_case_renames_on_case_insensitive_remotes_are_propagated() {
+    let mut f = Fixture::new();
+    f.caps.case_insensitive = true;
+    f.seed("readme.txt");
+    fs::rename(f.local.join("readme.txt"), f.local.join("README.txt")).unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert!(!f.remote_file("readme.txt").exists());
+    assert_eq!(f.read_remote("README.txt"), "original");
+    f.assert_clean();
+    fs::rename(f.remote_file("README.txt"), f.remote_file("Readme.txt")).unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert!(!f.local.join("README.txt").exists());
+    assert_eq!(f.read_local("Readme.txt"), "original");
+    f.assert_clean();
+}
+
+#[test]
+fn a_letter_case_rename_that_met_an_edit_stays_blocked() {
+    let mut f = Fixture::new();
+    f.caps.case_insensitive = true;
+    f.seed("notes.txt");
+    fs::rename(f.local.join("notes.txt"), f.local.join("Notes.txt")).unwrap();
+    fs::write(f.remote_file("notes.txt"), "remote edit").unwrap();
+    f.pass();
+    assert_eq!(f.errors().len(), 2);
+    assert_eq!(f.read_remote("notes.txt"), "remote edit");
+    assert!(!f.remote_file("Notes.txt").exists());
+    assert_eq!(f.read_local("Notes.txt"), "original");
+    assert!(!f.local.join("notes.txt").exists());
+}
+
+#[test]
+fn a_failed_remote_restore_puts_the_current_version_back() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.seed("other.txt");
+    fs::write(f.local.join("file.txt"), "local edit").unwrap();
+    f.pass();
+    f.assert_no_errors();
+    let item = recovered(&f)
+        .into_iter()
+        .find(|item| item.side == "remote")
+        .unwrap();
+    let stored = f.remote_root.join(&item.stored_path);
+    crate::sync::failpoint::arm_action("restore:before_copy", move || {
+        fs::remove_file(&stored).unwrap();
+    });
+    let restored = pass::restore(&f.pair(), item.id);
+    crate::sync::failpoint::disarm();
+    assert!(restored.is_err());
+    assert_eq!(f.read_remote("file.txt"), "local edit");
+    let restored_id = item.id;
+    for item in recovered(&f)
+        .iter()
+        .filter(|item| item.side == "remote" && item.id != restored_id)
+    {
+        assert!(f.remote_root.join(&item.stored_path).exists(), "{item:?}");
+    }
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_local("file.txt"), "local edit");
+    assert_eq!(f.read_remote("file.txt"), "local edit");
+}
+
+#[test]
+fn upload_interrupted_while_preserving_puts_the_remote_version_back() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.seed("other.txt");
+    fs::write(f.local.join("file.txt"), "local edit").unwrap();
+    crash_at(&mut f, "preserve_remote:after_move");
+    assert!(!f.remote_file("file.txt").exists());
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(conflicts(&f), 0);
+    assert_eq!(f.read_remote("file.txt"), "local edit");
+    for item in recovered(&f) {
+        assert!(f.remote_root.join(&item.stored_path).exists(), "{item:?}");
+    }
+    f.assert_clean();
+}
+
+#[test]
+fn a_local_file_created_during_a_download_is_compared_not_duplicated() {
+    let mut f = Fixture::new();
+    f.seed("other.txt");
+    fs::write(f.remote_file("new.txt"), "remote").unwrap();
+    set_time(&f.remote_file("new.txt"), 1_600_000_000);
+    let local_file = f.local.join("new.txt");
+    crate::sync::failpoint::arm_action("download:staged", move || {
+        fs::write(&local_file, "local!").unwrap();
+    });
+    f.pass();
+    crate::sync::failpoint::disarm();
+    f.retry_all();
+    f.pass();
+    f.assert_no_errors_except_conflicts();
+    assert_eq!(conflicts(&f), 1);
+    let copy = only_conflict_copy(&f, "new");
+    assert_eq!(f.read_local(&copy), "remote");
+    assert_eq!(f.read_remote(&copy), "remote");
+    assert_eq!(f.read_local("new.txt"), "local!");
+    assert_eq!(f.read_remote("new.txt"), "local!");
+    assert_eq!(staging_entries(&f), 0);
 }

@@ -5,7 +5,7 @@
 //! `Unknown` and never authorizes a transfer or a deletion.
 
 use crate::rclone::{self, RcloneRemoteItem};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -398,35 +398,33 @@ pub fn valid_relative(rel: &str) -> bool {
 
 /// Find names that would map onto the same item: Unicode normalization
 /// variants everywhere, and names differing only by case when the remote is
-/// case-insensitive. Every name in a colliding group is returned.
-pub fn collisions<'a>(
+/// case-insensitive. Every group of two or more distinct names is returned.
+pub fn collision_groups<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     case_insensitive: bool,
-) -> BTreeMap<String, String> {
-    let mut groups: HashMap<String, Vec<&str>> = HashMap::new();
+) -> Vec<Vec<String>> {
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for path in paths {
         let mut key: String = path.nfc().collect();
         if case_insensitive {
             key = key.to_lowercase();
         }
         let group = groups.entry(key).or_default();
-        if !group.contains(&path) {
-            group.push(path);
+        if !group.iter().any(|known| known == path) {
+            group.push(path.to_owned());
         }
     }
-    let mut blocked = BTreeMap::new();
-    for group in groups.values().filter(|group| group.len() > 1) {
-        let names = group.join("', '");
-        for path in group {
-            blocked.insert(
-                (*path).to_owned(),
-                format!(
-                    "'{names}' would become the same item on the remote (letter case or Unicode normalization). Rename all but one of them."
-                ),
-            );
-        }
-    }
-    blocked
+    groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect()
+}
+
+pub fn collision_reason(group: &[String]) -> String {
+    format!(
+        "'{}' would become the same item on the remote (letter case or Unicode normalization). Rename all but one of them.",
+        group.join("', '")
+    )
 }
 
 /// Bytes of local files read for hashing, for measurement.
@@ -564,12 +562,15 @@ mod tests {
 
     #[test]
     fn case_and_normalization_collisions_are_found() {
-        let found = collisions(["Readme.md", "README.md", "other"], true);
-        assert_eq!(found.len(), 2);
-        assert!(collisions(["Readme.md", "README.md"], false).is_empty());
+        let found = collision_groups(["Readme.md", "README.md", "other", "README.md"], true);
+        assert_eq!(
+            found,
+            vec![vec!["Readme.md".to_owned(), "README.md".to_owned()]]
+        );
+        assert!(collision_groups(["Readme.md", "README.md"], false).is_empty());
         let composed = "caf\u{e9}";
         let decomposed = "cafe\u{301}";
-        assert_eq!(collisions([composed, decomposed], false).len(), 2);
+        assert_eq!(collision_groups([composed, decomposed], false)[0].len(), 2);
     }
 
     #[test]

@@ -775,6 +775,38 @@ pub fn recovery_for_op<C: ConnectionTrait>(
     .is_empty())
 }
 
+/// Where operation `op` preserved the `side` version of `rel`, if it did.
+pub fn recovery_of_op<C: ConnectionTrait>(
+    db: &C,
+    op: &str,
+    side: &str,
+    rel: &str,
+) -> Result<Option<String>, DbErr> {
+    query(
+        db,
+        "SELECT stored_path FROM recovery_items WHERE op_id = ? AND side = ? AND rel_path = ? AND pruned_at IS NULL ORDER BY id DESC",
+        vec![op.into(), side.into(), rel.into()],
+    )?
+    .first()
+    .map(|row| get::<String>(row, "stored_path"))
+    .transpose()
+}
+
+/// A preserved version was moved back where it came from: it is no longer
+/// stored in recovery, so it is not offered for restoring.
+pub fn forget_recovery<C: ConnectionTrait>(
+    db: &C,
+    op: &str,
+    stored_path: &str,
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "UPDATE recovery_items SET pruned_at = ? WHERE op_id = ? AND stored_path = ?",
+        vec![now().into(), op.into(), stored_path.into()],
+    )
+    .map(|_| ())
+}
+
 pub fn conflict_for_op<C: ConnectionTrait>(db: &C, op: &str) -> Result<bool, DbErr> {
     Ok(!query(
         db,

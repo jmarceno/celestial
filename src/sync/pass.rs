@@ -189,43 +189,6 @@ impl Pair<'_> {
             Err(reason) => (Delta::Unknown(reason), None),
         }
     }
-
-    fn sides_delta(
-        &self,
-        rel: &str,
-        local: &LocalMeta,
-        remote: &RemoteMeta,
-    ) -> (Delta, Option<Fingerprint>) {
-        if local.is_dir != remote.is_dir {
-            return (Delta::Changed, None);
-        }
-        if local.is_dir {
-            return (Delta::Same, None);
-        }
-        // Different sizes prove different contents without hashing.
-        if remote.size >= 0 && u64::try_from(remote.size).ok() != Some(local.size) {
-            return (Delta::Changed, None);
-        }
-        if let Some(remote_fp) = self.remote_fingerprint(remote) {
-            return match self.hash_local(rel, &remote_fp.algo) {
-                Ok(fp) if fp.value.eq_ignore_ascii_case(&remote_fp.value) => {
-                    (Delta::Same, Some(fp))
-                }
-                Ok(fp) => (Delta::Changed, Some(fp)),
-                Err(reason) => (Delta::Unknown(reason), None),
-            };
-        }
-        // Without a provider hash, equal size and modification time (within
-        // the provider's precision) is the only evidence available.
-        if local
-            .mtime
-            .same_within(remote.mtime, self.caps.precision_ns)
-        {
-            (Delta::Same, None)
-        } else {
-            (Delta::Changed, None)
-        }
-    }
 }
 
 fn remote_delta(meta: &RemoteMeta, base: &Baseline) -> Delta {
@@ -279,6 +242,81 @@ impl Cx<'_> {
 
     fn stat_local(&self, rel: &str) -> Result<Option<LocalMeta>, String> {
         self.root.lstat(rel).map_err(|err| err.to_string())
+    }
+
+    /// Whether both present sides hold the same contents.
+    fn sides_delta(
+        &self,
+        rel: &str,
+        local: &LocalMeta,
+        remote: &RemoteMeta,
+    ) -> (Delta, Option<Fingerprint>) {
+        let pair = self.pair;
+        if local.is_dir != remote.is_dir {
+            return (Delta::Changed, None);
+        }
+        if local.is_dir {
+            return (Delta::Same, None);
+        }
+        // Different sizes prove different contents without hashing.
+        if remote.size >= 0 && u64::try_from(remote.size).ok() != Some(local.size) {
+            return (Delta::Changed, None);
+        }
+        if let Some(remote_fp) = pair.remote_fingerprint(remote) {
+            return match pair.hash_local(rel, &remote_fp.algo) {
+                Ok(fp) if fp.value.eq_ignore_ascii_case(&remote_fp.value) => {
+                    (Delta::Same, Some(fp))
+                }
+                Ok(fp) => (Delta::Changed, Some(fp)),
+                Err(reason) => (Delta::Unknown(reason), None),
+            };
+        }
+        // Without a provider hash, equal size and modification time (within
+        // the provider's precision) is accepted as equal contents. A remote
+        // that cannot keep modification times offers no such evidence, and
+        // different times do not prove different contents: compare bytes.
+        if pair.caps.set_modtime
+            && local
+                .mtime
+                .same_within(remote.mtime, pair.caps.precision_ns)
+        {
+            return (Delta::Same, None);
+        }
+        match self.compare_by_download(rel, remote) {
+            Ok((same, fp)) => (if same { Delta::Same } else { Delta::Changed }, Some(fp)),
+            Err(reason) => (Delta::Unknown(reason), None),
+        }
+    }
+
+    /// Download the remote version into staging and compare it with the
+    /// local file. Returns whether they are equal and the local fingerprint.
+    fn compare_by_download(
+        &self,
+        rel: &str,
+        remote: &RemoteMeta,
+    ) -> Result<(bool, Fingerprint), String> {
+        let pair = self.pair;
+        self.check_space(true, remote.size)?;
+        let algo = pair.algo();
+        let stage = self.rec().staging_rel(&recovery::random_id());
+        let stage_path = self.root.path().join(&stage);
+        let stage_text = stage_path.to_str().ok_or(observe::NON_UTF8)?;
+        let fetched =
+            rclone::sync::copy_to_local(stage_text, &pair.remote.name, &pair.remote_path(rel))
+                .map_err(|err| err.error)
+                .and_then(|()| match observe::hash_local(&stage_path, algo) {
+                    Ok(Some(fp)) => Ok(fp),
+                    Ok(None) => Err(format!(
+                        "Could not compute the {algo} hash of the remote file"
+                    )),
+                    Err(HashError::Changing) => Err(CHANGING.into()),
+                    Err(HashError::Failed(err)) => Err(err),
+                });
+        // Whatever is left in staging is discarded by the next replay too.
+        let _ = self.root.unlink(&stage);
+        let remote_fp = fetched?;
+        let local_fp = pair.hash_local(rel, algo)?;
+        Ok((local_fp.value == remote_fp.value, local_fp))
     }
 
     /// Pause before writing when the destination is short of space, instead
@@ -337,7 +375,11 @@ pub fn run(
     let local = match cached {
         Some(tree) => tree,
         None => observe::observe_local(root_path, &|rel, metadata| {
-            ignored(rel) || internal.is(metadata)
+            // Internal folders of stopped or nested pairs hold preserved
+            // versions too; they are never synchronized.
+            ignored(rel)
+                || internal.is(metadata)
+                || recovery::is_marked_internal(&root_path.join(rel), metadata)
         })
         .map_err(|err| format!("Local sync folder is unavailable: {err}"))?,
     };
@@ -379,14 +421,29 @@ pub fn run(
         .chain(remote.blocked.iter())
         .map(|(rel, reason)| (rel.clone(), reason.clone()))
         .collect();
-    blocked.extend(observe::collisions(
+    // Names that would become one remote item are blocked, except a file
+    // renamed only in letter case on one side: once the old name is removed
+    // the new one no longer collides. That is allowed only when the
+    // decisions below say exactly that.
+    let mut case_renames: Vec<(String, String, String)> = Vec::new();
+    for group in observe::collision_groups(
         local
             .items
             .keys()
             .chain(remote.items.keys())
             .map(String::as_str),
         pair.caps.case_insensitive,
-    ));
+    ) {
+        let reason = observe::collision_reason(&group);
+        match case_rename(&group, &local, &remote, &baselines) {
+            Some((old, new)) => case_renames.push((old, new, reason)),
+            None => {
+                for rel in group {
+                    blocked.insert(rel, reason.clone());
+                }
+            }
+        }
+    }
     let reserved = tr::tr!("This name is reserved for Celestial's preserved versions. Rename it.");
     for rel in remote.items.keys() {
         if rel == &internal.name || rel.starts_with(&format!("{}/", internal.name)) {
@@ -452,7 +509,7 @@ pub fn run(
                 continue;
             }
         }
-        decide(pair, &mut entry);
+        decide(&cx, &mut entry);
         if matches!(entry.decision, Decision::KeepBoth(ConflictKind::FileFolder))
             || matches!(entry.local, Obs::Unknown(_))
             || matches!(entry.remote, Obs::Unknown(_))
@@ -462,6 +519,7 @@ pub fn run(
         }
         entries.push(entry);
     }
+    let renames = confirm_case_renames(&mut entries, &case_renames);
     settle_folders(&mut entries);
     cap_conflict_copies(&mut entries);
 
@@ -496,6 +554,19 @@ pub fn run(
             return Ok(report);
         }
         if failed[index] || entry.deferred || entry.prune {
+            continue;
+        }
+        // The new name of a case-only rename is created only once the old
+        // name is gone, or it would replace it on the remote.
+        if renames
+            .iter()
+            .any(|(old, new)| *new == index && failed[*old])
+        {
+            retry(
+                pair,
+                &entry.rel,
+                &tr::tr!("Waiting for the previous name to be removed first."),
+            )?;
             continue;
         }
         if let Some(reason) = &entry.blocked {
@@ -590,6 +661,77 @@ pub fn run(
     tracing::debug!(pair = %pair.dir.local_path, stats = ?report.stats, actions = report.actions, "pass finished");
     report.local_tree = Some(local);
     Ok(report)
+}
+
+/// `(old, new)` when a collision group is one synchronized file whose name
+/// changed only in letter case on one side: each name exists on one side
+/// only, and only the old name has history.
+fn case_rename(
+    group: &[String],
+    local: &LocalTree,
+    remote: &observe::RemoteTree,
+    baselines: &BTreeMap<String, Baseline>,
+) -> Option<(String, String)> {
+    let [first, second] = group else {
+        return None;
+    };
+    if first.to_lowercase() != second.to_lowercase() {
+        return None;
+    }
+    let only_local = |rel: &str| {
+        local.items.get(rel).is_some_and(|meta| !meta.is_dir) && !remote.items.contains_key(rel)
+    };
+    let only_remote = |rel: &str| {
+        remote.items.get(rel).is_some_and(|meta| !meta.is_dir) && !local.items.contains_key(rel)
+    };
+    if !((only_local(first) && only_remote(second)) || (only_remote(first) && only_local(second))) {
+        return None;
+    }
+    match (
+        baselines.contains_key(first),
+        baselines.contains_key(second),
+    ) {
+        (true, false) => Some((first.clone(), second.clone())),
+        (false, true) => Some((second.clone(), first.clone())),
+        _ => None,
+    }
+}
+
+/// Allow a case-only rename when the old name is deleted where it was
+/// renamed and the new name created on the other side; block both names
+/// otherwise. Returns the entry indices of the allowed renames.
+fn confirm_case_renames(
+    entries: &mut [Entry],
+    candidates: &[(String, String, String)],
+) -> Vec<(usize, usize)> {
+    let mut allowed = Vec::new();
+    for (old, new, reason) in candidates {
+        let position = |rel: &str| entries.iter().position(|entry| entry.rel == rel);
+        let (Some(old_index), Some(new_index)) = (position(old), position(new)) else {
+            for entry in entries
+                .iter_mut()
+                .filter(|entry| entry.rel == *old || entry.rel == *new)
+            {
+                entry.blocked = Some(reason.clone());
+            }
+            continue;
+        };
+        let (old_entry, new_entry) = (&entries[old_index], &entries[new_index]);
+        let renamed = !old_entry.deferred
+            && !new_entry.deferred
+            && matches!(
+                (&old_entry.decision, &new_entry.decision),
+                (Decision::DeleteRemote, Decision::Upload)
+                    | (Decision::DeleteLocal, Decision::Download)
+            );
+        if renamed {
+            allowed.push((old_index, new_index));
+        } else {
+            entries[old_index].blocked = Some(reason.clone());
+            entries[new_index].blocked = Some(reason.clone());
+        }
+    }
+    allowed
 }
 
 /// Keep at most [`recovery::MAX_CONFLICT_COPIES`] visible conflict copies per
@@ -928,8 +1070,16 @@ fn upload_steps(
     let pair = cx.pair;
     let source_rel = match snapshot {
         Some(snapshot) => {
-            fs::copy(pair.local_path(&entry.rel), cx.root.path().join(snapshot))
-                .map_err(|err| err.to_string())?;
+            let snapshot_path = cx.root.path().join(snapshot);
+            fs::copy(pair.local_path(&entry.rel), &snapshot_path).map_err(|err| err.to_string())?;
+            // The upload carries the original modification time.
+            if let Some(time) = local.mtime.to_datetime() {
+                fs::File::options()
+                    .write(true)
+                    .open(&snapshot_path)
+                    .and_then(|file| file.set_modified(time.into()))
+                    .map_err(|err| err.to_string())?;
+            }
             if !cx
                 .stat_local(&entry.rel)?
                 .is_some_and(|now| now.same_tuple(local))
@@ -972,9 +1122,13 @@ fn upload_steps(
     if let Err(err) = rclone::sync::copy_to_remote(source, &pair.remote.name, destination) {
         if let Some(item) = preserved {
             // Put the previous version back where nothing replaced it.
-            if matches!(pair.stat_remote(&entry.rel), Ok(None)) {
-                let _ =
-                    rclone::sync::move_on_remote(&pair.remote.name, &item.stored_path, destination);
+            if matches!(pair.stat_remote(&entry.rel), Ok(None))
+                && rclone::sync::move_on_remote(&pair.remote.name, &item.stored_path, destination)
+                    .is_ok()
+            {
+                if let Err(err) = store::forget_recovery(pair.db, op, &item.stored_path) {
+                    tracing::warn!("could not update the recovery inventory: {err}");
+                }
             }
         }
         return Err(err.error);
@@ -1068,23 +1222,13 @@ fn download_steps(
         None => match cx.root.rename_noreplace(stage, &entry.rel) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Something was created at the path meanwhile: keep both.
-                let copy = recovery::conflict_rel(&entry.rel, "remote", op, observe::Stamp::now());
-                cx.root
-                    .rename_noreplace(stage, &copy)
-                    .map_err(|err| err.to_string())?;
-                record_conflict(
-                    cx,
-                    &entry.rel,
-                    "concurrent_create",
-                    &copy,
-                    "remote",
-                    op,
-                    None,
-                    Some(remote),
-                )?;
+                // Something was created at the path meanwhile. The remote
+                // version is still on the remote, so nothing is lost: the
+                // next pass compares both versions and keeps both if they
+                // differ, without a redundant extra copy.
+                let _ = cx.root.unlink(stage);
                 return Err(tr::tr!(
-                    "A local item was created while the remote version was downloaded; both were kept."
+                    "A local item was created while the remote version was downloaded; both are compared again."
                 ));
             }
             Err(err) => {
@@ -1252,6 +1396,13 @@ fn keep_both(cx: &Cx, entry: &Entry, kind: ConflictKind) -> Result<(), String> {
     if let Err(err) = renamed {
         rec.abandon(&op, &err);
         return Err(err);
+    }
+    failpoint::hit("keep_both:moved");
+    // The history described the version that was just renamed. Without it,
+    // a failed copy below is retried as a new item instead of looking like
+    // a deletion that met an edit.
+    if let Some(base) = &entry.base {
+        store::delete_baseline(pair.db, base.id).map_err(|err| err.to_string())?;
     }
     rec.step(&op, "renamed", None)?;
     failpoint::hit("keep_both:renamed");
@@ -1463,7 +1614,8 @@ fn side(obs: &Obs<impl Clone>, kind: Option<bool>, delta: Delta) -> Side {
     }
 }
 
-fn decide(pair: &Pair, entry: &mut Entry) {
+fn decide(cx: &Cx, entry: &mut Entry) {
+    let pair = cx.pair;
     let history = match &entry.base {
         None => History::None,
         Some(base) if base.verified() && base.is_dir.is_some() => {
@@ -1499,7 +1651,7 @@ fn decide(pair: &Pair, entry: &mut Entry) {
     entry.fingerprint = local_fp;
     if reconcile::needs_sides(&input.local, &input.remote, history) {
         if let (Obs::Present(local), Obs::Present(remote)) = (&entry.local, &entry.remote) {
-            let (delta, fp) = pair.sides_delta(&entry.rel, local, remote);
+            let (delta, fp) = cx.sides_delta(&entry.rel, local, remote);
             input.sides = Some(delta);
             if fp.is_some() {
                 entry.fingerprint = fp;
@@ -1723,10 +1875,21 @@ pub fn restore(pair: &Pair, id: i64) -> Result<String, String> {
                 if displaced.same_after_rename(&expected) {
                     rec.preserve_path(&stage, &rel, &expected, &reason, &op)?;
                 } else {
+                    // An edit landed after the check: keep it visible.
                     let copy = recovery::conflict_rel(&rel, "local", &op, observe::Stamp::now());
                     cx.root
                         .rename_noreplace(&stage, &copy)
                         .map_err(|err| err.to_string())?;
+                    record_conflict(
+                        &cx,
+                        &rel,
+                        "edit_edit",
+                        &copy,
+                        "local",
+                        &op,
+                        Some(&displaced),
+                        None,
+                    )?;
                 }
             }
             None => {
@@ -1743,22 +1906,45 @@ pub fn restore(pair: &Pair, id: i64) -> Result<String, String> {
         if current.as_ref().is_some_and(|meta| meta.is_dir) {
             return Err(tr::tr!("A folder now has this name; rename it first."));
         }
-        if let Some(expected) = &current {
-            cx.rec().preserve_remote(
-                &rel,
-                expected,
-                &reason,
-                &op,
-                &pair.list_options(),
-                pair.caps.preferred_hash(),
-            )?;
+        let destination = pair.remote_path(&rel);
+        let preserved = match &current {
+            Some(expected) => {
+                let (kept, moved) = cx.rec().preserve_remote(
+                    &rel,
+                    expected,
+                    &reason,
+                    &op,
+                    &pair.list_options(),
+                    pair.caps.preferred_hash(),
+                )?;
+                if !same_remote(expected, &moved) {
+                    keep_displaced_remote(&cx, &rel, &kept, &moved, &op)?;
+                }
+                Some(kept)
+            }
+            None => None,
+        };
+        failpoint::hit("restore:before_copy");
+        if let Err(err) =
+            rclone::sync::copy_on_remote(&pair.remote.name, &item.stored_path, &destination)
+        {
+            // Put the current version back: an empty path would otherwise
+            // look like a deletion and be propagated.
+            if let Some(kept) = preserved {
+                if matches!(pair.stat_remote(&rel), Ok(None))
+                    && rclone::sync::move_on_remote(
+                        &pair.remote.name,
+                        &kept.stored_path,
+                        &destination,
+                    )
+                    .is_ok()
+                {
+                    store::forget_recovery(pair.db, &op, &kept.stored_path)
+                        .map_err(|err| err.to_string())?;
+                }
+            }
+            return Err(err.error);
         }
-        rclone::sync::copy_on_remote(
-            &pair.remote.name,
-            &item.stored_path,
-            &pair.remote_path(&rel),
-        )
-        .map_err(|err| err.error)?;
     }
     store::mark_recovery(pair.db, item.id, "restored_at").map_err(|err| err.to_string())?;
     Ok(rel)
