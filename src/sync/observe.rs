@@ -10,6 +10,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 
@@ -21,8 +22,14 @@ pub struct Stamp {
     pub nanos: u32,
 }
 
-/// Filesystem timestamp granularity assumed by the racy-clean rule.
-const RACY_WINDOW_SECS: i64 = 2;
+/// Filesystem timestamp granularity assumed by the racy-clean rule, in
+/// nanoseconds. Tests shorten it so they need not sleep.
+static RACY_WINDOW_NANOS: AtomicI64 = AtomicI64::new(2_000_000_000);
+
+#[cfg(test)]
+pub fn set_racy_window(nanos: i64) {
+    RACY_WINDOW_NANOS.store(nanos, Ordering::Relaxed);
+}
 
 impl Stamp {
     pub fn new(secs: i64, nanos: i64) -> Self {
@@ -127,12 +134,16 @@ impl LocalMeta {
         self == other
     }
 
-    /// A file modified within the timestamp granularity of the observation
+    /// A file changed within the timestamp granularity of the observation
     /// could change again without changing its tuple, so its fingerprint is
-    /// not trusted as a baseline until a later observation.
+    /// not trusted as a baseline until a later observation. Every content
+    /// change sets the inode change time to the current time; the
+    /// modification time is not used because tools set it freely, including
+    /// to the future.
     pub fn is_racy(&self, observed_at: Stamp) -> bool {
-        let limit = observed_at.secs - RACY_WINDOW_SECS;
-        !self.is_dir && (self.mtime.secs >= limit || self.ctime.secs >= limit)
+        let limit =
+            observed_at.total_nanos() - i128::from(RACY_WINDOW_NANOS.load(Ordering::Relaxed));
+        !self.is_dir && self.ctime.total_nanos() >= limit
     }
 }
 

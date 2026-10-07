@@ -3,11 +3,15 @@
 mod capabilities;
 mod engine;
 pub mod model;
+mod pass;
+mod reconcile;
 // The reconciliation engine builds on these in the following changes.
 #[allow(dead_code)]
 mod observe;
 #[allow(dead_code)]
 mod store;
+#[cfg(test)]
+mod testing;
 mod watch;
 
 pub use engine::spawn;

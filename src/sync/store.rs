@@ -119,6 +119,10 @@ pub struct BaselineWrite {
     pub size: i64,
     pub fingerprint: Option<Fingerprint>,
     pub local: LocalMeta,
+    /// `false` for a file modified within the timestamp granularity of its
+    /// observation: its tuple is not trusted, so the next pass compares its
+    /// contents before relying on it.
+    pub trust_local: bool,
     pub remote_size: i64,
     pub remote_mtime: Stamp,
     pub remote_hash: Option<String>,
@@ -251,7 +255,7 @@ pub fn save_baseline<C: ConnectionTrait>(
             i64::from(write.local.mtime.nanos).into(),
             write.local.ctime.secs.into(),
             i64::from(write.local.ctime.nanos).into(),
-            to_db(write.local.inode).into(),
+            write.trust_local.then(|| to_db(write.local.inode)).into(),
             to_db(write.local.device).into(),
             write.remote_size.into(),
             i64::from(write.remote_mtime.nanos).into(),
@@ -823,6 +827,7 @@ pub(crate) mod tests {
                 value: "abc".into(),
             }),
             local: meta(),
+            trust_local: true,
             remote_size: 3,
             remote_mtime: Stamp::new(-100, 0),
             remote_hash: Some("abc".into()),

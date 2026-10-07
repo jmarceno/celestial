@@ -15,17 +15,26 @@ pub const FILE_IGNORE_NAME: &str = ".sync-exclude.lst";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncError {
+    /// A problem with the whole pair (unavailable root, unreadable rules,
+    /// database failure). The pair pauses until a later check succeeds.
     General(String, String),
-    BothMoreCurrent(String, String),
+    /// One item that is retried automatically or blocked until changed.
+    Item {
+        rel: String,
+        path: String,
+        state: String,
+        reason: String,
+        next_attempt: Option<i64>,
+    },
 }
 
-/// Kind (`true` for a folder) and modification time of one side of a conflict,
-/// or `None` when that side does not exist.
-pub type ItemVersion = Option<(bool, i64)>;
+/// Key of the pair-level error; item issues are keyed by relative path.
+pub const PAIR_KEY: &str = "\0pair";
 
 #[derive(Clone, Debug)]
 pub struct StoredError {
     pub id: u64,
+    pub key: String,
     pub error: SyncError,
 }
 
@@ -33,7 +42,6 @@ pub struct StoredError {
 pub struct DirState {
     pub status: String,
     pub phase: String,
-    pub error_status: String,
     pub errors: Vec<StoredError>,
 }
 
@@ -42,28 +50,20 @@ impl DirState {
         Self {
             status: tr::tr!("Awaiting sync check..."),
             phase: "loading".into(),
-            error_status: String::new(),
             errors: Vec::new(),
         }
     }
 
-    fn error_count(&self) -> i32 {
-        self.error_status
-            .split_whitespace()
-            .next()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0)
+    fn error_status(&self) -> String {
+        match self.errors.len() {
+            0 => String::new(),
+            1 => tr::tr!("1 error found."),
+            count => tr::tr!("{} errors found.", count),
+        }
     }
 
-    fn set_error_count(&mut self, count: i32) {
-        self.error_status = if count <= 0 {
-            String::new()
-        } else if count == 1 {
-            tr::tr!("1 error found.") + " "
-        } else {
-            tr::tr!("{} errors found.", count) + " "
-        };
+    pub fn has_pair_error(&self) -> bool {
+        self.errors.iter().any(|err| err.key == PAIR_KEY)
     }
 }
 
@@ -75,8 +75,6 @@ pub struct Model {
     next_error_id: u64,
     pub remote_deletions: Vec<String>,
     pub dir_deletions: Vec<(String, String, String)>,
-    /// The (local, remote) versions shown in an open conflict prompt, by error ID.
-    pub conflict_versions: HashMap<u64, (ItemVersion, ItemVersion)>,
 }
 
 impl Default for Model {
@@ -94,7 +92,6 @@ impl Model {
             next_error_id: 1,
             remote_deletions: Vec::new(),
             dir_deletions: Vec::new(),
-            conflict_versions: HashMap::new(),
         }
     }
 
@@ -124,6 +121,12 @@ impl Model {
             .and_then(|dirs| dirs.get_mut(&(local.to_owned(), remote_path.to_owned())))
     }
 
+    pub fn dir(&self, remote: &str, local: &str, remote_path: &str) -> Option<&DirState> {
+        self.remotes
+            .get(remote)
+            .and_then(|dirs| dirs.get(&(local.to_owned(), remote_path.to_owned())))
+    }
+
     pub fn set_status(
         &mut self,
         remote: &str,
@@ -146,21 +149,86 @@ impl Model {
         true
     }
 
+    /// Whether the pair is paused by a pair-level problem.
     pub fn has_errors(&self, remote: &str, local: &str, remote_path: &str) -> bool {
-        self.remotes
-            .get(remote)
-            .and_then(|dirs| dirs.get(&(local.to_owned(), remote_path.to_owned())))
-            .is_some_and(|dir| !dir.error_status.is_empty())
+        self.dir(remote, local, remote_path)
+            .is_some_and(DirState::has_pair_error)
     }
 
     pub fn error_dir_count(&self) -> i32 {
         self.remotes
             .values()
             .flat_map(|dirs| dirs.values())
-            .filter(|dir| !dir.error_status.is_empty())
+            .filter(|dir| !dir.errors.is_empty())
             .count() as i32
     }
 
+    /// Record or clear the pair-level problem.
+    pub fn set_pair_error(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        error: Option<SyncError>,
+    ) -> bool {
+        let mut next = self.next_error_id;
+        let Some(dir) = self.dir_mut(remote, local, remote_path) else {
+            return false;
+        };
+        let existing = dir.errors.iter().position(|err| err.key == PAIR_KEY);
+        match (existing, error) {
+            (Some(index), Some(error)) => dir.errors[index].error = error,
+            (Some(index), None) => {
+                dir.errors.remove(index);
+            }
+            (None, Some(error)) => {
+                dir.errors.insert(
+                    0,
+                    StoredError {
+                        id: next,
+                        key: PAIR_KEY.into(),
+                        error,
+                    },
+                );
+                next += 1;
+            }
+            (None, None) => {}
+        }
+        self.next_error_id = next;
+        true
+    }
+
+    /// Replace the item issues of a pair, keeping the IDs of issues that are
+    /// still present so an open prompt keeps referring to the same item.
+    pub fn set_issues(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        issues: Vec<(String, SyncError)>,
+    ) -> bool {
+        let mut next = self.next_error_id;
+        let Some(dir) = self.dir_mut(remote, local, remote_path) else {
+            return false;
+        };
+        let old: HashMap<String, u64> = dir
+            .errors
+            .iter()
+            .map(|err| (err.key.clone(), err.id))
+            .collect();
+        dir.errors.retain(|err| err.key == PAIR_KEY);
+        for (key, error) in issues {
+            let id = old.get(&key).copied().unwrap_or_else(|| {
+                next += 1;
+                next - 1
+            });
+            dir.errors.push(StoredError { id, key, error });
+        }
+        self.next_error_id = next;
+        true
+    }
+
+    /// Record a pair-level problem (kept for callers that only add one).
     pub fn add_error(
         &mut self,
         remote: &str,
@@ -168,45 +236,25 @@ impl Model {
         remote_path: &str,
         error: SyncError,
     ) -> bool {
-        let id = self.next_error_id;
-        self.next_error_id += 1;
-        let Some(dir) = self.dir_mut(remote, local, remote_path) else {
-            return false;
-        };
-        let count = dir.error_count() + 1;
-        dir.set_error_count(count);
-        dir.errors.push(StoredError { id, error });
-        true
+        self.set_pair_error(remote, local, remote_path, Some(error))
     }
 
+    /// Remove an issue from the view. The caller decides what dismissal
+    /// means for the item (retry now, acknowledge).
     pub fn dismiss_error(
         &mut self,
         remote: &str,
         local: &str,
         remote_path: &str,
         id: u64,
-        please_resolve: &str,
-    ) -> bool {
-        self.conflict_versions.remove(&id);
-        let Some(dir) = self.dir_mut(remote, local, remote_path) else {
-            return false;
-        };
-        let before = dir.errors.len();
-        dir.errors.retain(|err| err.id != id);
-        if dir.errors.len() == before {
-            return false;
+    ) -> Option<StoredError> {
+        let dir = self.dir_mut(remote, local, remote_path)?;
+        let index = dir.errors.iter().position(|err| err.id == id)?;
+        let removed = dir.errors.remove(index);
+        if dir.errors.is_empty() && dir.phase == "warning" {
+            dir.phase = "done".into();
         }
-        let count = dir.error_count().saturating_sub(1);
-        dir.set_error_count(count);
-        if count == 0 {
-            if let Some(text) = dir.status.strip_suffix(please_resolve) {
-                dir.status = text.to_owned();
-            }
-            if dir.phase == "warning" {
-                dir.phase = "done".into();
-            }
-        }
-        true
+        Some(removed)
     }
 
     pub fn error_by_id(
@@ -215,31 +263,21 @@ impl Model {
         local: &str,
         remote_path: &str,
         id: u64,
-    ) -> Option<SyncError> {
-        self.remotes
-            .get(remote)
-            .and_then(|dirs| dirs.get(&(local.to_owned(), remote_path.to_owned())))
+    ) -> Option<StoredError> {
+        self.dir(remote, local, remote_path)
             .and_then(|dir| dir.errors.iter().find(|err| err.id == id))
-            .map(|err| err.error.clone())
+            .cloned()
     }
 
-    pub fn mark_finished(
-        &mut self,
-        remote: &str,
-        local: &str,
-        remote_path: &str,
-        please_resolve: &str,
-    ) -> bool {
+    pub fn mark_finished(&mut self, remote: &str, local: &str, remote_path: &str) -> bool {
         let Some(dir) = self.dir_mut(remote, local, remote_path) else {
             return false;
         };
-        if dir.error_status.is_empty() {
+        if dir.errors.is_empty() {
             dir.status = tr::tr!("Files are synced.");
             dir.phase = "done".into();
         } else {
-            let mut text = tr::tr!("Files are synced.");
-            text.push_str(please_resolve);
-            dir.status = text;
+            dir.status = tr::tr!("Files are synced. Some items need attention.");
             dir.phase = "warning".into();
         }
         true
@@ -260,7 +298,7 @@ impl Model {
                             "remoteDisplay": format!("/{remote}"),
                             "status": dir.status,
                             "phase": dir.phase,
-                            "errorStatus": dir.error_status.trim(),
+                            "errorStatus": dir.error_status(),
                             "errors": dir.errors.iter().map(error_json).collect::<Vec<_>>(),
                             "exclusions": read_exclusions(local),
                         })
@@ -285,16 +323,33 @@ fn error_json(err: &StoredError) -> Value {
             "title": path,
             "detail": message,
         }),
-        SyncError::BothMoreCurrent(local, remote) => json!({
-            "id": err.id,
-            "kind": "conflict",
-            "title": tr::tr!(
-                "Both '{}' and '{}' are more recent than at last sync.",
-                local,
-                remote
-            ),
-            "detail": "",
-        }),
+        SyncError::Item {
+            path,
+            state,
+            reason,
+            next_attempt,
+            ..
+        } => {
+            let detail = match next_attempt {
+                Some(at) if state == "retrying" => {
+                    let when = time::OffsetDateTime::from_unix_timestamp(*at)
+                        .ok()
+                        .map(|time| format!("{:02}:{:02} UTC", time.hour(), time.minute()))
+                        .unwrap_or_default();
+                    format!(
+                        "{reason}\n{}",
+                        tr::tr!("Retrying automatically at {}.", when)
+                    )
+                }
+                _ => reason.clone(),
+            };
+            json!({
+                "id": err.id,
+                "kind": state,
+                "title": util::fmt_home(path),
+                "detail": detail,
+            })
+        }
     }
 }
 
