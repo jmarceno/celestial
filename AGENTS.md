@@ -5,8 +5,10 @@ Compile with `cargo remote` instead of a local `cargo build`, `cargo test`, or `
 ```bash
 cargo remote -- build --release
 cargo remote -- test
-cargo remote -- clippy --all-targets -- -D warnings
+cargo remote -- clippy --all-targets
 ```
+
+`Cargo.toml` already denies warnings. cargo-remote strips a second `--`, so forwarding `-- -D warnings` fails with `unexpected argument '-D'`.
 
 `cargo fmt` stays local. Dotfiles are not synced; pass `-h` only when the build needs them. Pass `-c <path-under-target>` only when you explicitly want a different file copied back.
 
