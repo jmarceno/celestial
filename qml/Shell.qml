@@ -156,6 +156,24 @@ ApplicationWindow {
                 anchors.fill: parent
                 anchors.margins: 14
                 spacing: 4
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.bottomMargin: 18
+                    spacing: 10
+                    Image {
+                        source: "qrc:/qt/qml/app/celestial/assets/com.unboundmark.Celestial-regular.svg"
+                        sourceSize: Qt.size(80, 80)
+                        Layout.preferredWidth: 40
+                        Layout.preferredHeight: 40
+                        fillMode: Image.PreserveAspectFit
+                    }
+                    Label {
+                        text: "Celestial"
+                        color: root.theme.textPrimary
+                        font.pixelSize: 19
+                        font.bold: true
+                    }
+                }
                 Label {
                     text: "SERVERS"
                     color: root.theme.textDim

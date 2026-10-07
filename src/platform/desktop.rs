@@ -83,8 +83,11 @@ fn icon_path() -> PathBuf {
 
 /// Write the embedded SVG next to the user's other icons.
 fn install_icon() -> Option<PathBuf> {
-    const SVG: &[u8] = include_bytes!("../../assets/com.unboundmark.Celestial-regular.svg");
+    const SVG: &[u8] = crate::ui::branding::LOGO_SVG;
     let path = icon_path();
+    if std::fs::read(&path).ok().as_deref() == Some(SVG) {
+        return Some(path);
+    }
     std::fs::create_dir_all(path.parent()?).ok()?;
     std::fs::write(&path, SVG).ok()?;
     Some(path)
@@ -221,9 +224,13 @@ fn exec_target(contents: &str) -> Option<String> {
 /// whose absolute launcher path no longer exists (the `.run` was moved or
 /// renamed) at the portable launcher running now.
 ///
-/// Only runs from the portable bundle, so a dev `cargo run` never hijacks
-/// the user's entries. Autostart is never created here.
+/// Existing icons are refreshed on any GUI launch. Launcher paths are only
+/// updated from the portable bundle; autostart is never created here.
 pub fn refresh_stale_entries() {
+    // An upgrade can change the embedded logo while keeping the same launcher.
+    if (menu_entry_path().is_file() || autostart_path().is_file()) && install_icon().is_none() {
+        tracing::warn!("could not refresh the installed application icon");
+    }
     if std::env::var_os("CELESTIAL_PORTABLE_EXE").is_none() {
         return;
     }

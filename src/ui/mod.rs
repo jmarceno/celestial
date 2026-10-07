@@ -1,5 +1,6 @@
 //! GUI entry point: single-instance check, tray, Qt environment, QML load.
 
+pub(crate) mod branding;
 pub mod controller;
 pub mod tray;
 
@@ -69,6 +70,10 @@ pub fn run(background: bool) -> i32 {
     let mut engine = QQmlApplicationEngine::new();
     if let Some(app) = app.as_mut() {
         app.set_application_name(&QString::from(crate::util::APP_NAME));
+        QGuiApplication::set_desktop_file_name(&QString::from(crate::util::APP_ID));
+        if let Err(err) = branding::set_window_icon() {
+            tracing::warn!("could not set window icon: {err}");
+        }
     }
     let Some(engine) = engine.as_mut() else {
         eprintln!("Celestial failed to start: Qt QML engine is null.");
