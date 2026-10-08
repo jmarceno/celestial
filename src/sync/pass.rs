@@ -358,7 +358,6 @@ pub fn run(
     let started = std::time::Instant::now();
     let rpc_before = rclone::sync::RPC_CALLS.load(std::sync::atomic::Ordering::Relaxed);
     let hashed_before = observe::HASHED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-    let walked = cached.is_none();
     let root_path = Path::new(&pair.dir.local_path);
     let mut patterns = Rules::load(root_path)?;
     let cx = context(pair)?;
@@ -382,6 +381,11 @@ pub fn run(
     .map_err(|err| err.error)?;
     patterns.note_remote_targets(&pair.dir.remote_path, &listing);
     let ignored = |rel: &str| patterns.matches_in(rel, &cx.root);
+    // A cached walk skipped the remote build folders known at that time.
+    // Once they change, its items are no longer comparable with the
+    // baselines (a folder no longer excluded would look deleted locally).
+    let cached = cached.filter(|tree| &tree.remote_exclusions == patterns.remote_targets());
+    let walked = cached.is_none();
     let mut local = match cached {
         Some(tree) => tree,
         None => observe::observe_local(root_path, &|rel, metadata| {
@@ -393,11 +397,7 @@ pub fn run(
         })
         .map_err(|err| format!("Local sync folder is unavailable: {err}"))?,
     };
-    // A newly observed remote build folder can also exclude paths from a
-    // previously cached local tree. Never treat excluded items as missing.
-    local.items.retain(|rel, _| !ignored(rel));
-    local.blocked.retain(|rel, _| !ignored(rel));
-    local.unreadable.retain(|rel, _| !ignored(rel));
+    local.remote_exclusions = patterns.remote_targets().clone();
     // The walk went by path: make sure it walked the folder that is open.
     let identity = cx.root.identity().map_err(|err| err.to_string())?;
     Root::open(root_path, Some(identity)).map_err(|err| err.to_string())?;

@@ -33,7 +33,7 @@ SQL and Scratch have no additional broad file-extension exclusion: SQL scripts, 
 
 ## Additional local languages
 
-The requested `~/Projetos` directory was absent; the inventory used `/home/jmarceno/Projects`, the parent of this checkout. The read-only inventory checked source filenames and manifests across active, archived and cloned projects, omitting dependency/build/cache directories. The extra languages and tools found were:
+An inventory of the maintainer's projects checked source filenames and manifests across active, archived and cloned projects, omitting dependency/build/cache directories. The extra languages and tools found were:
 
 | Language/ecosystem | Added or shared default coverage |
 | --- | --- |
@@ -65,4 +65,4 @@ The native object rule is `regex:(^|/)(build|obj)/.*\.(o|ali|smod|dcu|ppu|class|
 - [Mix project build paths](https://mix.hexdocs.pm/Mix.Project.html), [DUB](https://dub.pm/advanced_usage/), [Stack work directories](https://docs.haskellstack.org/en/stable/topics/stack_work/)
 - [Lua compiler](https://www.lua.org/manual/5.4/luac.html), [Godot version control guidance](https://docs.godotengine.org/en/stable/tutorials/best_practices/version_control_systems.html)
 - [GitHub's maintained ignore templates](https://github.com/github/gitignore), consulted selectively rather than copied wholesale: many ignore version-control secrets, session state or source-like extensions that a backup must retain.
-- Duende: the local `/home/jmarceno/Projects/duende/README.md` documents `examples/duende_build` output, and its `.gitignore` excludes `duende_build/`.
+- Duende: the compiler's README documents `examples/duende_build` output, and its `.gitignore` excludes `duende_build/`.

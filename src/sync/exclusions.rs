@@ -5,7 +5,7 @@ use super::model::FILE_IGNORE_NAME;
 use glob::{MatchOptions, Pattern};
 use regex::Regex;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -156,7 +156,9 @@ pub fn defaults() -> Vec<String> {
         "/**/steamapps/temp",
         "/dev",
         "/proc",
-        "/run",
+        // Not all of /run: udisks mounts removable drives under /run/media.
+        "/run/user",
+        "/run/lock",
         "/sys",
         "/tmp",
         "/var/tmp",
@@ -195,19 +197,20 @@ pub fn defaults() -> Vec<String> {
         }
     }
     // Honor relocated XDG storage as well as the conventional home layout.
-    if let Some(cache) = absolute_env("XDG_CACHE_HOME") {
-        lines.push(Pattern::escape(&cache.to_string_lossy()));
+    let home = absolute_env("HOME");
+    let xdg = |name| absolute_env(name).map(|path| rule_for(&path, home.as_deref()));
+    if let Some(cache) = xdg("XDG_CACHE_HOME") {
+        lines.push(cache);
     }
-    if let Some(config) = absolute_env("XDG_CONFIG_HOME") {
-        add_config_caches(&mut lines, &Pattern::escape(&config.to_string_lossy()));
+    if let Some(config) = xdg("XDG_CONFIG_HOME") {
+        add_config_caches(&mut lines, &config);
     }
-    if let Some(data) = absolute_env("XDG_DATA_HOME") {
-        let prefix = Pattern::escape(&data.to_string_lossy());
+    if let Some(prefix) = xdg("XDG_DATA_HOME") {
         lines.push(format!("{prefix}/Trash"));
         lines.push(format!("{prefix}/pnpm/store"));
     }
     // Keep the list stable and omit duplicate entries from conventional XDG paths.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     lines.retain(|line| seen.insert(line.clone()));
     lines
 }
@@ -215,6 +218,17 @@ pub fn defaults() -> Vec<String> {
 fn add_config_caches(lines: &mut Vec<String>, prefix: &str) {
     for cache in CONFIG_CACHES {
         lines.push(format!("{prefix}/*/**/{cache}"));
+    }
+}
+
+/// A literal rule for `path`, written as `~/` when it is inside the home
+/// folder so that conventional XDG locations repeat (and drop) a default.
+fn rule_for(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rel) if !rel.as_os_str().is_empty() => {
+            format!("~/{}", Pattern::escape(&rel.to_string_lossy()))
+        }
+        _ => Pattern::escape(&path.to_string_lossy()),
     }
 }
 
@@ -251,7 +265,19 @@ pub fn initialize(local: &Path) -> Result<(), String> {
     let result = (|| {
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
-        super::localfs::Root::open(local, None)?.rename_noreplace(&name, FILE_IGNORE_NAME)
+        drop(file);
+        let root = Root::open(local, None)?;
+        match root.rename_noreplace(&name, FILE_IGNORE_NAME) {
+            Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => {
+                // Network and FUSE filesystems may lack renameat2. A hard
+                // link also publishes the complete file without replacing.
+                fs::hard_link(&temporary, &path).map_err(|link| match link.kind() {
+                    std::io::ErrorKind::AlreadyExists => link,
+                    _ => err,
+                })
+            }
+            result => result,
+        }
     })();
     let _ = fs::remove_file(temporary);
     match result {
@@ -261,13 +287,29 @@ pub fn initialize(local: &Path) -> Result<(), String> {
     }
 }
 
+/// `.sync-exclude.lst.<pid>.<n>.tmp`, left behind if `initialize` is interrupted.
+fn is_initialize_leftover(relative: &str) -> bool {
+    relative
+        .strip_prefix(FILE_IGNORE_NAME)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(pid, n)| {
+            [pid, n]
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 pub struct Rules {
     root: PathBuf,
     relative: Vec<Pattern>,
     absolute: Vec<Pattern>,
     regexes: Vec<Regex>,
+    /// An absolute rule covers the selected folder itself (or a parent).
+    root_excluded: bool,
     rust_target: bool,
-    remote_targets: HashSet<String>,
+    remote_targets: BTreeSet<String>,
     local_targets: RefCell<HashMap<String, bool>>,
 }
 
@@ -300,8 +342,9 @@ impl Rules {
             relative: Vec::new(),
             absolute: Vec::new(),
             regexes: Vec::new(),
+            root_excluded: false,
             rust_target: false,
-            remote_targets: HashSet::new(),
+            remote_targets: BTreeSet::new(),
             local_targets: RefCell::new(HashMap::new()),
         };
         for line in text.lines().filter(|line| !line.is_empty()) {
@@ -335,7 +378,24 @@ impl Rules {
                 rules.relative.push(pattern);
             }
         }
+        rules.root_excluded = local.ancestors().any(|path| rules.matches_absolute(path));
         Ok(rules)
+    }
+
+    fn matches_absolute(&self, path: &Path) -> bool {
+        let options = MatchOptions {
+            require_literal_separator: true,
+            ..MatchOptions::new()
+        };
+        self.absolute
+            .iter()
+            .any(|pattern| pattern.matches_path_with(path, options))
+    }
+
+    /// Build folders proven by the remote listing, which also exclude the
+    /// matching local paths.
+    pub fn remote_targets(&self) -> &BTreeSet<String> {
+        &self.remote_targets
     }
 
     /// A recursive remote listing proves the structure even when the local
@@ -427,20 +487,21 @@ impl Rules {
     }
 
     pub fn matches(&self, relative: &str) -> bool {
-        if relative == FILE_IGNORE_NAME
-            || (relative.starts_with(&format!("{FILE_IGNORE_NAME}.")) && relative.ends_with(".tmp"))
-        {
+        if relative == FILE_IGNORE_NAME || is_initialize_leftover(relative) {
             return true;
         }
-        if self.remote_targets.contains("") {
+        // The selected root may itself be inside an excluded cache/temp folder.
+        if self.root_excluded || self.remote_targets.contains("") {
             return true;
         }
         // Retain the historical semantics of relative user globs (e.g. *.tmp).
+        // Absolute rules use the local name of each path on both sides.
         let mut path = relative;
         loop {
             if self.remote_targets.contains(path)
                 || self.relative.iter().any(|pattern| pattern.matches(path))
                 || self.regexes.iter().any(|regex| regex.is_match(path))
+                || (!self.absolute.is_empty() && self.matches_absolute(&self.root.join(path)))
             {
                 return true;
             }
@@ -449,18 +510,7 @@ impl Rules {
             };
             path = parent;
         }
-        // Apply the local absolute name to both sides. Check parents too when
-        // the selected root is itself inside an excluded cache/temp directory.
-        let absolute = self.root.join(relative);
-        let options = MatchOptions {
-            require_literal_separator: true,
-            ..MatchOptions::new()
-        };
-        absolute.ancestors().any(|path| {
-            self.absolute
-                .iter()
-                .any(|pattern| pattern.matches_path_with(path, options))
-        })
+        false
     }
 }
 
@@ -564,6 +614,40 @@ mod tests {
         assert!(
             !home_rules("/mnt/games/SteamLibrary").matches("steamapps/compatdata/123/save.dat")
         );
+        // Removable drives are mounted under /run/media by udisks.
+        assert!(!home_rules("/run/media/alice/USB").matches("Documents/report.txt"));
+        assert!(!home_rules("/").matches("run/media/alice/USB/report.txt"));
+        assert!(home_rules("/").matches("run/user/1000/gvfs/share/file"));
+    }
+
+    #[test]
+    fn xdg_locations_inside_home_are_written_as_home_rules() {
+        let home = Path::new("/home/alice[1]");
+        assert_eq!(
+            rule_for(Path::new("/home/alice[1]/.cache"), Some(home)),
+            "~/.cache"
+        );
+        assert_eq!(
+            rule_for(Path::new("/home/alice[1]/x[y]"), Some(home)),
+            "~/x[[]y[]]"
+        );
+        assert_eq!(rule_for(Path::new("/srv/cache"), Some(home)), "/srv/cache");
+        assert_eq!(rule_for(home, Some(home)), "/home/alice[[]1[]]");
+        assert_eq!(rule_for(Path::new("/srv/cache"), None), "/srv/cache");
+    }
+
+    #[test]
+    fn only_initialize_leftovers_are_protected() {
+        let rules = Rules::parse(Path::new("/data"), None, "").unwrap();
+        assert!(rules.matches(".sync-exclude.lst.123.0.tmp"));
+        for rel in [
+            ".sync-exclude.lst.notes.tmp",
+            ".sync-exclude.lst.1.tmp",
+            ".sync-exclude.lst..1.tmp",
+            "nested/.sync-exclude.lst.123.0.tmp",
+        ] {
+            assert!(!rules.matches(rel), "user file excluded: {rel}");
+        }
     }
 
     #[test]

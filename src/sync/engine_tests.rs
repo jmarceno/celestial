@@ -562,18 +562,32 @@ fn newly_detected_remote_build_structure_filters_a_cached_local_tree() {
     };
     let report = pass::run(&f.pair(), &mut hooks, Some(cached)).unwrap();
     assert_eq!(report.actions, 0);
-    assert!(!report.stats.walked);
+    // The cached walk predates the remote build folder, so it is walked again.
+    assert!(report.stats.walked);
     assert!(!f.local.join("project/target/release").exists());
     assert_eq!(f.read_local("project/target/readme.txt"), "original");
     assert_eq!(f.read_remote("project/target/readme.txt"), "original");
+    let cached = report.local_tree.unwrap();
     assert!(
-        !report
-            .local_tree
-            .unwrap()
+        !cached
             .items
             .keys()
             .any(|rel| rel.starts_with("project/target"))
     );
+    // Same remote structure: the cached tree is reused as is.
+    let report = pass::run(&f.pair(), &mut hooks, Some(cached)).unwrap();
+    assert_eq!(report.actions, 0);
+    assert!(!report.stats.walked);
+    let cached = report.local_tree.unwrap();
+    // Once the remote build folder disappears, the local folder is included
+    // again. The cached tree skipped it, so using it would look like the
+    // local copy was deleted and remove the remote one.
+    fs::remove_dir_all(f.remote_file("project/target/release")).unwrap();
+    let report = pass::run(&f.pair(), &mut hooks, Some(cached)).unwrap();
+    assert!(report.stats.walked);
+    assert_eq!(f.read_local("project/target/readme.txt"), "original");
+    assert_eq!(f.read_remote("project/target/readme.txt"), "original");
+    f.assert_clean();
 }
 
 #[test]

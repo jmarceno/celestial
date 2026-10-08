@@ -5,7 +5,7 @@
 //! `Unknown` and never authorizes a transfer or a deletion.
 
 use crate::rclone::{self, RcloneRemoteItem};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -199,6 +199,9 @@ pub struct LocalTree {
     pub blocked: BTreeMap<String, String>,
     /// Folders that could not be read; everything below them is unknown.
     pub unreadable: BTreeMap<String, String>,
+    /// Remote build folders whose local paths the walk also skipped. The
+    /// tree is reusable only while the remote proves the same folders.
+    pub remote_exclusions: BTreeSet<String>,
 }
 
 impl LocalTree {
