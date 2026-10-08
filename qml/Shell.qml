@@ -18,6 +18,7 @@ ApplicationWindow {
 
     property var snapshot: ({ remotes: [] })
     property var progress: ({ pairs: [], total: null })
+    property var estimate: ({})
     // Bumped every 30 s so relative times ("5 min ago") stay current.
     property int clock: 0
     property string selectedName: ""
@@ -82,6 +83,10 @@ ApplicationWindow {
         dialog.open()
     }
     function closeDialog() {
+        if (root.popupMode === "add") {
+            root.estimateTimer.stop()
+            root.controller.cancelEstimate()
+        }
         dialog.close()
         root.popupMode = ""
     }
@@ -91,6 +96,19 @@ ApplicationWindow {
         running: root.visible
         repeat: true
         onTriggered: root.clock++
+    }
+
+    // Measure the folder pair shortly after the person stops typing.
+    property Timer estimateTimer: Timer {
+        interval: 700
+        onTriggered: {
+            if (root.popupMode === "add" && localField.text.length > 0 && root.selectedName.length > 0)
+                root.controller.estimateDir(root.selectedName, localField.text, remoteField.text)
+        }
+    }
+    function estimateCurrent() {
+        return root.popupMode === "add" && root.estimate.local === localField.text
+            && root.estimate.remotePath === remoteField.text && root.estimate.remote === root.selectedName
     }
 
     onClosing: function(close) {
@@ -119,6 +137,9 @@ ApplicationWindow {
                 }
             }
             root.detail = null
+        }
+        function onEstimate_jsonChanged() {
+            root.estimate = root.parse(root.controller.estimate_json, {})
         }
         function onProgress_jsonChanged() {
             root.progress = root.parse(root.controller.progress_json, { pairs: [], total: null })
@@ -655,7 +676,13 @@ ApplicationWindow {
                 Layout.leftMargin: 18
                 Layout.rightMargin: 18
                 spacing: 10
-                Field { id: localField; label: "Local folder"; Layout.fillWidth: true; text: root.localDraft }
+                Field {
+                    id: localField
+                    label: "Local folder"
+                    Layout.fillWidth: true
+                    text: root.localDraft
+                    onTextChanged: root.estimateTimer.restart()
+                }
                 PrimaryButton { text: "Browse…"; onClicked: folderDialog.open() }
                 Field {
                     id: remoteField
@@ -666,7 +693,24 @@ ApplicationWindow {
                         root.remoteDraft = remoteField.text
                         if (root.selectedName.length > 0)
                             root.controller.listDirs(root.selectedName, remoteField.text)
+                        root.estimateTimer.restart()
                     }
+                }
+                Label {
+                    text: root.estimateCurrent() ? (root.estimate.text || "") : ""
+                    visible: text.length > 0
+                    color: root.theme.textSecondary
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                Label {
+                    text: root.estimateCurrent() && root.estimate.warning ? root.estimate.warning : ""
+                    visible: text.length > 0
+                    color: root.theme.warning
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
                 }
                 Repeater {
                     model: root.suggestions

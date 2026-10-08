@@ -171,11 +171,21 @@ pub fn delete_group_stats(group: &str) {
     }
 }
 
+/// What `operations/size` reports about a folder.
+#[derive(Clone, Copy, Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct FolderSize {
+    pub count: u64,
+    pub bytes: u64,
+    /// Objects whose size the remote does not report.
+    #[serde(default)]
+    pub sizeless: u64,
+}
+
 /// Functions called synchronously on the synchronization worker.
 pub mod sync {
     use super::{
-        FsInfo, ListOptions, RcloneError, RcloneList, RcloneListFilter, RcloneRemoteItem,
-        RcloneStat,
+        FolderSize, FsInfo, ListOptions, RcloneError, RcloneList, RcloneListFilter,
+        RcloneRemoteItem, RcloneStat,
     };
     use crate::util;
     use serde::de::DeserializeOwned;
@@ -339,6 +349,20 @@ pub mod sync {
         let reply = run("operations/about", json!({ "fs": remote_fs(remote_name)? }))?;
         let value: Value = decode("operations/about", &reply)?;
         Ok(value.get("free").and_then(Value::as_i64))
+    }
+
+    /// Files and bytes under a remote folder, recursively. A folder that does
+    /// not exist yet holds nothing.
+    pub fn folder_size(remote_name: &str, path: &str) -> Result<FolderSize, RcloneError> {
+        let fs = format!("{}{}", remote_fs(remote_name)?, util::strip_slashes(path));
+        let reply = match run("operations/size", json!({ "fs": fs })) {
+            Ok(reply) => reply,
+            Err(err) if err.error.contains("directory not found") => {
+                return Ok(FolderSize::default());
+            }
+            Err(err) => return Err(err),
+        };
+        decode("operations/size", &reply)
     }
 
     /// make a directory on the remote.

@@ -385,7 +385,7 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_count(count: u64) -> String {
+pub fn format_count(count: u64) -> String {
     let digits = count.to_string();
     let mut out = String::new();
     for (index, digit) in digits.chars().enumerate() {

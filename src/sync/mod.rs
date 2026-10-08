@@ -5,6 +5,7 @@ mod engine;
 mod exclusions;
 mod failpoint;
 mod localfs;
+pub mod measure;
 pub mod model;
 mod observe;
 mod pass;
@@ -83,6 +84,8 @@ pub enum Notice {
         body: String,
     },
     Suggestions(String),
+    /// A folder estimate, partial or final (see [`measure`]).
+    Estimate(String),
 }
 
 #[derive(Clone)]

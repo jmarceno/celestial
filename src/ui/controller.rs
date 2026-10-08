@@ -52,6 +52,7 @@ mod qobject {
         #[qproperty(QString, snapshot_json)]
         #[qproperty(QString, suggestions_json)]
         #[qproperty(QString, progress_json)]
+        #[qproperty(QString, estimate_json)]
         #[qproperty(bool, window_visible)]
         #[qproperty(bool, quit_requested)]
         type AppController = super::AppControllerRust;
@@ -150,6 +151,21 @@ mod qobject {
             id: i64,
         );
 
+        /// Estimate a folder pair before it is added; results arrive in
+        /// `estimate_json`.
+        #[qinvokable]
+        #[cxx_name = "estimateDir"]
+        fn estimate_dir(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+        );
+
+        #[qinvokable]
+        #[cxx_name = "cancelEstimate"]
+        fn cancel_estimate(self: Pin<&mut Self>);
+
         #[qinvokable]
         #[cxx_name = "listDirs"]
         fn list_dirs(self: Pin<&mut Self>, remote: &QString, path: &QString);
@@ -173,6 +189,7 @@ pub struct AppControllerRust {
     snapshot_json: QString,
     suggestions_json: QString,
     progress_json: QString,
+    estimate_json: QString,
     window_visible: bool,
     quit_requested: bool,
     runtime: Option<Runtime>,
@@ -184,6 +201,7 @@ impl Default for AppControllerRust {
             snapshot_json: QString::from("{}"),
             suggestions_json: QString::from("[]"),
             progress_json: QString::from("{\"pairs\":[],\"total\":null}"),
+            estimate_json: QString::from("{}"),
             window_visible: false,
             quit_requested: false,
             runtime: None,
@@ -245,6 +263,7 @@ impl qobject::AppController {
         let mut snapshot: Option<String> = None;
         let mut suggestions: Option<String> = None;
         let mut progress: Option<String> = None;
+        let mut estimate: Option<String> = None;
         let mut status_at: Option<(i32, i32)> = None;
         let mut exit_now = false;
         {
@@ -276,6 +295,7 @@ impl qobject::AppController {
             for notice in rt.notices.try_iter() {
                 match notice {
                     Notice::Suggestions(text) => suggestions = Some(text),
+                    Notice::Estimate(text) => estimate = Some(text),
                     Notice::Dialog { kind, title, body } => {
                         if kind == "login" || kind == "fatal" {
                             show = true;
@@ -319,6 +339,9 @@ impl qobject::AppController {
         }
         if let Some(text) = progress {
             self.as_mut().set_progress_json(QString::from(&*text));
+        }
+        if let Some(text) = estimate {
+            self.as_mut().set_estimate_json(QString::from(&*text));
         }
         if let Some((x, y)) = status_at {
             self.as_mut().tray_activated(x, y);
@@ -454,6 +477,26 @@ impl qobject::AppController {
             remote_path: remote_path.to_string(),
             id: id as u64,
         });
+    }
+
+    fn estimate_dir(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+    ) {
+        if let Some(rt) = self.rust().runtime.as_ref() {
+            sync::measure::request(
+                &rt.shared,
+                remote.to_string(),
+                local.to_string(),
+                remote_path.to_string(),
+            );
+        }
+    }
+
+    fn cancel_estimate(self: Pin<&mut Self>) {
+        sync::measure::cancel();
     }
 
     fn list_dirs(self: Pin<&mut Self>, remote: &QString, path: &QString) {

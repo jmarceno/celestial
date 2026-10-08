@@ -2400,3 +2400,15 @@ fn stopping_a_pair_forgets_its_recent_changes() {
             .is_empty()
     );
 }
+
+#[test]
+fn remote_folder_size_counts_files_and_treats_a_missing_folder_as_empty() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.remote_file("a")).unwrap();
+    fs::write(f.remote_file("one.txt"), "12345").unwrap();
+    fs::write(f.remote_file("a/two.txt"), "123").unwrap();
+    let size = rclone::sync::folder_size(&f.remote.name, "sandbox").unwrap();
+    assert_eq!((size.count, size.bytes), (2, 8));
+    let missing = rclone::sync::folder_size(&f.remote.name, "sandbox/not-yet").unwrap();
+    assert_eq!(missing, rclone::FolderSize::default());
+}

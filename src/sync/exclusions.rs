@@ -336,6 +336,17 @@ impl Rules {
         Self::parse(local, absolute_env("HOME").as_deref(), &text)
     }
 
+    /// The rules a folder would get, without writing the starting list into
+    /// it: for estimating a folder before it is synchronized.
+    pub fn preview(local: &Path) -> Result<Self, String> {
+        let text = match fs::read_to_string(local.join(FILE_IGNORE_NAME)) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => defaults().join("\n"),
+            Err(err) => return Err(err.to_string()),
+        };
+        Self::parse(local, absolute_env("HOME").as_deref(), &text)
+    }
+
     fn parse(local: &Path, home: Option<&Path>, text: &str) -> Result<Self, String> {
         let mut rules = Self {
             root: local.to_path_buf(),
