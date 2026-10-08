@@ -360,7 +360,7 @@ pub fn run(
     let hashed_before = observe::HASHED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     let walked = cached.is_none();
     let root_path = Path::new(&pair.dir.local_path);
-    let patterns = Rules::load(root_path)?;
+    let mut patterns = Rules::load(root_path)?;
     let cx = context(pair)?;
     // Finish or undo anything an interruption left half done before looking.
     cx.rec().replay()?;
@@ -372,8 +372,17 @@ pub fn run(
             && (rel == recovery::REMOTE_RECOVERY_ROOT
                 || rel.starts_with(&format!("{}/", recovery::REMOTE_RECOVERY_ROOT)))
     };
-    let ignored = |rel: &str| patterns.matches(rel);
-    let local = match cached {
+    let listing = rclone::sync::list_with(
+        &pair.remote.name,
+        &pair.dir.remote_path,
+        true,
+        RcloneListFilter::All,
+        &pair.list_options(),
+    )
+    .map_err(|err| err.error)?;
+    patterns.note_remote_targets(&pair.dir.remote_path, &listing);
+    let ignored = |rel: &str| patterns.matches_in(rel, &cx.root);
+    let mut local = match cached {
         Some(tree) => tree,
         None => observe::observe_local(root_path, &|rel, metadata| {
             // Internal folders of stopped or nested pairs hold preserved
@@ -384,17 +393,14 @@ pub fn run(
         })
         .map_err(|err| format!("Local sync folder is unavailable: {err}"))?,
     };
+    // A newly observed remote build folder can also exclude paths from a
+    // previously cached local tree. Never treat excluded items as missing.
+    local.items.retain(|rel, _| !ignored(rel));
+    local.blocked.retain(|rel, _| !ignored(rel));
+    local.unreadable.retain(|rel, _| !ignored(rel));
     // The walk went by path: make sure it walked the folder that is open.
     let identity = cx.root.identity().map_err(|err| err.to_string())?;
     Root::open(root_path, Some(identity)).map_err(|err| err.to_string())?;
-    let listing = rclone::sync::list_with(
-        &pair.remote.name,
-        &pair.dir.remote_path,
-        true,
-        RcloneListFilter::All,
-        &pair.list_options(),
-    )
-    .map_err(|err| err.error)?;
     let remote = observe::remote_tree(
         &pair.dir.remote_path,
         &listing,

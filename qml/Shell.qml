@@ -455,7 +455,7 @@ ApplicationWindow {
                 }
                 Label { text: "File/folder exclusions"; color: root.theme.textSecondary; font.pixelSize: 13; font.bold: true }
                 Label {
-                    text: "Starting rules skip caches, temporary files and installed Steam games. Edit or remove any rule and save. One glob per line in .sync-exclude.lst: ~/ starts at home, / is absolute, other paths start at this folder."
+                    text: "Edit or remove any starting rule and save. One rule per line: glob paths (~/ is home, / is absolute), regex: followed by a regular expression, or builtin:rust-target for Rust build folders. Regex paths are relative to this folder."
                     color: root.theme.textDim
                     font.pixelSize: 12
                     wrapMode: Text.WordWrap

@@ -488,12 +488,7 @@ pub fn read_exclusions(local_path: &str) -> Vec<String> {
 }
 
 pub fn write_exclusions(local_path: &str, text: &str) -> Result<(), String> {
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        glob::Pattern::new(line).map_err(|err| format!("{line}: {err}"))?;
-    }
+    super::exclusions::validate(text)?;
     let path = Path::new(local_path).join(FILE_IGNORE_NAME);
     if !Path::new(local_path).is_dir() {
         return Err(tr::tr!("The specified local directory doesn't exist"));

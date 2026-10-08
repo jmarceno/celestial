@@ -304,6 +304,15 @@ fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
             "cached",
         ),
         ("Projects/app/__pycache__/module.pyc", "cached"),
+        ("go/pkg/mod/cache/download/module.zip", "cached"),
+        ("Projects/rust/target/debug/app", "cached"),
+        ("Projects/rust/target/other-cache", "cached"),
+        ("Projects/web/node_modules/package/index.js", "cached"),
+        ("Projects/d/.dub/build/debug/app.o", "cached"),
+        ("Projects/elixir/_build/dev/app.beam", "cached"),
+        ("Projects/haskell/.stack-work/dist/Main.o", "cached"),
+        ("Projects/native/obj/main.o", "cached"),
+        ("Projects/web/tsconfig.tsbuildinfo", "cached"),
         (
             "Games/SteamLibrary/steamapps/common/Game/game.exe",
             "downloadable",
@@ -317,6 +326,12 @@ fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
         ),
         (".local/share/Steam/userdata/123/save.dat", "keep"),
         (".Private/document", "keep"),
+        ("Projects/d/source/main.d", "keep"),
+        ("Projects/native/build/README.md", "keep"),
+        ("Projects/sql/database.sqlite-wal", "keep"),
+        ("Projects/r/.RData", "keep"),
+        ("Models/model.obj", "keep"),
+        ("Music/song.mod", "keep"),
     ] {
         let target = f.local.join(path);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -326,6 +341,12 @@ fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
         ".cache/pip/remote.whl",
         ".var/app/org.mozilla.firefox/cache/remote-cache",
         "Games/SteamLibrary/steamapps/common/RemoteGame/game.exe",
+        "go/bin/remote-tool",
+        "Projects/remote-rust/target/release/app",
+        "Projects/kotlin/.gradle/caches/remote-cache",
+        "Projects/godot/.godot/imported/remote.ctex",
+        "Projects/duende/duende_build/generated.d",
+        "Projects/dotnet/obj/Debug/net8.0/remote.dll",
     ] {
         let target = f.remote_file(path);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -337,6 +358,15 @@ fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
         ".cargo/registry/src/local.rs",
         ".config/BraveSoftware/Brave-Browser/Default/Code Cache/js/cache",
         "Projects/app/__pycache__/module.pyc",
+        "go/pkg/mod/cache/download/module.zip",
+        "Projects/rust/target/debug/app",
+        "Projects/rust/target/other-cache",
+        "Projects/web/node_modules/package/index.js",
+        "Projects/d/.dub/build/debug/app.o",
+        "Projects/elixir/_build/dev/app.beam",
+        "Projects/haskell/.stack-work/dist/Main.o",
+        "Projects/native/obj/main.o",
+        "Projects/web/tsconfig.tsbuildinfo",
         "Games/SteamLibrary/steamapps/common/Game/game.exe",
         FILE_IGNORE_NAME,
     ] {
@@ -349,6 +379,12 @@ fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
         ".cache/pip/remote.whl",
         ".var/app/org.mozilla.firefox/cache/remote-cache",
         "Games/SteamLibrary/steamapps/common/RemoteGame/game.exe",
+        "go/bin/remote-tool",
+        "Projects/remote-rust/target/release/app",
+        "Projects/kotlin/.gradle/caches/remote-cache",
+        "Projects/godot/.godot/imported/remote.ctex",
+        "Projects/duende/duende_build/generated.d",
+        "Projects/dotnet/obj/Debug/net8.0/remote.dll",
     ] {
         assert!(
             !f.local.join(path).exists(),
@@ -362,6 +398,12 @@ fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
         "Games/SteamLibrary/steamapps/compatdata/123/save.dat",
         ".local/share/Steam/userdata/123/save.dat",
         ".Private/document",
+        "Projects/d/source/main.d",
+        "Projects/native/build/README.md",
+        "Projects/sql/database.sqlite-wal",
+        "Projects/r/.RData",
+        "Models/model.obj",
+        "Music/song.mod",
     ] {
         assert_eq!(f.read_remote(path), "keep");
     }
@@ -370,6 +412,23 @@ fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
     f.pass();
     assert_eq!(f.read_remote(".cache/pip/local.whl"), "cached");
     assert_eq!(f.read_local(".cache/pip/remote.whl"), "remote cache/game");
+    assert_eq!(
+        f.read_remote("go/pkg/mod/cache/download/module.zip"),
+        "cached"
+    );
+    assert_eq!(f.read_remote("Projects/rust/target/other-cache"), "cached");
+    assert_eq!(
+        f.read_remote("Projects/elixir/_build/dev/app.beam"),
+        "cached"
+    );
+    assert_eq!(
+        f.read_local("Projects/remote-rust/target/release/app"),
+        "remote cache/game"
+    );
+    assert_eq!(
+        f.read_local("Projects/duende/duende_build/generated.d"),
+        "remote cache/game"
+    );
     assert_eq!(
         f.read_remote("Games/SteamLibrary/steamapps/common/Game/game.exe"),
         "downloadable"
@@ -390,6 +449,131 @@ fn invalid_exclusions_pause_transfers() {
     f.pass();
     assert_eq!(f.model.error_dir_count(), 1);
     assert!(!f.remote_file("file.txt").exists());
+}
+
+#[test]
+fn regex_exclusions_apply_to_both_sides_and_keep_globs_working() {
+    let mut f = Fixture::new();
+    model::write_exclusions(
+        f.local.to_str().unwrap(),
+        "regex:(^|/)target/(debug|release)(/|$)\n*.bak",
+    )
+    .unwrap();
+    for (remote, rel) in [
+        (false, "project/target/debug/local-app"),
+        (true, "project/target/release/remote-app"),
+        (false, "notes.bak"),
+        (true, "remote-notes.bak"),
+        (false, "project/target/source.rs"),
+        (true, "project/src/main.rs"),
+    ] {
+        let path = if remote {
+            f.remote_file(rel)
+        } else {
+            f.local.join(rel)
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "contents").unwrap();
+    }
+    f.pass();
+    assert!(!f.remote_file("project/target/debug/local-app").exists());
+    assert!(!f.local.join("project/target/release/remote-app").exists());
+    assert!(!f.remote_file("notes.bak").exists());
+    assert!(!f.local.join("remote-notes.bak").exists());
+    assert_eq!(f.read_remote("project/target/source.rs"), "contents");
+    assert_eq!(f.read_local("project/src/main.rs"), "contents");
+    f.assert_clean();
+}
+
+#[test]
+fn invalid_regex_from_disk_pauses_synchronization() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join(FILE_IGNORE_NAME), "regex:[").unwrap();
+    fs::write(f.local.join("file.txt"), "keep local").unwrap();
+    f.pass();
+    assert_eq!(f.model.error_dir_count(), 1);
+    assert!(!f.remote_file("file.txt").exists());
+    assert_eq!(f.read_local("file.txt"), "keep local");
+}
+
+#[test]
+fn rust_build_folders_on_either_side_are_skipped_and_plain_targets_are_kept() {
+    let mut f = Fixture::new();
+    model::write_exclusions(f.local.to_str().unwrap(), "builtin:rust-target").unwrap();
+    for (remote, rel) in [
+        (false, "project/target/debug/app"),
+        (false, "project/target/release/app"),
+        (false, "project/target/.rustc_info.json"),
+        (false, "project/src/main.rs"),
+        (false, "documents/target/readme.txt"),
+        (true, "remote-project/target/release/app"),
+        (true, "remote-project/src/main.rs"),
+        (true, "cross/target/.rustc_info.json"),
+        (true, "cross/target/custom-triple/release/app"),
+        (true, "remote-documents/target/readme.txt"),
+    ] {
+        let path = if remote {
+            f.remote_file(rel)
+        } else {
+            f.local.join(rel)
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "contents").unwrap();
+    }
+    f.pass();
+    assert!(!f.remote_file("project/target").exists());
+    assert!(!f.local.join("remote-project/target").exists());
+    assert!(!f.local.join("cross/target").exists());
+    assert_eq!(f.read_remote("project/src/main.rs"), "contents");
+    assert_eq!(f.read_local("remote-project/src/main.rs"), "contents");
+    assert_eq!(f.read_remote("documents/target/readme.txt"), "contents");
+    assert_eq!(
+        f.read_local("remote-documents/target/readme.txt"),
+        "contents"
+    );
+    f.assert_clean();
+    model::write_exclusions(f.local.to_str().unwrap(), "").unwrap();
+    f.pass();
+    assert_eq!(f.read_remote("project/target/release/app"), "contents");
+    assert_eq!(
+        f.read_local("remote-project/target/release/app"),
+        "contents"
+    );
+    assert_eq!(
+        f.read_local("cross/target/custom-triple/release/app"),
+        "contents"
+    );
+    f.assert_clean();
+}
+
+#[test]
+fn newly_detected_remote_build_structure_filters_a_cached_local_tree() {
+    let mut f = Fixture::new();
+    fs::create_dir_all(f.local.join("project/target")).unwrap();
+    f.seed("project/target/readme.txt");
+    f.assert_clean();
+    let cached = f.last.as_mut().unwrap().local_tree.take().unwrap();
+    fs::create_dir_all(f.remote_file("project/target/release")).unwrap();
+    fs::write(f.remote_file("project/target/release/app"), "remote binary").unwrap();
+    model::write_exclusions(f.local.to_str().unwrap(), "builtin:rust-target").unwrap();
+    let mut hooks = TestHooks {
+        calls: 0,
+        on_checkpoint: None,
+    };
+    let report = pass::run(&f.pair(), &mut hooks, Some(cached)).unwrap();
+    assert_eq!(report.actions, 0);
+    assert!(!report.stats.walked);
+    assert!(!f.local.join("project/target/release").exists());
+    assert_eq!(f.read_local("project/target/readme.txt"), "original");
+    assert_eq!(f.read_remote("project/target/readme.txt"), "original");
+    assert!(
+        !report
+            .local_tree
+            .unwrap()
+            .items
+            .keys()
+            .any(|rel| rel.starts_with("project/target"))
+    );
 }
 
 #[test]

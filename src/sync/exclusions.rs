@@ -1,7 +1,11 @@
 //! Editable starting rules, with home/absolute paths anchored to the local side.
 
+use super::localfs::Root;
 use super::model::FILE_IGNORE_NAME;
 use glob::{MatchOptions, Pattern};
+use regex::Regex;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,6 +31,7 @@ pub fn defaults() -> Vec<String> {
         "~/.cargo/registry",
         "~/.cargo/git/db",
         "~/.cargo/git/checkouts",
+        "~/go",
         "~/.npm/_cacache",
         "~/.npm/_logs",
         "~/.npm/_npx",
@@ -47,11 +52,104 @@ pub fn defaults() -> Vec<String> {
         "**/.pytype",
         "**/.pyre",
         "**/.parcel-cache",
-        "**/.next/cache",
         "**/.angular/cache",
         "**/.sass-cache",
         "**/.eslintcache",
         "**/.stylelintcache",
+        "builtin:rust-target",
+        // Download caches; keep each tool's settings and installed user commands.
+        "~/.m2/repository",
+        "~/.nuget/packages",
+        "~/.local/share/NuGet/v3-cache",
+        "~/.local/share/NuGet/plugins-cache",
+        "~/.swiftpm/cache",
+        "~/Library/Caches",
+        "~/Library/Developer/Xcode/DerivedData",
+        "~/.dub/packages",
+        "~/.hex/packages",
+        "~/.cabal/packages",
+        "~/.cabal/store",
+        "~/.stack/pantry",
+        "~/.konan/cache",
+        "~/.konan/dependencies",
+        // Python test environments and notebook checkpoints are reproducible.
+        "**/.hypothesis",
+        "**/.tox",
+        "**/.nox",
+        "**/.ipynb_checkpoints",
+        // JavaScript/TypeScript dependencies, generated framework files and caches.
+        "**/node_modules",
+        "**/.next",
+        "**/.nuxt",
+        "**/.svelte-kit",
+        "**/.vite",
+        "**/.turbo",
+        "**/.nyc_output",
+        "**/.yarn/unplugged",
+        "**/.yarn/install-state.gz",
+        "**/.yarn/build-state.yml",
+        "**/*.tsbuildinfo",
+        // Shared native compiler caches cover C/C++, Fortran, Ada, ASM and COBOL.
+        "**/CMakeFiles",
+        "**/CMakeCache.txt",
+        "**/cmake-build-*",
+        "**/autom4te.cache",
+        "**/.ninja_log",
+        "**/.ninja_deps",
+        "**/.deps",
+        "**/.libs",
+        r"regex:(^|/)(build|obj)/.*\.(o|ali|smod|dcu|ppu|class|gch|pch)$",
+        // Maven/Gradle/Kotlin: skip generated subtrees, not every folder named build.
+        "**/target/classes",
+        "**/target/test-classes",
+        "**/target/generated-sources",
+        "**/target/generated-test-sources",
+        "**/target/maven-status",
+        "**/target/maven-archiver",
+        "**/target/surefire-reports",
+        "**/target/failsafe-reports",
+        "**/.gradle/caches",
+        "**/.gradle/[0-9]*",
+        "**/.gradle/buildOutputCleanup",
+        "**/.gradle/configuration-cache",
+        "**/.gradle/checksums",
+        "**/.gradle/vcs-1",
+        "**/.kotlin/sessions",
+        "**/.kotlin/errors",
+        "**/.kotlin/daemon",
+        "**/build/classes",
+        "**/build/tmp",
+        "**/build/generated",
+        "**/build/intermediates",
+        // .NET, Visual Basic and SQL projects: explicit build profiles and restore caches.
+        "**/[Bb]in/[Dd]ebug",
+        "**/[Bb]in/[Rr]elease",
+        "**/[Oo]bj/[Dd]ebug",
+        "**/[Oo]bj/[Rr]elease",
+        "**/[Oo]bj/project.assets.json",
+        "**/[Oo]bj/project.nuget.cache",
+        "**/[Oo]bj/*.nuget.g.props",
+        "**/[Oo]bj/*.nuget.g.targets",
+        "**/[Oo]bj/*.nuget.dgspec.json",
+        // Other recognizable tool outputs; preserve sources, databases and sessions.
+        "**/*.identcache",
+        "**/*.Rcheck",
+        "**/.build",
+        "**/.swiftpm/cache",
+        "**/.phpunit.cache",
+        "**/.phpunit.result.cache",
+        "**/.php-cs-fixer.cache",
+        "**/.phpcs-cache",
+        "**/target/partial_parse.msgpack",
+        "**/.dub/build",
+        "**/duende_build",
+        "**/_build",
+        "**/.elixir_ls",
+        "**/.stack-work",
+        "**/dist-newstyle",
+        "**/luac.out",
+        "**/.godot",
+        "**/.direnv",
         "/**/steamapps/common",
         "/**/steamapps/shadercache",
         "/**/steamapps/downloading",
@@ -167,6 +265,16 @@ pub struct Rules {
     root: PathBuf,
     relative: Vec<Pattern>,
     absolute: Vec<Pattern>,
+    regexes: Vec<Regex>,
+    rust_target: bool,
+    remote_targets: HashSet<String>,
+    local_targets: RefCell<HashMap<String, bool>>,
+}
+
+/// Use the same parser when saving and when synchronizing. Invalid rules
+/// must be rejected before a working exclusions file is truncated.
+pub fn validate(text: &str) -> Result<(), String> {
+    Rules::parse(Path::new("/"), absolute_env("HOME").as_deref(), text).map(|_| ())
 }
 
 impl Rules {
@@ -191,8 +299,29 @@ impl Rules {
             root: local.to_path_buf(),
             relative: Vec::new(),
             absolute: Vec::new(),
+            regexes: Vec::new(),
+            rust_target: false,
+            remote_targets: HashSet::new(),
+            local_targets: RefCell::new(HashMap::new()),
         };
         for line in text.lines().filter(|line| !line.is_empty()) {
+            if line == "builtin:rust-target" {
+                rules.rust_target = true;
+                continue;
+            }
+            if let Some(expression) = line.strip_prefix("regex:") {
+                if expression.is_empty() {
+                    return Err("regex: requires a non-empty expression".into());
+                }
+                rules
+                    .regexes
+                    .push(Regex::new(expression).map_err(|err| format!("{line}: {err}"))?);
+                continue;
+            }
+            if line.starts_with("builtin:") {
+                return Err(format!("Unknown exclusion rule: {line}"));
+            }
+            let line = line.strip_prefix("glob:").unwrap_or(line);
             let expanded = if let Some(suffix) = line.strip_prefix("~/") {
                 let home = home.ok_or("Cannot expand ~/ in exclusions: HOME is unavailable")?;
                 format!("{}/{suffix}", Pattern::escape(&home.to_string_lossy()))
@@ -209,16 +338,110 @@ impl Rules {
         Ok(rules)
     }
 
+    /// A recursive remote listing proves the structure even when the local
+    /// cache is absent. The same exclusion is then applied to both sides.
+    pub fn note_remote_targets(
+        &mut self,
+        remote_root: &str,
+        items: &[crate::rclone::RcloneRemoteItem],
+    ) {
+        if !self.rust_target {
+            return;
+        }
+        for item in items {
+            let rel = if remote_root.is_empty() {
+                Some(item.path.as_str())
+            } else {
+                item.path
+                    .strip_prefix(remote_root)
+                    .and_then(|tail| tail.strip_prefix('/'))
+            };
+            let Some(rel) = rel.filter(|rel| super::observe::valid_relative(rel)) else {
+                continue;
+            };
+            let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+            if ((item.is_dir && matches!(name, "debug" | "release"))
+                || (!item.is_dir && name == ".rustc_info.json"))
+                && self.is_target_path(parent)
+            {
+                self.remote_targets.insert(parent.to_owned());
+            }
+        }
+    }
+
+    fn is_target_path(&self, rel: &str) -> bool {
+        if rel.is_empty() {
+            self.root.file_name().is_some_and(|name| name == "target")
+        } else {
+            rel.rsplit('/').next() == Some("target")
+        }
+    }
+
+    pub fn matches_in(&self, relative: &str, local: &Root) -> bool {
+        if self.matches(relative) {
+            return true;
+        }
+        if !self.rust_target {
+            return false;
+        }
+        let mut candidate = relative;
+        loop {
+            if self.is_target_path(candidate) {
+                let known = self.local_targets.borrow().get(candidate).copied();
+                let excluded = known.unwrap_or_else(|| {
+                    let is_dir = candidate.is_empty()
+                        || local
+                            .lstat(candidate)
+                            .is_ok_and(|meta| meta.is_some_and(|meta| meta.is_dir));
+                    let excluded = is_dir
+                        && ["debug", "release", ".rustc_info.json"].iter().any(|name| {
+                            let rel = if candidate.is_empty() {
+                                (*name).to_owned()
+                            } else {
+                                format!("{candidate}/{name}")
+                            };
+                            local.lstat(&rel).is_ok_and(|meta| {
+                                meta.is_some_and(|meta| {
+                                    if *name == ".rustc_info.json" {
+                                        !meta.is_dir
+                                    } else {
+                                        meta.is_dir
+                                    }
+                                })
+                            })
+                        });
+                    self.local_targets
+                        .borrow_mut()
+                        .insert(candidate.to_owned(), excluded);
+                    excluded
+                });
+                if excluded {
+                    return true;
+                }
+            }
+            if candidate.is_empty() {
+                return false;
+            }
+            candidate = candidate.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+    }
+
     pub fn matches(&self, relative: &str) -> bool {
         if relative == FILE_IGNORE_NAME
             || (relative.starts_with(&format!("{FILE_IGNORE_NAME}.")) && relative.ends_with(".tmp"))
         {
             return true;
         }
+        if self.remote_targets.contains("") {
+            return true;
+        }
         // Retain the historical semantics of relative user globs (e.g. *.tmp).
         let mut path = relative;
         loop {
-            if self.relative.iter().any(|pattern| pattern.matches(path)) {
+            if self.remote_targets.contains(path)
+                || self.relative.iter().any(|pattern| pattern.matches(path))
+                || self.regexes.iter().any(|regex| regex.is_match(path))
+            {
                 return true;
             }
             let Some((parent, _)) = path.rsplit_once('/') else {
@@ -262,6 +485,9 @@ mod tests {
             ".cache/mozilla/firefox/profile/cache2/entries/cached",
             ".cargo/registry/src/crate/lib.rs",
             ".cargo/git/checkouts/crate/lib.rs",
+            "go/pkg/mod/cache/download/module.zip",
+            "go/bin/tool",
+            "go/src/project/main.go",
             ".npm/_cacache/content-v2/cache",
             ".local/share/pnpm/store/v3/cache",
             ".gradle/caches/modules-2/cached.jar",
@@ -287,6 +513,8 @@ mod tests {
         }
         for path in [
             "Documents/report.txt",
+            "Documents/go/main.go",
+            "Projects/go/main.go",
             ".ssh/id_ed25519",
             ".Private/encrypted-document",
             ".local/bin/my-tool",
@@ -316,11 +544,14 @@ mod tests {
     #[test]
     fn anchored_rules_work_for_parent_nested_and_unrelated_roots() {
         assert!(home_rules("/home").matches("alice/.cache/pip/data"));
+        assert!(home_rules("/home").matches("alice/go/src/project/main.go"));
         assert!(home_rules("/").matches("home/alice/.cargo/registry/data"));
+        assert!(home_rules("/home/alice/go").matches("src/project/main.go"));
         assert!(home_rules("/home/alice/.config").matches("google-chrome/Default/Cache/data"));
         assert!(home_rules("/home/alice/.cache").matches("pip/data"));
         assert!(!home_rules("/home/alice/Documents").matches(".cache/important.txt"));
         assert!(!home_rules("/home/bob").matches(".cache/important.txt"));
+        assert!(!home_rules("/home/bob").matches("go/src/project/main.go"));
         assert!(!home_rules("/home/alice").matches("tmp/important.txt"));
         assert!(home_rules("/").matches("tmp/session/data"));
         assert!(home_rules("/mnt/games/SteamLibrary").matches("steamapps/common/Game/game.exe"));
@@ -333,6 +564,126 @@ mod tests {
         assert!(
             !home_rules("/mnt/games/SteamLibrary").matches("steamapps/compatdata/123/save.dat")
         );
+    }
+
+    #[test]
+    fn development_defaults_skip_generated_data_and_preserve_project_inputs() {
+        let rules = home_rules("/home/alice");
+        for path in [
+            ".m2/repository/org/example/library.jar",
+            ".nuget/packages/library/lib/compiled.dll",
+            ".swiftpm/cache/repositories/checkouts",
+            "Library/Developer/Xcode/DerivedData/App/Build/data",
+            ".dub/packages/package/source/installed.d",
+            ".hex/packages/hexpm/package.tar",
+            ".cabal/store/ghc/package/lib.a",
+            ".stack/pantry/hackage/index.tar",
+            ".konan/dependencies/llvm/bin/clang",
+            "Projects/python/.hypothesis/examples/data",
+            "Projects/python/.tox/py313/lib/package.py",
+            "Projects/notebook/.ipynb_checkpoints/report.ipynb",
+            "Projects/web/node_modules/library/index.js",
+            "Projects/web/.next/server/page.js",
+            "Projects/web/.svelte-kit/generated/manifest.js",
+            "Projects/web/.nuxt/manifest.js",
+            "Projects/web/.vite/deps/library.js",
+            "Projects/web/.turbo/cache/file",
+            "Projects/web/tsconfig.tsbuildinfo",
+            "Projects/native/build/CMakeFiles/app.dir/main.cpp.o",
+            "Projects/native/build/CMakeCache.txt",
+            "Projects/native/cmake-build-debug/app",
+            "Projects/native/build/.ninja_deps",
+            "Projects/native/autom4te.cache/output",
+            "Projects/native/obj/main.o",
+            "Projects/ada/obj/main.ali",
+            "Projects/fortran/obj/module.smod",
+            "Projects/pascal/build/unit.ppu",
+            "Projects/delphi/build/unit.dcu",
+            "Projects/delphi/Project.identcache",
+            "Projects/java/target/classes/Main.class",
+            "Projects/java/target/generated-sources/Generated.java",
+            "Projects/kotlin/.gradle/caches/data",
+            "Projects/kotlin/.kotlin/sessions/data",
+            "Projects/kotlin/build/classes/Main.class",
+            "Projects/dotnet/bin/Debug/net8.0/App.dll",
+            "Projects/vb/Bin/Release/net8.0/App.dll",
+            "Projects/sql/obj/project.assets.json",
+            "Projects/sql/target/partial_parse.msgpack",
+            "Projects/r/package.Rcheck/check.log",
+            "Projects/swift/.build/debug/App",
+            "Projects/php/.phpunit.cache/test-results",
+            "Projects/php/.php-cs-fixer.cache",
+            "Projects/d/.dub/build/debug/app.o",
+            "Projects/duende/duende_build/generated.d",
+            "Projects/elixir/_build/dev/lib/app/ebin/app.beam",
+            "Projects/elixir/.elixir_ls/build/data",
+            "Projects/haskell/.stack-work/dist/Main.o",
+            "Projects/haskell/dist-newstyle/build/Main.o",
+            "Projects/lua/luac.out",
+            "Projects/godot/.godot/imported/image.ctex",
+            "Projects/nix/.direnv/flake-profile",
+        ] {
+            assert!(
+                rules.matches(path),
+                "development cache not excluded: {path}"
+            );
+        }
+        for path in [
+            ".m2/settings.xml",
+            ".nuget/NuGet/NuGet.Config",
+            ".swiftpm/configuration/registries.json",
+            ".dub/settings.json",
+            ".hex/hex.config",
+            ".cabal/config",
+            ".cabal/bin/my-tool",
+            ".stack/config.yaml",
+            ".konan/konan.properties",
+            "Projects/d/source/main.d",
+            "Projects/duende/examples/main.du",
+            "Projects/native/build/README.md",
+            "Projects/native/obj/model.obj",
+            "Projects/native/Makefile",
+            "Projects/native/CMakeLists.txt",
+            "Projects/native/vendor/library.so",
+            "Projects/java/lib/library.jar",
+            "Projects/java/pom.xml",
+            "Projects/kotlin/build.gradle.kts",
+            "Projects/kotlin/.gradle/gradle.properties",
+            "Projects/kotlin/.gradle/init.d/custom.gradle",
+            "Projects/kotlin/.kotlin/tool-settings.json",
+            "Projects/dotnet/App.csproj",
+            "Projects/dotnet/bin/important-tool",
+            "Projects/vb/App.vbproj",
+            "Projects/sql/queries/query.sql",
+            "Projects/sql/database.sqlite-wal",
+            "Projects/sql/database.sqlite-shm",
+            "Projects/sql/backup.sql",
+            "Projects/scratch/project.sb3",
+            "Projects/r/.Rhistory",
+            "Projects/r/.RData",
+            "Projects/r/.Renviron",
+            "Projects/elixir/mix.lock",
+            "Projects/elixir/deps/local-patch/lib/app.ex",
+            "Projects/python/.venv/custom-source.py",
+            "Projects/python/notebook.ipynb",
+            "Projects/swift/Package.resolved",
+            "Projects/godot/scene.tscn",
+            "Projects/godot/player.gd.uid",
+            "Projects/nix/.envrc",
+            "Projects/nix/flake.lock",
+            "Music/song.mod",
+            ".local/bin/installed-command",
+        ] {
+            assert!(!rules.matches(path), "project input excluded: {path}");
+        }
+        // The logical home is backed by a disposable filesystem for the
+        // structural probe, so /tmp itself does not trigger a home-path rule.
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("Projects/rust/target/debug")).unwrap();
+        fs::create_dir_all(temp.path().join("Documents/target")).unwrap();
+        let root = Root::open(temp.path(), None).unwrap();
+        assert!(rules.matches_in("Projects/rust/target/debug/app", &root));
+        assert!(!rules.matches_in("Documents/target/important.txt", &root));
     }
 
     #[test]
@@ -401,5 +752,124 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         assert!(Rules::load(temp.path()).is_err());
+    }
+
+    #[test]
+    fn regexes_match_relative_paths_and_excluded_parents() {
+        let rules = Rules::parse(
+            Path::new("/home/alice/Documents"),
+            None,
+            r"regex:(^|/)target/(debug|release)(/|$)
+regex:(?i)^cache files$
+*.bak
+glob:regex:literal[0-9].txt",
+        )
+        .unwrap();
+        for rel in [
+            "target/debug/app",
+            "Projects/app/target/release/deps/lib.rlib",
+            "CACHE FILES/data",
+            "nested/file.bak",
+            "regex:literal1.txt",
+        ] {
+            assert!(rules.matches(rel), "regex/glob missed {rel}");
+        }
+        for rel in [
+            "Projects/app/target/source.rs",
+            "Projects/app/target/debugger/readme",
+            "other/CACHE FILES/data",
+            "target/release-notes.txt",
+            "important.txt",
+        ] {
+            assert!(!rules.matches(rel), "regex/glob matched {rel}");
+        }
+    }
+
+    #[test]
+    fn invalid_regex_saves_keep_the_previous_rules_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().to_str().unwrap();
+        super::super::model::write_exclusions(local, "*.bak").unwrap();
+        for invalid in ["regex:[", "regex:", "builtin:unknown"] {
+            assert!(super::super::model::write_exclusions(local, invalid).is_err());
+            assert_eq!(
+                fs::read_to_string(temp.path().join(FILE_IGNORE_NAME)).unwrap(),
+                "*.bak"
+            );
+        }
+        super::super::model::write_exclusions(local, r"regex:\.tmp$").unwrap();
+        assert!(
+            Rules::load(temp.path())
+                .unwrap()
+                .matches("nested/cache.tmp")
+        );
+    }
+
+    #[test]
+    fn rust_target_requires_a_directory_with_real_build_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+        fs::create_dir_all(path.join("project/target/debug")).unwrap();
+        fs::create_dir_all(path.join("release-only/target/release")).unwrap();
+        fs::create_dir_all(path.join("cross/target/custom-triple/release")).unwrap();
+        fs::write(path.join("cross/target/.rustc_info.json"), "{}").unwrap();
+        fs::create_dir_all(path.join("documents/target")).unwrap();
+        fs::write(
+            path.join("documents/target/debug"),
+            "a document, not a directory",
+        )
+        .unwrap();
+        fs::create_dir_all(path.join("targeted/debug")).unwrap();
+        fs::create_dir_all(path.join("linked-marker/target")).unwrap();
+        std::os::unix::fs::symlink(
+            path.join("project/target/debug"),
+            path.join("linked-marker/target/debug"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(path.join("project/target"), path.join("linked-target"))
+            .unwrap();
+        let root = Root::open(path, None).unwrap();
+        let rules = Rules::parse(path, None, "builtin:rust-target").unwrap();
+        for rel in [
+            "project/target",
+            "project/target/debug/app",
+            "project/target/other-cache",
+            "release-only/target/release/app",
+            "cross/target/custom-triple/release/app",
+        ] {
+            assert!(
+                rules.matches_in(rel, &root),
+                "build folder not excluded: {rel}"
+            );
+        }
+        for rel in [
+            "project/src/main.rs",
+            "documents/target/debug",
+            "documents/target/readme",
+            "targeted/debug/app",
+            "linked-marker/target/debug/app",
+            "linked-target/debug/app",
+        ] {
+            assert!(
+                !rules.matches_in(rel, &root),
+                "non-build folder excluded: {rel}"
+            );
+        }
+        // Each new pass rechecks the structure instead of retaining an old match.
+        fs::remove_dir(path.join("project/target/debug")).unwrap();
+        let rules = Rules::parse(path, None, "builtin:rust-target").unwrap();
+        assert!(!rules.matches_in("project/target/readme", &root));
+    }
+
+    #[test]
+    fn a_selected_target_root_is_detected_and_the_rule_is_optional() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("target");
+        fs::create_dir_all(path.join("release")).unwrap();
+        let root = Root::open(&path, None).unwrap();
+        let rules = Rules::parse(&path, None, "builtin:rust-target").unwrap();
+        assert!(rules.matches_in("release/app", &root));
+        let rules = Rules::parse(&path, None, "").unwrap();
+        assert!(!rules.matches_in("release/app", &root));
     }
 }
