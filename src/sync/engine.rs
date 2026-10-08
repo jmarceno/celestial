@@ -123,6 +123,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
     }
     let db = util::await_future(Database::connect(format!("sqlite://{}", db_path.display())))
         .map_err(|err| tr::tr!("Unable to connect to database [{}].", err))?;
+    store::use_wal(&db);
     backup_before_migration(&db, &db_path)?;
     util::await_future(Migrator::up(&db, None))
         .map_err(|err| tr::tr!("Unable to run database migrations [{}]", err))?;
@@ -658,7 +659,7 @@ fn backup_before_migration(db: &DatabaseConnection, db_path: &Path) -> Result<()
         return Ok(());
     }
     let backup = db_path.with_extension(format!("db.before-upgrade-{}", store::now()));
-    fs::copy(db_path, &backup).map_err(|err| {
+    store::copy_database(db, db_path, &backup).map_err(|err| {
         tr::tr!(
             "Unable to back up the database before upgrading it [{}].",
             err

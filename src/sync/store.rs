@@ -44,6 +44,39 @@ fn from_db(value: i64) -> u64 {
     u64::from_ne_bytes(value.to_ne_bytes())
 }
 
+/// Use write-ahead logging: a commit then syncs one file once instead of
+/// several, which is most of the cost of synchronizing many small files.
+/// Commits stay durable (`synchronous` is left at its default). The mode is
+/// kept in the database file; a filesystem without the shared memory WAL
+/// needs keeps the rollback journal.
+pub fn use_wal<C: ConnectionTrait>(db: &C) {
+    match query(db, "PRAGMA journal_mode=WAL", vec![]) {
+        Ok(rows) => {
+            let mode = rows
+                .first()
+                .and_then(|row| get::<String>(row, "journal_mode").ok())
+                .unwrap_or_default();
+            if mode != "wal" {
+                tracing::warn!(mode, "the database could not use write-ahead logging");
+            }
+        }
+        Err(err) => tracing::warn!("could not enable write-ahead logging: {err}"),
+    }
+}
+
+/// Copy the database to `to`, including commits still in the write-ahead
+/// log, so the copy is complete on its own.
+pub fn copy_database<C: ConnectionTrait>(
+    db: &C,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<(), String> {
+    query(db, "PRAGMA wal_checkpoint(TRUNCATE)", vec![]).map_err(|err| err.to_string())?;
+    std::fs::copy(from, to)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
 /// The pair's stable identity, assigning one if it has none yet.
 pub fn pair_uuid<C: ConnectionTrait>(db: &C, sync_dir_id: i32) -> Result<String, DbErr> {
     exec(
@@ -1076,6 +1109,25 @@ pub(crate) mod tests {
         let dir = pair(&db, "/l");
         assert_eq!(set_retrying(&db, dir.id, "x", "a").unwrap().attempts, 1);
         assert_eq!(set_retrying(&db, dir.id, "x", "b").unwrap().attempts, 2);
+    }
+
+    #[test]
+    fn a_copy_of_a_wal_database_holds_every_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("celestial.db");
+        std::fs::File::create(&path).unwrap();
+        let url = |path: &std::path::Path| format!("sqlite://{}", path.display());
+        let db = util::await_future(Database::connect(url(&path))).unwrap();
+        use_wal(&db);
+        let mode = query(&db, "PRAGMA journal_mode", vec![]).unwrap();
+        assert_eq!(get::<String>(&mode[0], "journal_mode").unwrap(), "wal");
+        util::await_future(Migrator::up(&db, None)).unwrap();
+        exec(&db, "INSERT INTO remotes (name) VALUES ('kept')", vec![]).unwrap();
+        let copy = temp.path().join("copy.db");
+        copy_database(&db, &path, &copy).unwrap();
+        let copied = util::await_future(Database::connect(url(&copy))).unwrap();
+        let rows = query(&copied, "SELECT name FROM remotes", vec![]).unwrap();
+        assert_eq!(get::<String>(&rows[0], "name").unwrap(), "kept");
     }
 
     #[test]
