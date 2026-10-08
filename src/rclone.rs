@@ -130,6 +130,47 @@ pub fn version() -> Result<String, RcloneError> {
         .ok_or_else(|| RcloneError::new("core/version returned no version"))
 }
 
+/// What `core/stats` reports about one stats group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupStats {
+    /// Bytes transferred since the group started, including files still
+    /// being transferred.
+    pub bytes: u64,
+    /// Bytes of the files being transferred now.
+    pub in_flight: u64,
+}
+
+impl GroupStats {
+    fn from_reply(reply: &str) -> Result<Self, RcloneError> {
+        let value: Value = serde_json::from_str(reply)
+            .map_err(|err| RcloneError::new(format!("Malformed reply from core/stats: {err}")))?;
+        let bytes = |value: &Value| value.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+        Ok(Self {
+            bytes: bytes(&value),
+            in_flight: value
+                .get("transferring")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().map(bytes).sum())
+                .unwrap_or(0),
+        })
+    }
+}
+
+/// Read a stats group. Safe to call from any thread while a transfer in that
+/// group runs; not counted in [`sync::RPC_CALLS`].
+pub fn group_stats(group: &str) -> Result<GroupStats, RcloneError> {
+    let reply = librclone::rpc("core/stats", json!({ "group": group }).to_string())
+        .map_err(|text| RcloneError::from_reply(&text))?;
+    GroupStats::from_reply(&reply)
+}
+
+/// Forget a stats group and its counters.
+pub fn delete_group_stats(group: &str) {
+    if let Err(text) = librclone::rpc("core/stats-delete", json!({ "group": group }).to_string()) {
+        tracing::debug!("could not delete stats group {group}: {text}");
+    }
+}
+
 /// Functions called synchronously on the synchronization worker.
 pub mod sync {
     use super::{
@@ -139,10 +180,22 @@ pub mod sync {
     use crate::util;
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// RPCs made by this process, for measurement.
     pub static RPC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        /// The rclone stats group transfers on this thread are counted in.
+        static STATS_GROUP: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Count the transfers this thread makes in `group` (`None` stops), so
+    /// another thread can read their progress with [`super::group_stats`].
+    pub fn set_stats_group(group: Option<String>) {
+        STATS_GROUP.with(|current| *current.borrow_mut() = group);
+    }
 
     /// The filesystem string for a configured remote.
     pub fn remote_fs(remote: &str) -> Result<String, RcloneError> {
@@ -313,17 +366,17 @@ pub mod sync {
         dst_fs: &str,
         dst_remote: &str,
     ) -> Result<(), RcloneError> {
-        run(
-            method,
-            json!({
-                "srcFs": src_fs,
-                "srcRemote": util::strip_slashes(src_remote),
-                "dstFs": dst_fs,
-                "dstRemote": util::strip_slashes(dst_remote),
-                "_config": { "IgnoreTimes": true },
-            }),
-        )
-        .map(|_| ())
+        let mut input = json!({
+            "srcFs": src_fs,
+            "srcRemote": util::strip_slashes(src_remote),
+            "dstFs": dst_fs,
+            "dstRemote": util::strip_slashes(dst_remote),
+            "_config": { "IgnoreTimes": true },
+        });
+        if let Some(group) = STATS_GROUP.with(|group| group.borrow().clone()) {
+            input["_group"] = json!(group);
+        }
+        run(method, input).map(|_| ())
     }
 
     /// Copy a file from the local machine to the remote.
@@ -380,6 +433,29 @@ mod tests {
         assert!(sync::remote_fs("").is_err());
         assert!(sync::remote_fs("a/b").is_err());
         assert_eq!(sync::remote_fs("drive").unwrap(), "drive:");
+    }
+
+    #[test]
+    fn group_stats_add_up_the_files_in_flight() {
+        let reply = r#"{"bytes": 1500, "speed": 10.5, "transferring": [
+            {"name": "a", "bytes": 200, "size": 1000},
+            {"name": "b", "bytes": 300, "size": 4000}
+        ]}"#;
+        assert_eq!(
+            GroupStats::from_reply(reply).unwrap(),
+            GroupStats {
+                bytes: 1500,
+                in_flight: 500
+            }
+        );
+        assert_eq!(
+            GroupStats::from_reply(r#"{"bytes": 7}"#).unwrap(),
+            GroupStats {
+                bytes: 7,
+                in_flight: 0
+            }
+        );
+        assert!(GroupStats::from_reply("nope").is_err());
     }
 
     #[test]

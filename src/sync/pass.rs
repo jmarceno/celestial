@@ -13,6 +13,7 @@ use super::failpoint;
 use super::localfs::Root;
 use super::model::SyncError;
 use super::observe::{self, Fingerprint, HashError, LocalMeta, LocalTree, Obs, RemoteMeta};
+use super::progress::Plan;
 use super::reconcile::{self, ConflictKind, Decision, Delta, History, Input, Kind, Side};
 use super::recovery::{self, Internal, Store as Recovery};
 use super::store::{self, Baseline, BaselineWrite};
@@ -43,7 +44,40 @@ pub trait Hooks {
     /// writes (quit, or the pair was stopped).
     fn checkpoint(&mut self) -> bool;
     fn progress(&mut self, text: String);
+    /// What the pass is about to transfer, once everything is decided.
+    fn plan(&mut self, _plan: &Plan) {}
+    /// Whether uploading `bytes` was approved although the remote reports
+    /// less free space.
+    fn space_approved(&self, _bytes: u64) -> bool {
+        false
+    }
+    /// A planned transfer starts.
+    fn item_started(&mut self, _rel: &str) {}
+    /// A planned transfer of `files` files and `bytes` bytes ended,
+    /// successfully or not.
+    fn item_finished(&mut self, _files: u64, _bytes: u64) {}
+    /// A file was synchronized.
+    fn activity(&mut self, _activity: &store::Activity) {}
 }
+
+/// The remote reports less free space than the pass would upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceShortage {
+    pub needed: u64,
+    pub free: u64,
+}
+
+/// Whether a pass that uploads `plan` must wait for space. An unknown free
+/// space never stops it; each upload still checks before writing.
+pub fn space_shortage(plan: &Plan, free: Option<i64>, approved: bool) -> Option<SpaceShortage> {
+    let free = u64::try_from(free?).unwrap_or(0);
+    let needed = plan.upload_bytes;
+    (needed > 0 && needed.saturating_add(SPACE_MARGIN) > free && !approved)
+        .then_some(SpaceShortage { needed, free })
+}
+
+/// Room left on the remote besides the planned bytes.
+const SPACE_MARGIN: u64 = 1 << 20;
 
 #[derive(Debug, Default)]
 pub struct Report {
@@ -61,6 +95,9 @@ pub struct Report {
     /// The local observation, reusable while the watcher sees no change.
     pub local_tree: Option<LocalTree>,
     pub stats: Stats,
+    /// The pass stopped before transferring anything: the remote is too
+    /// small for what it would upload.
+    pub space: Option<SpaceShortage>,
 }
 
 /// What a pass cost, for measurement and logging.
@@ -82,7 +119,7 @@ impl Report {
     /// the watcher reports an event. Items waiting for a retry are retried on
     /// their own schedule.
     pub fn settled(&self) -> bool {
-        self.actions == 0 && !self.aborted
+        self.actions == 0 && !self.aborted && self.space.is_none()
     }
 }
 
@@ -320,6 +357,16 @@ impl Cx<'_> {
         Ok((local_fp.value == remote_fp.value, local_fp))
     }
 
+    /// Free space on the remote, read once per pass; `None` when the
+    /// remote does not report it.
+    fn remote_free(&self) -> Option<i64> {
+        if self.remote_free.get().is_none() {
+            let free = rclone::sync::free_space(&self.pair.remote.name).unwrap_or(None);
+            self.remote_free.set(Some(free));
+        }
+        self.remote_free.get().flatten()
+    }
+
     /// Pause before writing when the destination is short of space, instead
     /// of filling it or dropping preservation.
     fn check_space(&self, local: bool, size: i64) -> Result<(), String> {
@@ -336,11 +383,7 @@ impl Cx<'_> {
             }
             return Ok(());
         }
-        if self.remote_free.get().is_none() {
-            let free = rclone::sync::free_space(&self.pair.remote.name).unwrap_or(None);
-            self.remote_free.set(Some(free));
-        }
-        match self.remote_free.get().flatten() {
+        match self.remote_free() {
             Some(free) if free < needed => Err(tr::tr!(
                 "Not enough free space on the remote; waiting for space."
             )),
@@ -474,15 +517,23 @@ pub fn run(
     rels.sort_by(|left, right| left.split('/').cmp(right.split('/')));
 
     let now = store::now();
+    let total = rels.len();
     let mut entries: Vec<Entry> = Vec::with_capacity(rels.len());
     let mut skip_under: Option<String> = None;
     for (index, rel) in rels.into_iter().enumerate() {
         // Deciding can hash files: stay responsive to stop and quit.
-        if index % 64 == 63 && !hooks.checkpoint() {
-            return Ok(Report {
-                aborted: true,
-                ..Report::default()
-            });
+        if index % 64 == 63 {
+            if !hooks.checkpoint() {
+                return Ok(Report {
+                    aborted: true,
+                    ..Report::default()
+                });
+            }
+            hooks.progress(tr::tr!(
+                "Checking for changes... ({} of {} items)",
+                index + 1,
+                total
+            ));
         }
         if let Some(parent) = &skip_under {
             if rel.starts_with(&format!("{parent}/")) {
@@ -530,6 +581,21 @@ pub fn run(
     settle_folders(&mut entries);
     cap_conflict_copies(&mut entries);
 
+    let plan = plan_of(&entries);
+    let free = if plan.upload_bytes > 0 {
+        cx.remote_free()
+    } else {
+        None
+    };
+    if let Some(shortage) = space_shortage(&plan, free, hooks.space_approved(plan.upload_bytes)) {
+        tracing::info!(pair = %pair.dir.local_path, ?shortage, "waiting for space on the remote");
+        return Ok(Report {
+            space: Some(shortage),
+            ..Report::default()
+        });
+    }
+    hooks.plan(&plan);
+
     let mut report = Report::default();
     let mut failed = vec![false; entries.len()];
     // Removals first, deepest items first, so folders are empty when they go.
@@ -545,7 +611,14 @@ pub fn run(
         let result = match removal(entry) {
             Some(step) => {
                 hooks.progress(tr::tr!("Synchronizing '{}'...", entry.rel));
-                execute_removal(&cx, entry, step).map(|()| report.actions += 1)
+                let result = execute_removal(&cx, entry, step);
+                if result.is_ok() {
+                    report.actions += 1;
+                    if entry.decision.removes_local() || entry.decision.removes_remote() {
+                        note_activity(pair, hooks, entry);
+                    }
+                }
+                result
             }
             None => continue,
         };
@@ -587,7 +660,18 @@ pub fn run(
             Decision::DeleteLocal | Decision::DeleteRemote => Ok(false),
             decision => {
                 hooks.progress(tr::tr!("Synchronizing '{}'...", entry.rel));
-                execute(&cx, entry, decision).map(|()| true)
+                let transfer = transfer_of(entry);
+                if transfer.is_some() {
+                    hooks.item_started(&entry.rel);
+                }
+                let result = execute(&cx, entry, decision).map(|()| true);
+                if let Some(transfer) = transfer {
+                    hooks.item_finished(transfer.files(), transfer.bytes());
+                    if result.is_ok() {
+                        note_activity(pair, hooks, entry);
+                    }
+                }
+                result
             }
         };
         match outcome {
@@ -614,6 +698,9 @@ pub fn run(
         .collect();
     if let Err(err) = cx.rec().prune(&live) {
         tracing::warn!("could not apply the retention policy: {err}");
+    }
+    if let Err(err) = store::prune_activity(pair.db, pair.dir.id, store::ACTIVITY_KEPT) {
+        tracing::warn!("could not prune the recent changes: {err}");
     }
     // Finished journal entries are kept a week for diagnosis.
     if let Err(err) = store::prune_operations(pair.db, 7 * 24 * 3600) {
@@ -668,6 +755,114 @@ pub fn run(
     tracing::debug!(pair = %pair.dir.local_path, stats = ?report.stats, actions = report.actions, "pass finished");
     report.local_tree = Some(local);
     Ok(report)
+}
+
+/// The file transfers an entry's decision makes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Transfer {
+    upload: Option<u64>,
+    /// `Some(None)`: a download whose size the remote does not report.
+    download: Option<Option<u64>>,
+}
+
+impl Transfer {
+    fn files(&self) -> u64 {
+        u64::from(self.upload.is_some()) + u64::from(self.download.is_some())
+    }
+
+    fn bytes(&self) -> u64 {
+        self.upload.unwrap_or(0) + self.download.flatten().unwrap_or(0)
+    }
+}
+
+fn transfer_of(entry: &Entry) -> Option<Transfer> {
+    if entry.deferred || entry.blocked.is_some() || entry.prune {
+        return None;
+    }
+    let local = entry.local.present().filter(|meta| !meta.is_dir);
+    let remote = entry.remote.present().filter(|meta| !meta.is_dir);
+    let remote_size = |meta: &RemoteMeta| u64::try_from(meta.size).ok();
+    match entry.decision {
+        Decision::Upload | Decision::RestoreToRemote => Some(Transfer {
+            upload: Some(local?.size),
+            download: None,
+        }),
+        Decision::Download | Decision::RestoreToLocal => Some(Transfer {
+            upload: None,
+            download: Some(remote_size(remote?)),
+        }),
+        // Each version is copied to the side that lacks it.
+        Decision::KeepBoth(ConflictKind::EditEdit | ConflictKind::Bootstrap) => Some(Transfer {
+            upload: Some(local?.size),
+            download: Some(remote_size(remote?)),
+        }),
+        _ => None,
+    }
+}
+
+/// What the decided entries will transfer and delete.
+fn plan_of(entries: &[Entry]) -> Plan {
+    let mut plan = Plan::default();
+    for entry in entries {
+        if let Some(transfer) = transfer_of(entry) {
+            if let Some(bytes) = transfer.upload {
+                plan.upload_files += 1;
+                plan.upload_bytes += bytes;
+            }
+            match transfer.download {
+                Some(Some(bytes)) => {
+                    plan.download_files += 1;
+                    plan.download_bytes += bytes;
+                }
+                Some(None) => {
+                    plan.download_files += 1;
+                    plan.unknown_size += 1;
+                }
+                None => {}
+            }
+        } else if !entry.deferred
+            && entry.blocked.is_none()
+            && (entry.prune || entry.decision.removes_local() || entry.decision.removes_remote())
+        {
+            plan.removals += 1;
+        }
+    }
+    plan
+}
+
+/// Record a synchronized file in the recent changes. Failing to record it
+/// does not fail the item.
+fn note_activity(pair: &Pair, hooks: &mut dyn Hooks, entry: &Entry) {
+    let local = entry.local.present().filter(|meta| !meta.is_dir);
+    let remote = entry.remote.present().filter(|meta| !meta.is_dir);
+    let local_size = |meta: &LocalMeta| i64::try_from(meta.size).unwrap_or(i64::MAX);
+    let (action, size) = match entry.decision {
+        _ if entry.prune => return,
+        Decision::Upload | Decision::RestoreToRemote => ("uploaded", local.map(local_size)),
+        Decision::Download | Decision::RestoreToLocal => {
+            ("downloaded", remote.map(|meta| meta.size))
+        }
+        Decision::DeleteLocal => ("deleted_local", local.map(local_size)),
+        Decision::DeleteRemote => ("deleted_remote", remote.map(|meta| meta.size)),
+        Decision::KeepBoth(ConflictKind::EditEdit | ConflictKind::Bootstrap) => {
+            ("conflict", local.map(local_size))
+        }
+        _ => return,
+    };
+    // Folders are not listed.
+    let Some(size) = size else {
+        return;
+    };
+    let activity = store::Activity {
+        rel: entry.rel.clone(),
+        action: action.into(),
+        size,
+        finished_at: store::now(),
+    };
+    if let Err(err) = store::insert_activity(pair.db, pair.dir.id, &activity) {
+        tracing::warn!("could not record a recent change: {err}");
+    }
+    hooks.activity(&activity);
 }
 
 /// `(old, new)` when a collision group is one synchronized file whose name

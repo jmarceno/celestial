@@ -12,6 +12,9 @@ use super::branding;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
     Open,
+    /// The icon was clicked at these screen coordinates (0, 0 when the
+    /// host does not say): show the status window.
+    Status(i32, i32),
     Quit,
 }
 
@@ -19,6 +22,8 @@ struct CelestialTray {
     tx: Sender<TrayEvent>,
     message: String,
     phase: String,
+    /// Transfer progress in total, while something is transferred.
+    progress: Option<String>,
     icons: Vec<Icon>,
 }
 
@@ -47,20 +52,34 @@ impl Tray for CelestialTray {
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
             title: self.message.clone(),
-            description: String::new(),
+            description: self.progress.clone().unwrap_or_default(),
             icon_name: String::new(),
             icon_pixmap: self.icon_pixmap(),
         }
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
+        let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
                 label: self.message.clone(),
                 enabled: false,
                 ..Default::default()
             }
             .into(),
+        ];
+        // Some hosts show this menu on a left click instead of activating
+        // the icon, so it carries the progress too.
+        if let Some(progress) = &self.progress {
+            items.push(
+                StandardItem {
+                    label: progress.clone(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.extend([
             StandardItem {
                 label: tr::tr!("Open"),
                 activate: Box::new(|tray: &mut Self| tray.send(TrayEvent::Open)),
@@ -73,11 +92,12 @@ impl Tray for CelestialTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 
-    fn activate(&mut self, _x: i32, _y: i32) {
-        self.send(TrayEvent::Open);
+    fn activate(&mut self, x: i32, y: i32) {
+        self.send(TrayEvent::Status(x, y));
     }
 
     fn watcher_offine(&self) -> bool {
@@ -112,6 +132,7 @@ impl TrayHandle {
             tx,
             message: tr::tr!("Awaiting sync checks..."),
             phase: "loading".into(),
+            progress: None,
             icons,
         });
         let handle = service.handle();
@@ -131,6 +152,10 @@ impl TrayHandle {
             tray.message = message;
             tray.phase = phase;
         });
+    }
+
+    pub fn update_progress(self: &Arc<Self>, progress: Option<String>) {
+        self.handle.update(|tray| tray.progress = progress);
     }
 }
 

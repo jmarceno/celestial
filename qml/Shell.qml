@@ -17,6 +17,9 @@ ApplicationWindow {
     color: theme.windowBg
 
     property var snapshot: ({ remotes: [] })
+    property var progress: ({ pairs: [], total: null })
+    // Bumped every 30 s so relative times ("5 min ago") stay current.
+    property int clock: 0
     property string selectedName: ""
     property var detail: null
     property string exclusionDraft: ""
@@ -49,6 +52,29 @@ ApplicationWindow {
         if (phase === "warning") return root.theme.warning
         return root.theme.textDim
     }
+    function progressFor(remote, dir) {
+        if (!dir) return null
+        var pairs = root.progress.pairs || []
+        for (var i = 0; i < pairs.length; i++) {
+            var pair = pairs[i]
+            if (pair.remote === remote && pair.localPath === dir.localPath && pair.remotePath === dir.remotePath)
+                return pair
+        }
+        return null
+    }
+    function ago(at, clock) {
+        var seconds = Math.max(0, Math.floor(Date.now() / 1000) - at)
+        if (seconds < 60) return "just now"
+        if (seconds < 3600) return Math.floor(seconds / 60) + " min ago"
+        if (seconds < 86400) return Math.floor(seconds / 3600) + " h ago"
+        return Math.floor(seconds / 86400) + " d ago"
+    }
+    function actionGlyph(action) {
+        if (action === "uploaded") return "↑"
+        if (action === "downloaded") return "↓"
+        if (action === "conflict") return "⇄"
+        return "✕"
+    }
     function openMessage(title, body) {
         root.popupMode = "message"
         root.popupTitle = title
@@ -58,6 +84,13 @@ ApplicationWindow {
     function closeDialog() {
         dialog.close()
         root.popupMode = ""
+    }
+
+    property Timer clockTimer: Timer {
+        interval: 30000
+        running: root.visible
+        repeat: true
+        onTriggered: root.clock++
     }
 
     onClosing: function(close) {
@@ -87,6 +120,9 @@ ApplicationWindow {
             }
             root.detail = null
         }
+        function onProgress_jsonChanged() {
+            root.progress = root.parse(root.controller.progress_json, { pairs: [], total: null })
+        }
         function onSuggestions_jsonChanged() {
             root.suggestions = root.parse(root.controller.suggestions_json, [])
         }
@@ -112,11 +148,11 @@ ApplicationWindow {
                 if (root.popupMode === "auth") root.closeDialog()
                 return
             }
-            if (kind === "conflict-info" || kind === "confirm-dismiss") {
+            if (kind === "conflict-info" || kind === "confirm-dismiss" || kind === "confirm-space") {
                 root.popupMode = kind
                 root.popupTitle = title
                 root.popupRef = root.parse(body, {})
-                root.popupBody = kind === "conflict-info" ? (root.popupRef.text || "") : ""
+                root.popupBody = kind === "confirm-dismiss" ? "" : (root.popupRef.text || "")
                 dialog.open()
                 return
             }
@@ -184,6 +220,14 @@ ApplicationWindow {
                 Label {
                     text: root.snapshot.trayMessage || "Awaiting sync checks..."
                     color: root.theme.textMuted
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                Label {
+                    text: root.progress.total ? root.progress.total.text : ""
+                    visible: root.progress.total !== null && root.progress.total !== undefined
+                    color: root.theme.accentStrong
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
@@ -291,9 +335,11 @@ ApplicationWindow {
                         Repeater {
                             model: root.selectedRemote() ? root.selectedRemote().dirs : []
                             Rectangle {
+                                id: dirCard
                                 required property var modelData
+                                property var live: root.progressFor(root.selectedName, modelData)
                                 width: dirCol.width
-                                height: 72
+                                height: live ? 112 : 72
                                 radius: root.theme.radius
                                 color: root.theme.cardBg
                                 border.color: root.theme.borderSubtle
@@ -324,6 +370,13 @@ ApplicationWindow {
                                             font.pixelSize: 12
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
+                                        }
+                                        TransferProgress {
+                                            visible: dirCard.live !== null
+                                            live: dirCard.live
+                                            theme: root.theme
+                                            Layout.fillWidth: true
+                                            Layout.topMargin: 4
                                         }
                                     }
                                     Label { text: "›"; color: root.theme.textDim; font.pixelSize: 18 }
@@ -380,6 +433,31 @@ ApplicationWindow {
                     text: root.detail ? root.detail.status : ""
                     color: root.theme.textMuted
                     font.pixelSize: 13
+                }
+                TransferProgress {
+                    property var current: root.progressFor(root.selectedName, root.detail)
+                    visible: current !== null
+                    live: current
+                    theme: root.theme
+                    Layout.fillWidth: true
+                }
+                Label {
+                    text: "Recent changes"
+                    color: root.theme.textSecondary
+                    font.pixelSize: 13
+                    font.bold: true
+                    visible: root.detail && root.detail.recent && root.detail.recent.length > 0
+                }
+                Repeater {
+                    model: root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : []
+                    RecentItem {
+                        required property var modelData
+                        item: modelData
+                        theme: root.theme
+                        when: root.ago(modelData.at, root.clock)
+                        glyph: root.actionGlyph(modelData.action)
+                        width: root.width - root.theme.sidebarWidth - 44
+                    }
                 }
                 Label {
                     text: "Sync errors"
@@ -628,8 +706,8 @@ ApplicationWindow {
                     }
                 }
                 PrimaryButton {
-                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync" : (root.popupMode === "conflict-info" ? "Acknowledge" : "Confirm"))
-                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info"
+                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : "Confirm")))
+                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space"
                     onClicked: {
                         if (root.popupMode === "login") {
                             root.controller.submitLogin(JSON.stringify({
@@ -653,7 +731,7 @@ ApplicationWindow {
                             root.controller.stopDir(root.selectedName, root.detail.localPath, root.detail.remotePath)
                             root.detail = null
                             root.closeDialog()
-                        } else if (root.popupMode === "confirm-dismiss") {
+                        } else if (root.popupMode === "confirm-dismiss" || root.popupMode === "confirm-space") {
                             root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
                             root.closeDialog()
                         } else if (root.popupMode === "conflict-info") {

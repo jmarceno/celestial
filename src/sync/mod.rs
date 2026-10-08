@@ -8,6 +8,7 @@ mod localfs;
 pub mod model;
 mod observe;
 mod pass;
+pub mod progress;
 mod reconcile;
 mod recovery;
 mod store;
@@ -92,6 +93,10 @@ pub struct Shared {
     pub cancel_auth: Arc<AtomicBool>,
     pub notices: crossbeam_channel::Sender<Notice>,
     pub tray: Arc<dyn Fn(String, String) + Send + Sync>,
+    /// Live transfer progress, read by the window and the tray.
+    pub progress: progress::ProgressBus,
+    /// The tray's progress line; `None` hides it.
+    pub tray_progress: Arc<dyn Fn(Option<String>) + Send + Sync>,
 }
 
 impl Shared {

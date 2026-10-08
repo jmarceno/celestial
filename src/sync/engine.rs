@@ -83,6 +83,9 @@ struct Schedule {
     local_trees: HashMap<i32, LocalTree>,
     /// A pair is waiting for a burst of local events to end.
     settling: bool,
+    /// Bytes the person approved uploading despite too little free space
+    /// on the remote, by pair.
+    space_approved: HashMap<i32, u64>,
 }
 
 impl Schedule {
@@ -110,6 +113,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         json!({ "path": config.display().to_string() }).to_string(),
     )
     .map_err(|err| format!("Could not set the rclone config path: {err}"))?;
+    super::progress::spawn_meter(shared.clone());
 
     let mut db_path = util::get_config_dir();
     db_path.push(util::DATABASE_NAME);
@@ -395,10 +399,19 @@ fn sync_pair(
         remote_name: &remote.name,
         sync_dir,
         last_progress: None,
+        space_approved: schedule.space_approved.get(&id).copied().unwrap_or(0),
     };
     let started = Instant::now();
+    // Count this pass's transfers in their own stats group, from zero.
+    let group = super::progress::group_name(id);
+    rclone::delete_group_stats(&group);
+    rclone::sync::set_stats_group(Some(group.clone()));
     let result = pass::run(&pair, &mut hooks, cached);
+    rclone::sync::set_stats_group(None);
+    shared.progress.end(id);
+    rclone::delete_group_stats(&group);
     schedule.remote_checks.done_after(id, started.elapsed());
+    let waiting_for_space = matches!(&result, Ok(report) if report.space.is_some());
     if let Ok(Some((name, _))) = store::internal_dir(db, id) {
         watcher.ignore_internal(id, Path::new(&sync_dir.local_path).join(name));
     }
@@ -414,6 +427,21 @@ fn sync_pair(
             );
         }
         Ok(report) if report.aborted => return,
+        Ok(pass::Report {
+            space: Some(shortage),
+            ..
+        }) => {
+            pair_error(
+                model,
+                shared,
+                &remote.name,
+                sync_dir,
+                Some(SyncError::Space {
+                    needed: shortage.needed,
+                    free: shortage.free,
+                }),
+            );
+        }
         Ok(report) => {
             model.set_pair_error(&remote.name, names.0, names.1, None);
             model.set_issues(&remote.name, names.0, names.1, report.issues.clone());
@@ -435,6 +463,14 @@ fn sync_pair(
     if matches!(sync_dir.exists(db), Ok(true)) {
         refresh_recovery(model, &pair);
         model.mark_finished(&remote.name, names.0, names.1);
+        if waiting_for_space {
+            model.set_status(
+                &remote.name,
+                names.0,
+                names.1,
+                tr::tr!("Waiting for space on the remote."),
+            );
+        }
         shared.publish(model);
     }
 }
@@ -480,6 +516,8 @@ struct WorkerHooks<'a> {
     sync_dir: &'a SyncDirsModel,
     /// When progress was last published; ordinary progress is throttled.
     last_progress: Option<Instant>,
+    /// Upload bytes approved despite too little free space on the remote.
+    space_approved: u64,
 }
 
 /// Ordinary progress is published at most this often; errors, conflicts,
@@ -521,10 +559,53 @@ impl pass::Hooks for WorkerHooks<'_> {
             &self.sync_dir.remote_path,
             text,
         );
+        if changed {
+            self.publish_throttled();
+        }
+    }
+
+    fn plan(&mut self, plan: &super::progress::Plan) {
+        tracing::debug!(pair = %self.sync_dir.local_path, ?plan, "pass plan");
+        self.shared.progress.start(
+            self.sync_dir.id,
+            self.remote_name,
+            &self.sync_dir.local_path,
+            &self.sync_dir.remote_path,
+            *plan,
+        );
+    }
+
+    fn space_approved(&self, bytes: u64) -> bool {
+        bytes <= self.space_approved
+    }
+
+    fn item_started(&mut self, rel: &str) {
+        self.shared.progress.current(self.sync_dir.id, rel);
+    }
+
+    fn item_finished(&mut self, files: u64, bytes: u64) {
+        self.shared
+            .progress
+            .finished(self.sync_dir.id, files, bytes);
+    }
+
+    fn activity(&mut self, activity: &store::Activity) {
+        self.model.push_recent(
+            self.remote_name,
+            &self.sync_dir.local_path,
+            &self.sync_dir.remote_path,
+            model::activity_json(&self.sync_dir.local_path, activity),
+        );
+        self.publish_throttled();
+    }
+}
+
+impl WorkerHooks<'_> {
+    fn publish_throttled(&mut self) {
         let due = self
             .last_progress
             .is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL);
-        if changed && due {
+        if due {
             self.last_progress = Some(Instant::now());
             self.shared.publish(self.model);
         }
@@ -556,6 +637,11 @@ fn reload_model(db: &DatabaseConnection, model: &mut Model) -> Result<(), DbErr>
         )?;
         for dir in dirs {
             model.ensure_dir(&remote.name, &dir.local_path, &dir.remote_path);
+            let recent = store::recent_activity(db, dir.id, model::RECENT_SHOWN as i64)?
+                .iter()
+                .map(|activity| model::activity_json(&dir.local_path, activity))
+                .collect();
+            model.set_recent(&remote.name, &dir.local_path, &dir.remote_path, recent);
         }
     }
     Ok(())
@@ -733,6 +819,12 @@ async fn forget_pair_state(tx: &DatabaseTransaction, sync_dir_id: i32) -> Result
     tx.execute(Statement::from_sql_and_values(
         sea_orm::DbBackend::Sqlite,
         "DELETE FROM item_states WHERE sync_dir_id = ?",
+        vec![sync_dir_id.into()],
+    ))
+    .await?;
+    tx.execute(Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "DELETE FROM sync_activity WHERE sync_dir_id = ?",
         vec![sync_dir_id.into()],
     ))
     .await?;
@@ -952,6 +1044,10 @@ fn dismiss_error(
             store::acknowledge_conflict(db, sync_dir.id, *id).map(|_| ())
         }
         SyncError::General(..) => Ok(()),
+        SyncError::Space { needed, .. } => {
+            schedule.space_approved.insert(sync_dir.id, *needed);
+            Ok(())
+        }
     };
     if let Err(err) = result {
         tracing::warn!("could not reschedule a dismissed item: {err}");
@@ -1011,6 +1107,21 @@ fn activate_error(
         );
         return;
     }
+    if let SyncError::Space { needed, free } = &stored.error {
+        shared.dialog(
+            "confirm-space",
+            tr::tr!("Not enough space on the remote"),
+            json!({
+                "remote": remote_name,
+                "local": local,
+                "remotePath": remote_path,
+                "id": id,
+                "text": model::space_text(*needed, *free),
+            })
+            .to_string(),
+        );
+        return;
+    }
     let title = match &stored.error {
         SyncError::General(..) => tr::tr!("Would you like to dismiss this error?"),
         SyncError::Item { state, reason, .. } if state == store::RETRYING => tr::tr!(
@@ -1021,7 +1132,7 @@ fn activate_error(
             "{}\n\nNothing was changed. Check this item again now?",
             reason
         ),
-        SyncError::Conflict { .. } => return,
+        SyncError::Conflict { .. } | SyncError::Space { .. } => return,
     };
     shared.dialog(
         "confirm-dismiss",

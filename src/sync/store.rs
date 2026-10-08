@@ -660,6 +660,79 @@ pub fn prune_operations<C: ConnectionTrait>(db: &C, age: i64) -> Result<(), DbEr
     .map(|_| ())
 }
 
+// ----------------------------------------------------------------- activity
+
+/// One synchronized file, for the list of recent changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    pub rel: String,
+    /// `uploaded`, `downloaded`, `deleted_local`, `deleted_remote` or
+    /// `conflict`.
+    pub action: String,
+    pub size: i64,
+    pub finished_at: i64,
+}
+
+/// Recent changes kept per pair.
+pub const ACTIVITY_KEPT: i64 = 500;
+
+pub fn insert_activity<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    activity: &Activity,
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "INSERT INTO sync_activity (sync_dir_id, rel, action, size, finished_at) VALUES (?, ?, ?, ?, ?)",
+        vec![
+            sync_dir_id.into(),
+            activity.rel.clone().into(),
+            activity.action.clone().into(),
+            activity.size.into(),
+            activity.finished_at.into(),
+        ],
+    )
+    .map(|_| ())
+}
+
+/// The latest changes of a pair, newest first.
+pub fn recent_activity<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    limit: i64,
+) -> Result<Vec<Activity>, DbErr> {
+    query(
+        db,
+        "SELECT rel, action, size, finished_at FROM sync_activity WHERE sync_dir_id = ? ORDER BY id DESC LIMIT ?",
+        vec![sync_dir_id.into(), limit.into()],
+    )?
+    .iter()
+    .map(|row| {
+        Ok(Activity {
+            rel: get(row, "rel")?,
+            action: get(row, "action")?,
+            size: get(row, "size")?,
+            finished_at: get(row, "finished_at")?,
+        })
+    })
+    .collect()
+}
+
+/// Keep only the latest `keep` changes of a pair.
+pub fn prune_activity<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    keep: i64,
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "DELETE FROM sync_activity WHERE sync_dir_id = ? AND id NOT IN
+         (SELECT id FROM sync_activity WHERE sync_dir_id = ? ORDER BY id DESC LIMIT ?)",
+        vec![sync_dir_id.into(), sync_dir_id.into(), keep.into()],
+    )
+    .map(|_| ())
+}
+
 // ----------------------------------------------------------------- recovery
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1003,6 +1076,44 @@ pub(crate) mod tests {
         let dir = pair(&db, "/l");
         assert_eq!(set_retrying(&db, dir.id, "x", "a").unwrap().attempts, 1);
         assert_eq!(set_retrying(&db, dir.id, "x", "b").unwrap().attempts, 2);
+    }
+
+    #[test]
+    fn recent_activity_is_newest_first_per_pair_and_pruned() {
+        let db = memory_db();
+        let first = pair(&db, "/a");
+        let second = pair(&db, "/b");
+        for index in 0..5 {
+            let activity = Activity {
+                rel: format!("f{index}"),
+                action: "uploaded".into(),
+                size: index,
+                finished_at: 100 + index,
+            };
+            insert_activity(&db, first.id, &activity).unwrap();
+        }
+        insert_activity(
+            &db,
+            second.id,
+            &Activity {
+                rel: "other".into(),
+                action: "downloaded".into(),
+                size: 1,
+                finished_at: 1,
+            },
+        )
+        .unwrap();
+        let rels = |id| {
+            recent_activity(&db, id, 10)
+                .unwrap()
+                .into_iter()
+                .map(|activity| activity.rel)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rels(first.id), ["f4", "f3", "f2", "f1", "f0"]);
+        prune_activity(&db, first.id, 2).unwrap();
+        assert_eq!(rels(first.id), ["f4", "f3"]);
+        assert_eq!(rels(second.id), ["other"]);
     }
 
     #[test]

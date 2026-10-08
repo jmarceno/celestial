@@ -9,6 +9,9 @@ fn main() {
         QmlFile::from("qml/SidebarItem.qml"),
         QmlFile::from("qml/PrimaryButton.qml"),
         QmlFile::from("qml/Field.qml"),
+        QmlFile::from("qml/TransferProgress.qml"),
+        QmlFile::from("qml/RecentItem.qml"),
+        QmlFile::from("qml/TrayPopup.qml"),
     ]))
     .files(["src/ui/controller.rs", "src/ui/branding.rs"])
     .qt_module("Quick")

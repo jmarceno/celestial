@@ -159,6 +159,8 @@ impl Fixture {
             cancel_auth: Arc::default(),
             notices,
             tray: Arc::new(|_, _| {}),
+            progress: Default::default(),
+            tray_progress: Arc::new(|_| {}),
         };
         let mut model = Model::new();
         model.ensure_dir(&remote.name, &dir.local_path, &dir.remote_path);

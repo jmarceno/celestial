@@ -2251,3 +2251,152 @@ fn a_local_file_created_during_a_download_is_compared_not_duplicated() {
     assert_eq!(f.read_remote("new.txt"), "local!");
     assert_eq!(staging_entries(&f), 0);
 }
+
+/// Hooks that record what a pass reports about its transfers.
+#[derive(Default)]
+struct Recorder {
+    plans: Vec<crate::sync::progress::Plan>,
+    started: Vec<String>,
+    finished: Vec<(u64, u64)>,
+    activity: Vec<(String, String, i64)>,
+}
+
+impl pass::Hooks for Recorder {
+    fn checkpoint(&mut self) -> bool {
+        true
+    }
+
+    fn progress(&mut self, _text: String) {}
+
+    fn plan(&mut self, plan: &crate::sync::progress::Plan) {
+        self.plans.push(*plan);
+    }
+
+    fn item_started(&mut self, rel: &str) {
+        self.started.push(rel.to_owned());
+    }
+
+    fn item_finished(&mut self, files: u64, bytes: u64) {
+        self.finished.push((files, bytes));
+    }
+
+    fn activity(&mut self, activity: &store::Activity) {
+        self.activity
+            .push((activity.rel.clone(), activity.action.clone(), activity.size));
+    }
+}
+
+#[test]
+fn a_pass_reports_its_plan_transfers_and_recent_changes() {
+    let f = Fixture::new();
+    fs::write(f.local.join("up.txt"), "12345").unwrap();
+    fs::write(f.remote_file("down.txt"), "abc").unwrap();
+    fs::create_dir(f.local.join("folder")).unwrap();
+    let group = "celestial/test-progress";
+    rclone::delete_group_stats(group);
+    rclone::sync::set_stats_group(Some(group.into()));
+    let mut hooks = Recorder::default();
+    let report = pass::run(&f.pair(), &mut hooks, None);
+    rclone::sync::set_stats_group(None);
+    let report = report.unwrap();
+    assert_eq!(report.space, None);
+    assert_eq!(
+        hooks.plans,
+        [crate::sync::progress::Plan {
+            upload_files: 1,
+            upload_bytes: 5,
+            download_files: 1,
+            download_bytes: 3,
+            ..Default::default()
+        }]
+    );
+    hooks.started.sort();
+    assert_eq!(hooks.started, ["down.txt", "up.txt"]);
+    assert_eq!(
+        hooks.finished.iter().map(|(files, _)| files).sum::<u64>(),
+        2
+    );
+    assert_eq!(
+        hooks.finished.iter().map(|(_, bytes)| bytes).sum::<u64>(),
+        8
+    );
+    hooks.activity.sort();
+    assert_eq!(
+        hooks.activity,
+        [
+            ("down.txt".into(), "downloaded".into(), 3),
+            ("up.txt".into(), "uploaded".into(), 5)
+        ]
+    );
+    // The transfers were counted in the pass's stats group.
+    assert!(rclone::group_stats(group).unwrap().bytes >= 8);
+    rclone::delete_group_stats(group);
+    let stored = store::recent_activity(&f.db, f.dir.id, 10).unwrap();
+    assert_eq!(stored.len(), 2);
+
+    // A propagated deletion is a removal in the plan and a recent change.
+    fs::remove_file(f.local.join("up.txt")).unwrap();
+    let mut hooks = Recorder::default();
+    pass::run(&f.pair(), &mut hooks, None).unwrap();
+    assert_eq!(hooks.plans[0].removals, 1);
+    assert_eq!(hooks.plans[0].files(), 0);
+    assert_eq!(
+        hooks.activity,
+        [("up.txt".into(), "deleted_remote".into(), 5)]
+    );
+    assert_eq!(
+        store::recent_activity(&f.db, f.dir.id, 1).unwrap()[0].action,
+        "deleted_remote"
+    );
+}
+
+#[test]
+fn uploads_wait_for_space_unless_approved() {
+    use crate::sync::progress::Plan;
+    let plan = Plan {
+        upload_files: 1,
+        upload_bytes: 10 << 20,
+        ..Plan::default()
+    };
+    assert_eq!(
+        pass::space_shortage(&plan, Some(5 << 20), false),
+        Some(pass::SpaceShortage {
+            needed: 10 << 20,
+            free: 5 << 20
+        })
+    );
+    assert_eq!(pass::space_shortage(&plan, Some(5 << 20), true), None);
+    assert_eq!(pass::space_shortage(&plan, Some(1 << 30), false), None);
+    // A remote that does not report its free space is not gated.
+    assert_eq!(pass::space_shortage(&plan, None, false), None);
+    let downloads = Plan {
+        download_files: 1,
+        download_bytes: 1 << 30,
+        ..Plan::default()
+    };
+    assert_eq!(pass::space_shortage(&downloads, Some(0), false), None);
+}
+
+#[test]
+fn stopping_a_pair_forgets_its_recent_changes() {
+    let f = Fixture::new();
+    store::insert_activity(
+        &f.db,
+        f.dir.id,
+        &store::Activity {
+            rel: "a".into(),
+            action: "uploaded".into(),
+            size: 1,
+            finished_at: 1,
+        },
+    )
+    .unwrap();
+    let tx = util::await_future(f.db.begin()).unwrap();
+    util::await_future(forget_pair_state(&tx, f.dir.id)).unwrap();
+    util::await_future(tx.commit()).unwrap();
+    assert!(
+        store::recent_activity(&f.db, f.dir.id, 10)
+            .unwrap()
+            .is_empty()
+    );
+}

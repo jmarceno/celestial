@@ -51,12 +51,18 @@ mod qobject {
         #[qml_element]
         #[qproperty(QString, snapshot_json)]
         #[qproperty(QString, suggestions_json)]
+        #[qproperty(QString, progress_json)]
         #[qproperty(bool, window_visible)]
         #[qproperty(bool, quit_requested)]
         type AppController = super::AppControllerRust;
 
         #[qsignal]
         fn activated(self: Pin<&mut Self>);
+
+        /// The tray icon was clicked: show the status window near `x`, `y`.
+        #[qsignal]
+        #[cxx_name = "trayActivated"]
+        fn tray_activated(self: Pin<&mut Self>, x: i32, y: i32);
 
         #[qsignal]
         #[cxx_name = "notice"]
@@ -157,6 +163,7 @@ struct Runtime {
     tray_rx: Option<crossbeam_channel::Receiver<TrayEvent>>,
     activations: Option<crossbeam_channel::Receiver<Activation>>,
     seen_gen: u64,
+    seen_progress: u64,
     background: bool,
     saw_snapshot: bool,
     exit_requested: bool,
@@ -165,6 +172,7 @@ struct Runtime {
 pub struct AppControllerRust {
     snapshot_json: QString,
     suggestions_json: QString,
+    progress_json: QString,
     window_visible: bool,
     quit_requested: bool,
     runtime: Option<Runtime>,
@@ -175,6 +183,7 @@ impl Default for AppControllerRust {
         Self {
             snapshot_json: QString::from("{}"),
             suggestions_json: QString::from("[]"),
+            progress_json: QString::from("{\"pairs\":[],\"total\":null}"),
             window_visible: false,
             quit_requested: false,
             runtime: None,
@@ -193,6 +202,7 @@ impl qobject::AppController {
         let stopped = Arc::new(AtomicBool::new(false));
         let cancel_auth = Arc::new(AtomicBool::new(false));
         let tray = boot.tray.clone();
+        let progress_tray = boot.tray.clone();
         let shared = Shared {
             bus: crate::sync::model::SnapshotBus::new(),
             quit: Arc::new(AtomicBool::new(false)),
@@ -204,6 +214,12 @@ impl qobject::AppController {
                     tray.update(message, phase);
                 }
             }),
+            progress: Default::default(),
+            tray_progress: Arc::new(move |progress| {
+                if let Some(tray) = progress_tray.as_ref() {
+                    tray.update_progress(progress);
+                }
+            }),
         };
         sync::spawn(shared.clone(), cmd_rx);
         self.as_mut().rust_mut().runtime = Some(Runtime {
@@ -213,6 +229,7 @@ impl qobject::AppController {
             tray_rx: boot.tray_rx,
             activations: boot.activations,
             seen_gen: 0,
+            seen_progress: 0,
             background: boot.background,
             saw_snapshot: false,
             exit_requested: false,
@@ -227,6 +244,8 @@ impl qobject::AppController {
         let mut notices = Vec::new();
         let mut snapshot: Option<String> = None;
         let mut suggestions: Option<String> = None;
+        let mut progress: Option<String> = None;
+        let mut status_at: Option<(i32, i32)> = None;
         let mut exit_now = false;
         {
             let mut rust = self.as_mut().rust_mut();
@@ -237,6 +256,7 @@ impl qobject::AppController {
                 for event in rx.try_iter() {
                     match event {
                         TrayEvent::Open => show = true,
+                        TrayEvent::Status(x, y) => status_at = Some((x, y)),
                         TrayEvent::Quit => {
                             rt.exit_requested = true;
                             rt.shared.quit.store(true, Ordering::Relaxed);
@@ -276,6 +296,11 @@ impl qobject::AppController {
                 }
                 snapshot = Some(json);
             }
+            let generation = rt.shared.progress.generation();
+            if generation != rt.seen_progress {
+                rt.seen_progress = generation;
+                progress = Some(rt.shared.progress.json());
+            }
             if rt.exit_requested && rt.shared.stopped.load(Ordering::Relaxed) {
                 exit_now = true;
             }
@@ -291,6 +316,12 @@ impl qobject::AppController {
         }
         if let Some(text) = snapshot {
             self.as_mut().set_snapshot_json(QString::from(&*text));
+        }
+        if let Some(text) = progress {
+            self.as_mut().set_progress_json(QString::from(&*text));
+        }
+        if let Some((x, y)) = status_at {
+            self.as_mut().tray_activated(x, y);
         }
         for (kind, title, body) in notices {
             self.as_mut().notice(

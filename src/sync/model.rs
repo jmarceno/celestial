@@ -34,6 +34,9 @@ pub enum SyncError {
         /// JSON describing both versions and where each one now lives.
         detail: String,
     },
+    /// The remote has less free space than the pair would upload. The pair
+    /// waits until there is space or the person approves the upload.
+    Space { needed: u64, free: u64 },
 }
 
 /// Key of the pair-level error; item issues are keyed by relative path.
@@ -53,6 +56,8 @@ pub struct DirState {
     pub errors: Vec<StoredError>,
     /// Preserved versions that can be restored, newest first.
     pub recovery: Vec<Value>,
+    /// Recently synchronized files, newest first.
+    pub recent: Vec<Value>,
 }
 
 impl DirState {
@@ -62,6 +67,7 @@ impl DirState {
             phase: "loading".into(),
             errors: Vec::new(),
             recovery: Vec::new(),
+            recent: Vec::new(),
         }
     }
 
@@ -253,6 +259,28 @@ impl Model {
         true
     }
 
+    pub fn set_recent(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        items: Vec<Value>,
+    ) -> bool {
+        let Some(dir) = self.dir_mut(remote, local, remote_path) else {
+            return false;
+        };
+        dir.recent = items;
+        true
+    }
+
+    /// Put a just synchronized file at the top of the recent list.
+    pub fn push_recent(&mut self, remote: &str, local: &str, remote_path: &str, item: Value) {
+        if let Some(dir) = self.dir_mut(remote, local, remote_path) {
+            dir.recent.insert(0, item);
+            dir.recent.truncate(RECENT_SHOWN);
+        }
+    }
+
     /// Record a pair-level problem (kept for callers that only add one).
     pub fn add_error(
         &mut self,
@@ -327,6 +355,7 @@ impl Model {
                             "errors": dir.errors.iter().map(error_json).collect::<Vec<_>>(),
                             "exclusions": read_exclusions(local),
                             "recovery": dir.recovery,
+                            "recent": dir.recent,
                         })
                     })
                     .collect();
@@ -341,8 +370,51 @@ impl Model {
     }
 }
 
+/// Recent changes shown per pair.
+pub const RECENT_SHOWN: usize = 50;
+
+/// A recent change as the window shows it.
+pub fn activity_json(local_root: &str, activity: &super::store::Activity) -> Value {
+    let path = Path::new(local_root).join(&activity.rel);
+    let name = activity
+        .rel
+        .rsplit('/')
+        .next()
+        .unwrap_or(&activity.rel)
+        .to_owned();
+    let label = match activity.action.as_str() {
+        "uploaded" => tr::tr!("Uploaded"),
+        "downloaded" => tr::tr!("Downloaded"),
+        "deleted_local" => tr::tr!("Deleted from this computer"),
+        "deleted_remote" => tr::tr!("Deleted from the remote"),
+        "conflict" => tr::tr!("Both versions kept"),
+        other => other.to_owned(),
+    };
+    json!({
+        "rel": activity.rel,
+        "name": name,
+        "path": path.display().to_string(),
+        "folder": path.parent().map(|parent| parent.display().to_string()).unwrap_or_default(),
+        "action": activity.action,
+        "label": label,
+        "size": activity.size,
+        "sizeText": if activity.size >= 0 {
+            super::progress::format_bytes(activity.size.unsigned_abs())
+        } else {
+            String::new()
+        },
+        "at": activity.finished_at,
+    })
+}
+
 fn error_json(err: &StoredError) -> Value {
     match &err.error {
+        SyncError::Space { needed, free } => json!({
+            "id": err.id,
+            "kind": "space",
+            "title": tr::tr!("Not enough space on the remote"),
+            "detail": space_text(*needed, *free),
+        }),
         SyncError::Conflict {
             rel, kind, detail, ..
         } => json!({
@@ -385,6 +457,14 @@ fn error_json(err: &StoredError) -> Value {
             })
         }
     }
+}
+
+pub fn space_text(needed: u64, free: u64) -> String {
+    tr::tr!(
+        "This folder needs {} more on the remote, but only {} is free. Nothing was uploaded. Free some space, or sync anyway to upload until the remote is full.",
+        super::progress::format_bytes(needed),
+        super::progress::format_bytes(free)
+    )
 }
 
 pub fn conflict_title(kind: &str, rel: &str) -> String {

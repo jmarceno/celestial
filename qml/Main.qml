@@ -11,6 +11,16 @@ QtObject {
         controller: root.controller
     }
 
+    property TrayPopup trayPopup: TrayPopup {
+        controller: root.controller
+        onOpenRequested: {
+            root.controller.showWindow()
+            root.shell.show()
+            root.shell.raise()
+            root.shell.requestActivate()
+        }
+    }
+
     property Timer tickTimer: Timer {
         interval: 50
         running: true
@@ -28,6 +38,9 @@ QtObject {
             } else {
                 root.shell.hide()
             }
+        }
+        function onTrayActivated(x, y) {
+            root.trayPopup.toggleAt(x, y)
         }
         function onActivated() {
             root.shell.show()
