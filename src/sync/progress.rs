@@ -61,8 +61,8 @@ pub struct PairProgress {
     pub done_files: u64,
     /// Planned bytes of finished items, whether they succeeded or not.
     pub done_bytes: u64,
-    /// The item being transferred.
-    pub current: Option<String>,
+    /// The items being transferred, oldest first.
+    pub active: Vec<String>,
     /// Bytes of the transfer in flight.
     pub in_flight: u64,
     /// Bytes per second over wall-clock time, so the time spent between
@@ -82,13 +82,22 @@ impl PairProgress {
             plan,
             done_files: 0,
             done_bytes: 0,
-            current: None,
+            active: Vec::new(),
             in_flight: 0,
             speed: 0.0,
             started: now,
             measured: false,
             sample: None,
         }
+    }
+
+    /// The item being transferred, and how many others are.
+    pub fn current(&self) -> Option<String> {
+        let first = self.active.first()?;
+        Some(match self.active.len() {
+            1 => first.clone(),
+            count => tr::tr!("{} and {} more", first, count - 1),
+        })
     }
 
     pub fn transferred(&self) -> u64 {
@@ -170,23 +179,28 @@ impl ProgressBus {
         });
     }
 
-    pub fn current(&self, id: i32, rel: &str) {
+    pub fn started(&self, id: i32, rel: &str) {
         self.edit(|pairs| {
             if let Some(pair) = pairs.get_mut(&id) {
-                pair.current = Some(rel.to_owned());
+                pair.active.push(rel.to_owned());
             }
         });
     }
 
-    /// A planned transfer of `files` files and `bytes` bytes finished,
-    /// successfully or not.
-    pub fn finished(&self, id: i32, files: u64, bytes: u64) {
+    /// The planned transfer of `rel`, `files` files and `bytes` bytes,
+    /// finished, successfully or not. Its bytes in flight leave the next
+    /// stats reading; until then the total is capped by the plan.
+    pub fn finished(&self, id: i32, rel: &str, files: u64, bytes: u64) {
         self.edit(|pairs| {
             if let Some(pair) = pairs.get_mut(&id) {
                 pair.done_files = (pair.done_files + files).min(pair.plan.files());
                 pair.done_bytes = pair.done_bytes.saturating_add(bytes);
-                pair.in_flight = 0;
-                pair.current = None;
+                if let Some(index) = pair.active.iter().position(|active| active == rel) {
+                    pair.active.remove(index);
+                }
+                if pair.active.is_empty() {
+                    pair.in_flight = 0;
+                }
             }
         });
     }
@@ -245,7 +259,7 @@ impl ProgressBus {
                 value["remote"] = json!(pair.remote);
                 value["localPath"] = json!(pair.local);
                 value["remotePath"] = json!(pair.remote_path);
-                value["current"] = json!(pair.current);
+                value["current"] = json!(pair.current());
                 value
             })
             .collect();
@@ -518,14 +532,30 @@ mod tests {
             })
         });
         assert_eq!(bus.get(1).unwrap().transferred(), 900);
-        bus.finished(1, 1, 600);
-        bus.finished(1, 1, 400);
-        bus.finished(1, 1, 400);
+        bus.finished(1, "a", 1, 600);
+        bus.finished(1, "b", 1, 400);
+        bus.finished(1, "c", 1, 400);
         let pair = bus.get(1).unwrap();
         assert_eq!((pair.done_files, pair.transferred()), (2, 1000));
         bus.end(1);
         assert!(bus.get(1).is_none());
         assert_eq!(bus.summary(), None);
+    }
+
+    #[test]
+    fn parallel_transfers_are_all_listed_as_current() {
+        let bus = ProgressBus::default();
+        bus.start(1, "r", "/l", "p", plan(300, 3));
+        bus.started(1, "a");
+        bus.started(1, "b");
+        bus.started(1, "c");
+        assert_eq!(bus.get(1).unwrap().current().unwrap(), "a and 2 more");
+        bus.finished(1, "a", 1, 100);
+        assert_eq!(bus.get(1).unwrap().current().unwrap(), "b and 1 more");
+        bus.finished(1, "c", 1, 100);
+        bus.finished(1, "b", 1, 100);
+        let pair = bus.get(1).unwrap();
+        assert_eq!((pair.current(), pair.done_files), (None, 3));
     }
 
     #[test]
@@ -561,7 +591,7 @@ mod tests {
                 ..Plan::default()
             },
         );
-        bus.finished(1, 1, 1_000_000_000);
+        bus.finished(1, "a", 1, 1_000_000_000);
         let value: Value = serde_json::from_str(&bus.json()).unwrap();
         assert_eq!(value["pairs"].as_array().unwrap().len(), 2);
         assert_eq!(value["total"]["files"], 12);

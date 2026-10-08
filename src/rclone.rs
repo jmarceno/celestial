@@ -207,6 +207,11 @@ pub mod sync {
         STATS_GROUP.with(|current| *current.borrow_mut() = group);
     }
 
+    /// This thread's stats group, to hand to threads it starts.
+    pub fn stats_group() -> Option<String> {
+        STATS_GROUP.with(|current| current.borrow().clone())
+    }
+
     /// The filesystem string for a configured remote.
     pub fn remote_fs(remote: &str) -> Result<String, RcloneError> {
         if remote.is_empty() || remote.contains(':') || remote.contains('/') {

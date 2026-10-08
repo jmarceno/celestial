@@ -580,13 +580,13 @@ impl pass::Hooks for WorkerHooks<'_> {
     }
 
     fn item_started(&mut self, rel: &str) {
-        self.shared.progress.current(self.sync_dir.id, rel);
+        self.shared.progress.started(self.sync_dir.id, rel);
     }
 
-    fn item_finished(&mut self, files: u64, bytes: u64) {
+    fn item_finished(&mut self, rel: &str, files: u64, bytes: u64) {
         self.shared
             .progress
-            .finished(self.sync_dir.id, files, bytes);
+            .finished(self.sync_dir.id, rel, files, bytes);
     }
 
     fn activity(&mut self, activity: &store::Activity) {

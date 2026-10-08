@@ -2276,7 +2276,7 @@ impl pass::Hooks for Recorder {
         self.started.push(rel.to_owned());
     }
 
-    fn item_finished(&mut self, files: u64, bytes: u64) {
+    fn item_finished(&mut self, _rel: &str, files: u64, bytes: u64) {
         self.finished.push((files, bytes));
     }
 
@@ -2411,4 +2411,98 @@ fn remote_folder_size_counts_files_and_treats_a_missing_folder_as_empty() {
     assert_eq!((size.count, size.bytes), (2, 8));
     let missing = rclone::sync::folder_size(&f.remote.name, "sandbox/not-yet").unwrap();
     assert_eq!(missing, rclone::FolderSize::default());
+}
+
+#[test]
+fn parallel_copies_synchronize_files_in_new_folders_both_ways() {
+    let mut f = Fixture::new();
+    for dir in ["up/a", "up/a/b"] {
+        fs::create_dir_all(f.local.join(dir)).unwrap();
+    }
+    for dir in ["down/x", "down/x/y"] {
+        fs::create_dir_all(f.remote_file(dir)).unwrap();
+    }
+    for index in 0..12 {
+        fs::write(
+            f.local.join(format!("up/a/b/{index}.txt")),
+            format!("local {index}"),
+        )
+        .unwrap();
+        fs::write(
+            f.local.join(format!("up/{index}.txt")),
+            format!("top {index}"),
+        )
+        .unwrap();
+        fs::write(
+            f.remote_file(&format!("down/x/y/{index}.txt")),
+            format!("remote {index}"),
+        )
+        .unwrap();
+    }
+    f.pass();
+    f.assert_no_errors();
+    for index in 0..12 {
+        assert_eq!(
+            f.read_remote(&format!("up/a/b/{index}.txt")),
+            format!("local {index}")
+        );
+        assert_eq!(
+            f.read_remote(&format!("up/{index}.txt")),
+            format!("top {index}")
+        );
+        assert_eq!(
+            f.read_local(&format!("down/x/y/{index}.txt")),
+            format!("remote {index}")
+        );
+    }
+    assert_eq!(
+        store::recent_activity(&f.db, f.dir.id, 100).unwrap().len(),
+        36
+    );
+    // Every copy left a verified baseline: nothing to do next time.
+    f.assert_clean();
+    // Edits on both sides, still in parallel.
+    for index in 0..6 {
+        fs::write(f.local.join(format!("up/{index}.txt")), "edited here").unwrap();
+        fs::write(
+            f.remote_file(&format!("down/x/y/{index}.txt")),
+            "edited there",
+        )
+        .unwrap();
+    }
+    f.pass();
+    f.assert_no_errors();
+    for index in 0..6 {
+        assert_eq!(f.read_remote(&format!("up/{index}.txt")), "edited here");
+        assert_eq!(
+            f.read_local(&format!("down/x/y/{index}.txt")),
+            "edited there"
+        );
+    }
+    f.assert_clean();
+}
+
+#[test]
+fn one_failed_parallel_copy_leaves_the_others_synchronized() {
+    if !permissions_apply() {
+        return;
+    }
+    let mut f = Fixture::new();
+    for index in 0..8 {
+        fs::write(f.local.join(format!("{index}.txt")), format!("{index}")).unwrap();
+    }
+    let locked = f.local.join("3.txt");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    f.pass();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+    let states = item_states(&f);
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states["3.txt"].state, store::RETRYING);
+    for index in (0..8).filter(|index| *index != 3) {
+        assert_eq!(f.read_remote(&format!("{index}.txt")), index.to_string());
+    }
+    f.retry_all();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_remote("3.txt"), "3");
 }

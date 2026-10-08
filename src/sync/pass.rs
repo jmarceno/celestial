@@ -24,6 +24,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const LOCAL_EMPTIED: &str = "Every synced item is missing from the local folder while the remote still has them. Automatic deletion is paused; check that the local folder or its drive is mounted. To delete everything intentionally, remove the items on both sides.";
 pub const REMOTE_EMPTIED: &str = "Every synced item is missing from the remote folder while the local folder still has them. Automatic deletion is paused; check the remote. To delete everything intentionally, remove the items on both sides.";
@@ -53,9 +54,9 @@ pub trait Hooks {
     }
     /// A planned transfer starts.
     fn item_started(&mut self, _rel: &str) {}
-    /// A planned transfer of `files` files and `bytes` bytes ended,
-    /// successfully or not.
-    fn item_finished(&mut self, _files: u64, _bytes: u64) {}
+    /// The planned transfer of `rel`, `files` files and `bytes` bytes,
+    /// ended, successfully or not.
+    fn item_finished(&mut self, _rel: &str, _files: u64, _bytes: u64) {}
     /// A file was synchronized.
     fn activity(&mut self, _activity: &store::Activity) {}
 }
@@ -75,6 +76,9 @@ pub fn space_shortage(plan: &Plan, free: Option<i64>, approved: bool) -> Option<
     (needed > 0 && needed.saturating_add(SPACE_MARGIN) > free && !approved)
         .then_some(SpaceShortage { needed, free })
 }
+
+/// How many file copies a pass runs at once (rclone's default).
+const TRANSFERS: usize = 4;
 
 /// Room left on the remote besides the planned bytes.
 const SPACE_MARGIN: u64 = 1 << 20;
@@ -264,7 +268,7 @@ struct Cx<'a> {
     internal: Internal,
     /// The pair root, opened once and checked against its identity.
     root: Root,
-    remote_free: Cell<Option<Option<i64>>>,
+    remote_free: OnceLock<Option<i64>>,
 }
 
 impl Cx<'_> {
@@ -360,11 +364,9 @@ impl Cx<'_> {
     /// Free space on the remote, read once per pass; `None` when the
     /// remote does not report it.
     fn remote_free(&self) -> Option<i64> {
-        if self.remote_free.get().is_none() {
-            let free = rclone::sync::free_space(&self.pair.remote.name).unwrap_or(None);
-            self.remote_free.set(Some(free));
-        }
-        self.remote_free.get().flatten()
+        *self
+            .remote_free
+            .get_or_init(|| rclone::sync::free_space(&self.pair.remote.name).unwrap_or(None))
     }
 
     /// Pause before writing when the destination is short of space, instead
@@ -627,61 +629,96 @@ pub fn run(
             retry(pair, &entry.rel, &reason)?;
         }
     }
-    // Then creations and transfers, parents before their contents.
-    for (index, entry) in entries.iter().enumerate() {
-        if !hooks.checkpoint() {
-            report.aborted = true;
-            return Ok(report);
-        }
-        if failed[index] || entry.deferred || entry.prune {
-            continue;
-        }
-        // The new name of a case-only rename is created only once the old
-        // name is gone, or it would replace it on the remote.
-        if renames
-            .iter()
-            .any(|(old, new)| *new == index && failed[*old])
-        {
-            retry(
-                pair,
-                &entry.rel,
-                &tr::tr!("Waiting for the previous name to be removed first."),
-            )?;
-            continue;
-        }
-        if let Some(reason) = &entry.blocked {
-            store::set_blocked(pair.db, pair.dir.id, &entry.rel, reason)
-                .map_err(|err| err.to_string())?;
-            continue;
-        }
-        let outcome = match &entry.decision {
-            Decision::Retry(reason) => Err(reason.clone()),
-            Decision::InSync | Decision::Nothing => Ok(false),
-            Decision::DeleteLocal | Decision::DeleteRemote => Ok(false),
-            decision => {
-                hooks.progress(tr::tr!("Synchronizing '{}'...", entry.rel));
-                let transfer = transfer_of(entry);
-                if transfer.is_some() {
-                    hooks.item_started(&entry.rel);
-                }
-                let result = execute(&cx, entry, decision).map(|()| true);
-                if let Some(transfer) = transfer {
-                    hooks.item_finished(transfer.files(), transfer.bytes());
-                    if result.is_ok() {
-                        note_activity(pair, hooks, entry);
-                    }
-                }
-                result
-            }
+    // Then creations and transfers, parents before their contents. Plain
+    // file copies run several at a time; any other step first waits for the
+    // copies in flight, so a folder exists before its contents and no step
+    // races a copy.
+    let width = TRANSFERS;
+    let group = rclone::sync::stats_group();
+    let cx = &cx;
+    let aborted = std::thread::scope(|scope| -> Result<bool, String> {
+        let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        let mut copies = Copies {
+            done: done_rx,
+            in_flight: 0,
         };
-        match outcome {
-            Ok(acted) => {
-                report.actions += usize::from(acted);
-                store::clear_item_state(pair.db, pair.dir.id, &entry.rel)
-                    .map_err(|err| err.to_string())?;
+        for (index, entry) in entries.iter().enumerate() {
+            if !hooks.checkpoint() {
+                copies.wait_until(0, pair, &entries, hooks, &mut report)?;
+                return Ok(true);
             }
-            Err(reason) => retry(pair, &entry.rel, &reason)?,
+            if failed[index] || entry.deferred || entry.prune {
+                continue;
+            }
+            // The new name of a case-only rename is created only once the old
+            // name is gone, or it would replace it on the remote.
+            if renames
+                .iter()
+                .any(|(old, new)| *new == index && failed[*old])
+            {
+                retry(
+                    pair,
+                    &entry.rel,
+                    &tr::tr!("Waiting for the previous name to be removed first."),
+                )?;
+                continue;
+            }
+            if let Some(reason) = &entry.blocked {
+                store::set_blocked(pair.db, pair.dir.id, &entry.rel, reason)
+                    .map_err(|err| err.to_string())?;
+                continue;
+            }
+            let decision = match &entry.decision {
+                Decision::Retry(reason) => {
+                    settle(pair, hooks, &mut report, entry, None, Err(reason.clone()))?;
+                    continue;
+                }
+                Decision::InSync
+                | Decision::Nothing
+                | Decision::DeleteLocal
+                | Decision::DeleteRemote => {
+                    settle(pair, hooks, &mut report, entry, None, Ok(false))?;
+                    continue;
+                }
+                decision => decision,
+            };
+            let transfer = transfer_of(entry);
+            let parallel = width > 1 && transfer.is_some() && plain_copy(entry);
+            copies.wait_until(
+                if parallel { width - 1 } else { 0 },
+                pair,
+                &entries,
+                hooks,
+                &mut report,
+            )?;
+            hooks.progress(tr::tr!("Synchronizing '{}'...", entry.rel));
+            if transfer.is_some() {
+                hooks.item_started(&entry.rel);
+            }
+            if parallel {
+                let done = done_tx.clone();
+                let group = group.clone();
+                scope.spawn(move || {
+                    rclone::sync::set_stats_group(group);
+                    // A panic is handed to the pass, which stops like it
+                    // would if the copy ran on its own thread.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute(cx, entry, decision)
+                    }));
+                    let _ = done.send((index, result));
+                });
+                copies.in_flight += 1;
+            } else {
+                let result = execute(cx, entry, decision).map(|()| true);
+                settle(pair, hooks, &mut report, entry, transfer, result)?;
+            }
         }
+        copies.wait_until(0, pair, &entries, hooks, &mut report)?;
+        Ok(false)
+    })?;
+    if aborted {
+        report.aborted = true;
+        return Ok(report);
     }
     // Forget states of items that no longer exist anywhere.
     let present: BTreeSet<&str> = entries.iter().map(|entry| entry.rel.as_str()).collect();
@@ -755,6 +792,76 @@ pub fn run(
     tracing::debug!(pair = %pair.dir.local_path, stats = ?report.stats, actions = report.actions, "pass finished");
     report.local_tree = Some(local);
     Ok(report)
+}
+
+/// How the copy of entry `.0` ended, or why it panicked.
+type CopyEnd = (usize, std::thread::Result<Result<(), String>>);
+
+/// File copies running on other threads.
+struct Copies {
+    done: crossbeam_channel::Receiver<CopyEnd>,
+    in_flight: usize,
+}
+
+impl Copies {
+    /// Wait until at most `limit` copies are running, recording each one
+    /// that ends.
+    fn wait_until(
+        &mut self,
+        limit: usize,
+        pair: &Pair,
+        entries: &[Entry],
+        hooks: &mut dyn Hooks,
+        report: &mut Report,
+    ) -> Result<(), String> {
+        while self.in_flight > limit {
+            let (index, result) = self.done.recv().map_err(|err| err.to_string())?;
+            self.in_flight -= 1;
+            // Nothing is recorded for a copy that panicked, as after a crash.
+            let result = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            let entry = &entries[index];
+            settle(
+                pair,
+                hooks,
+                report,
+                entry,
+                transfer_of(entry),
+                result.map(|()| true),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A copy of one file that needs nothing else from the pass: no conflict
+/// copy, no folder, no restore record written alongside.
+fn plain_copy(entry: &Entry) -> bool {
+    matches!(entry.decision, Decision::Upload | Decision::Download)
+}
+
+/// Record how an item ended: its transfer, the recent change, and its
+/// state (synced, or retried later).
+fn settle(
+    pair: &Pair,
+    hooks: &mut dyn Hooks,
+    report: &mut Report,
+    entry: &Entry,
+    transfer: Option<Transfer>,
+    result: Result<bool, String>,
+) -> Result<(), String> {
+    if let Some(transfer) = transfer {
+        hooks.item_finished(&entry.rel, transfer.files(), transfer.bytes());
+        if result.is_ok() {
+            note_activity(pair, hooks, entry);
+        }
+    }
+    match result {
+        Ok(acted) => {
+            report.actions += usize::from(acted);
+            store::clear_item_state(pair.db, pair.dir.id, &entry.rel).map_err(|err| err.to_string())
+        }
+        Err(reason) => retry(pair, &entry.rel, &reason),
+    }
 }
 
 /// The file transfers an entry's decision makes.
@@ -1931,7 +2038,7 @@ fn context<'a>(pair: &'a Pair<'a>) -> Result<Cx<'a>, String> {
         pair,
         internal,
         root,
-        remote_free: Cell::new(None),
+        remote_free: OnceLock::new(),
     })
 }
 
