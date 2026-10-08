@@ -455,7 +455,7 @@ ApplicationWindow {
                 }
                 Label { text: "File/folder exclusions"; color: root.theme.textSecondary; font.pixelSize: 13; font.bold: true }
                 Label {
-                    text: "One glob per line, stored in .sync-exclude.lst inside the local folder."
+                    text: "Starting rules skip caches, temporary files and installed Steam games. Edit or remove any rule and save. One glob per line in .sync-exclude.lst: ~/ starts at home, / is absolute, other paths start at this folder."
                     color: root.theme.textDim
                     font.pixelSize: 12
                     wrapMode: Text.WordWrap

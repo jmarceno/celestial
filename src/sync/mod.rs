@@ -2,6 +2,7 @@
 
 mod capabilities;
 mod engine;
+mod exclusions;
 mod failpoint;
 mod localfs;
 pub mod model;

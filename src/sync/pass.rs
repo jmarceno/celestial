@@ -8,9 +8,10 @@
 //! or emptied root, unreadable exclusions, a database failure) stop a pass.
 
 use super::capabilities::Capabilities;
+use super::exclusions::Rules;
 use super::failpoint;
 use super::localfs::Root;
-use super::model::{FILE_IGNORE_NAME, SyncError};
+use super::model::SyncError;
 use super::observe::{self, Fingerprint, HashError, LocalMeta, LocalTree, Obs, RemoteMeta};
 use super::reconcile::{self, ConflictKind, Decision, Delta, History, Input, Kind, Side};
 use super::recovery::{self, Internal, Store as Recovery};
@@ -359,7 +360,7 @@ pub fn run(
     let hashed_before = observe::HASHED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     let walked = cached.is_none();
     let root_path = Path::new(&pair.dir.local_path);
-    let patterns = load_ignore_globs(&root_path.join(FILE_IGNORE_NAME))?;
+    let patterns = Rules::load(root_path)?;
     let cx = context(pair)?;
     // Finish or undo anything an interruption left half done before looking.
     cx.rec().replay()?;
@@ -371,7 +372,7 @@ pub fn run(
             && (rel == recovery::REMOTE_RECOVERY_ROOT
                 || rel.starts_with(&format!("{}/", recovery::REMOTE_RECOVERY_ROOT)))
     };
-    let ignored = |rel: &str| is_ignored(rel, &patterns);
+    let ignored = |rel: &str| patterns.matches(rel);
     let local = match cached {
         Some(tree) => tree,
         None => observe::observe_local(root_path, &|rel, metadata| {
@@ -1717,42 +1718,6 @@ fn settle_folders(entries: &mut [Entry]) {
                 _ => Decision::KeepBoth(ConflictKind::FileFolder),
             }
         };
-    }
-}
-
-pub fn load_ignore_globs(ignore_file: &Path) -> Result<Vec<glob::Pattern>, String> {
-    match fs::metadata(ignore_file) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.to_string()),
-        Ok(metadata) if !metadata.is_file() => {
-            return Err("Exclusion rules are not a regular file".into());
-        }
-        Ok(_) => {}
-    }
-    let _lock =
-        file_lock::FileLock::lock(ignore_file, true, file_lock::FileOptions::new().read(true))
-            .map_err(|err| err.to_string())?;
-    fs::read_to_string(ignore_file)
-        .map_err(|err| err.to_string())?
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| glob::Pattern::new(line).map_err(|err| format!("{line}: {err}")))
-        .collect()
-}
-
-pub fn is_ignored(relative: &str, patterns: &[glob::Pattern]) -> bool {
-    if relative == FILE_IGNORE_NAME {
-        return true;
-    }
-    let mut path = relative;
-    loop {
-        if patterns.iter().any(|pattern| pattern.matches(path)) {
-            return true;
-        }
-        let Some((parent, _)) = path.rsplit_once('/') else {
-            return false;
-        };
-        path = parent;
     }
 }
 

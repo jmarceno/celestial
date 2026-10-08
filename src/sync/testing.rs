@@ -82,6 +82,9 @@ impl Fixture {
         let local = temp.path().join("local");
         let remote_root = temp.path().join("remote");
         fs::create_dir(&local).unwrap();
+        // Fixture roots live in /tmp, which the editable production defaults
+        // exclude. Each test opts into the rules it wants to exercise.
+        fs::write(local.join(super::model::FILE_IGNORE_NAME), "").unwrap();
         fs::create_dir_all(remote_root.join("sandbox")).unwrap();
         librclone::rpc(
             "config/setpath",

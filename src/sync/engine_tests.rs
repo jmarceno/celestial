@@ -278,6 +278,111 @@ fn exclusions_apply_on_both_sides_of_nonroot_pair() {
 }
 
 #[test]
+fn default_exclusions_skip_both_sides_and_removing_them_enables_sync() {
+    let mut f = Fixture::new();
+    fs::remove_file(f.local.join(FILE_IGNORE_NAME)).unwrap();
+    crate::sync::exclusions::initialize(&f.local).unwrap();
+    // Simulate this disposable root as the user's home without changing the
+    // process environment. /tmp itself is intentionally excluded in production.
+    let text = fs::read_to_string(f.local.join(FILE_IGNORE_NAME)).unwrap();
+    let home = glob::Pattern::escape(f.local.to_str().unwrap());
+    let text = text
+        .lines()
+        .filter(|line| *line != "/tmp")
+        .map(|line| {
+            line.strip_prefix("~/")
+                .map_or_else(|| line.to_owned(), |tail| format!("{home}/{tail}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    model::write_exclusions(f.local.to_str().unwrap(), &text).unwrap();
+    for (path, content) in [
+        (".cache/pip/local.whl", "cached"),
+        (".cargo/registry/src/local.rs", "cached"),
+        (
+            ".config/BraveSoftware/Brave-Browser/Default/Code Cache/js/cache",
+            "cached",
+        ),
+        ("Projects/app/__pycache__/module.pyc", "cached"),
+        (
+            "Games/SteamLibrary/steamapps/common/Game/game.exe",
+            "downloadable",
+        ),
+        (".local/share/app/database.sqlite", "keep"),
+        (".config/google-chrome/Default/Bookmarks", "keep"),
+        (".cargo/credentials.toml", "keep"),
+        (
+            "Games/SteamLibrary/steamapps/compatdata/123/save.dat",
+            "keep",
+        ),
+        (".local/share/Steam/userdata/123/save.dat", "keep"),
+        (".Private/document", "keep"),
+    ] {
+        let target = f.local.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, content).unwrap();
+    }
+    for path in [
+        ".cache/pip/remote.whl",
+        ".var/app/org.mozilla.firefox/cache/remote-cache",
+        "Games/SteamLibrary/steamapps/common/RemoteGame/game.exe",
+    ] {
+        let target = f.remote_file(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, "remote cache/game").unwrap();
+    }
+    f.pass();
+    for path in [
+        ".cache/pip/local.whl",
+        ".cargo/registry/src/local.rs",
+        ".config/BraveSoftware/Brave-Browser/Default/Code Cache/js/cache",
+        "Projects/app/__pycache__/module.pyc",
+        "Games/SteamLibrary/steamapps/common/Game/game.exe",
+        FILE_IGNORE_NAME,
+    ] {
+        assert!(
+            !f.remote_file(path).exists(),
+            "excluded file uploaded: {path}"
+        );
+    }
+    for path in [
+        ".cache/pip/remote.whl",
+        ".var/app/org.mozilla.firefox/cache/remote-cache",
+        "Games/SteamLibrary/steamapps/common/RemoteGame/game.exe",
+    ] {
+        assert!(
+            !f.local.join(path).exists(),
+            "excluded file downloaded: {path}"
+        );
+    }
+    for path in [
+        ".local/share/app/database.sqlite",
+        ".config/google-chrome/Default/Bookmarks",
+        ".cargo/credentials.toml",
+        "Games/SteamLibrary/steamapps/compatdata/123/save.dat",
+        ".local/share/Steam/userdata/123/save.dat",
+        ".Private/document",
+    ] {
+        assert_eq!(f.read_remote(path), "keep");
+    }
+    f.assert_clean();
+    model::write_exclusions(f.local.to_str().unwrap(), "").unwrap();
+    f.pass();
+    assert_eq!(f.read_remote(".cache/pip/local.whl"), "cached");
+    assert_eq!(f.read_local(".cache/pip/remote.whl"), "remote cache/game");
+    assert_eq!(
+        f.read_remote("Games/SteamLibrary/steamapps/common/Game/game.exe"),
+        "downloadable"
+    );
+    assert_eq!(
+        f.read_local("Games/SteamLibrary/steamapps/common/RemoteGame/game.exe"),
+        "remote cache/game"
+    );
+    assert!(model::read_exclusions(f.local.to_str().unwrap()).is_empty());
+    f.assert_clean();
+}
+
+#[test]
 fn invalid_exclusions_pause_transfers() {
     let mut f = Fixture::new();
     fs::write(f.local.join(FILE_IGNORE_NAME), "[invalid").unwrap();

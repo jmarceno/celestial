@@ -1176,6 +1176,10 @@ fn add_dir(
         );
         return;
     }
+    if let Err(err) = super::exclusions::initialize(local_path) {
+        shared.dialog("error", tr::tr!("File/Folder Exclusions"), err);
+        return;
+    }
     if util::await_future(
         SyncDirsActiveModel {
             remote_id: ActiveValue::Set(db_remote.id),

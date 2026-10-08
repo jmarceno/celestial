@@ -454,8 +454,12 @@ static EXCLUSIONS: Mutex<Option<RulesCache>> = Mutex::new(None);
 pub fn read_exclusions(local_path: &str) -> Vec<String> {
     use std::os::unix::fs::MetadataExt;
     let path = Path::new(local_path).join(FILE_IGNORE_NAME);
-    let Ok(metadata) = fs::metadata(&path) else {
-        return Vec::new();
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return super::exclusions::defaults();
+        }
+        Err(_) => return Vec::new(),
     };
     let identity = (
         metadata.dev(),

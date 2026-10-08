@@ -6,6 +6,12 @@ Supported providers: Dropbox, Google Drive, Nextcloud, Owncloud, pCloud, Proton 
 
 Exclusions are stored in `.sync-exclude.lst` in each local folder.
 
+When that file is absent, Celestial creates an editable starting list excluding common caches and temporary data: XDG caches, browser/Electron caches, Flatpak/Snap caches, Cargo downloads, npm/Yarn/pnpm caches, Gradle caches, Python/tool caches, installed Steam games/caches/unfinished downloads, trash, and system runtime/temporary folders. Existing lists are kept exactly as they are; saving an empty list disables every optional exclusion. Removed rules are never added back to an existing list.
+
+Rules starting with `~/` refer to your home directory, `/` rules use absolute local paths, and other globs are relative to the selected folder. `*` in home/absolute rules covers one path component; `**` covers any depth. Relative globs retain their existing behavior (`*.tmp` also matches nested files). An excluded folder excludes its descendants on both sides. The rules file and Celestial's internal recovery folders remain protected.
+
+The defaults preserve `.local/bin`, application data/state in `.local/share` and `.local/state`, browser bookmarks/passwords/extensions, Cargo configuration/credentials/installed binaries, encrypted files in `.Private`, and Steam's `userdata` and Proton `compatdata`. Installed Steam games (`/**/steamapps/common`) are excluded across all libraries because they can be downloaded again; saves or local mods stored inside that installation directory are also excluded unless you remove the rule. Whole `.local`, browser profiles, Steam installations, virtual environments, source repositories and generic `build`/`target` folders are not excluded: they can contain irreplaceable data. Review the list before using a whole home directory as a synchronization root. Cache choices follow the [XDG specification](https://specifications.freedesktop.org/basedir/0.8/), [Cargo's documented layout](https://doc.rust-lang.org/cargo/guide/cargo-home.html), [Chromium's cache layout](https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md), [Firefox profiles](https://firefox-source-docs.mozilla.org/toolkit/profile/index.html), and [Gradle's cache layout](https://docs.gradle.org/current/userguide/directory_layout.html).
+
 ## Installation
 
 Build the portable executable following [BUILDING.md](BUILDING.md), then install it:
