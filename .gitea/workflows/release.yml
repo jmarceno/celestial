@@ -1,0 +1,65 @@
+name: release
+
+# MANUAL ONLY: start it from the Actions tab ("Run workflow") on the branch
+# to release. Never add push / tag / schedule / pull_request triggers.
+#
+# Everything else is automatic: the version (Cargo.toml when newer than every
+# release tag, otherwise the latest tag with the patch bumped), the portable
+# build on Ubuntu 22.04 (glibc 2.35), its smoke test, and the release with
+# tag v<version> on the dispatched commit. A commit that already has a
+# release tag is refused.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Plan version
+        id: plan
+        run: .gitea/scripts/release-plan.sh "$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)"
+
+      - name: Stamp version
+        run: .gitea/scripts/release-stamp-cargo.sh Cargo.toml Cargo.lock celestial "${{ steps.plan.outputs.version }}"
+
+      - name: Build portable bundle (Ubuntu 22.04)
+        run: |
+          set -euo pipefail
+          image=celestial-release-builder:22.04
+          docker build -t "$image" -f packaging/release/Containerfile packaging/release
+          .gitea/scripts/container-build.sh "$image" build/portable \
+            -v celestial-release-cargo:/opt/cargo/registry \
+            -v celestial-release-target:/workspace-target \
+            -v celestial-release-go:/root/go \
+            -e CARGO_TARGET_DIR=/workspace-target \
+            -e APP_VERSION="${{ steps.plan.outputs.version }}" \
+            -e CELESTIAL_PACKAGE_STAGED=1 \
+            -- bash -euo pipefail -c './scripts/build-native.sh --release --local && ./scripts/build-portable.sh'
+
+      - name: Smoke portable bundle
+        run: ./scripts/smoke-portable.sh build/portable/Celestial-${{ steps.plan.outputs.version }}-x86_64-portable.run
+
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/portable/Celestial-*-portable.run dist/
+          (cd dist && sha256sum ./*.run > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GITEA_API: ${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          RELEASE_SHA: ${{ gitea.sha }}
+        run: .gitea/scripts/release-publish.sh "${{ steps.plan.outputs.tag }}" "Celestial ${{ steps.plan.outputs.version }}" "${{ steps.plan.outputs.notes }}" dist

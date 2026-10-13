@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Remote build: copy back and stage the binary, desktop entry and icon.
+# --local compiles with this machine's cargo instead; only the release CI
+# container (.gitea/workflows/release.yml) uses it.
 #
 # Usage:
-#   ./scripts/build-native.sh [--debug|--release] [--stage <absolute-path>] [--features <feats>]
+#   ./scripts/build-native.sh [--debug|--release] [--local] [--stage <absolute-path>] [--features <feats>]
 set -euo pipefail
 
 PROJECT_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -14,13 +16,15 @@ APP=celestial
 BUILD_TYPE="debug"
 STAGE=""
 FEATURES=""
+LOCAL=0
 
 usage() {
   cat <<EOF
-Usage: $0 [--debug|--release] [--stage <absolute-path>] [--features <feats>]
+Usage: $0 [--debug|--release] [--local] [--stage <absolute-path>] [--features <feats>]
 
   --debug            Debug build (default)
   --release          Release build
+  --local            Compile with the local cargo (release CI container only)
   --stage <path>     Absolute stage directory (default: \$PROJECT_ROOT/build/stage)
   --features <feats> Extra cargo features
 EOF
@@ -30,6 +34,7 @@ while (($#)); do
   case "$1" in
     --debug) BUILD_TYPE="debug"; shift ;;
     --release) BUILD_TYPE="release"; shift ;;
+    --local) LOCAL=1; shift ;;
     --stage) STAGE="${2:?--stage needs a path}"; shift 2 ;;
     --stage=*) STAGE="${1#*=}"; shift ;;
     --features) FEATURES="${2:?--features needs a value}"; shift 2 ;;
@@ -46,10 +51,14 @@ echo "=== build-native ($BUILD_TYPE) -> $STAGE ==="
 CARGO_ARGS=(build --locked)
 [[ "$BUILD_TYPE" == "release" ]] && CARGO_ARGS+=(--release)
 [[ -n "$FEATURES" ]] && CARGO_ARGS+=(--features "$FEATURES")
-(cd "$PROJECT_ROOT" && cargo remote -h -- "${CARGO_ARGS[@]}")
-
-# cargo remote copies back only the finished executable.
-TARGET_DIR="$PROJECT_ROOT/target"
+if [[ "$LOCAL" -eq 1 ]]; then
+  (cd "$PROJECT_ROOT" && cargo "${CARGO_ARGS[@]}")
+  TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+else
+  (cd "$PROJECT_ROOT" && cargo remote -h -- "${CARGO_ARGS[@]}")
+  # cargo remote copies back only the finished executable.
+  TARGET_DIR="$PROJECT_ROOT/target"
+fi
 BIN="$TARGET_DIR/$BUILD_TYPE/$APP"
 [[ -x "$BIN" ]] || { echo "error: binary missing: $BIN" >&2; exit 1; }
 
