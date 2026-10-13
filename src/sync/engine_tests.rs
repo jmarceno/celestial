@@ -4,6 +4,7 @@ use crate::entities::{RemotesActiveModel, SyncItemsActiveModel};
 use crate::sync::model::FILE_IGNORE_NAME;
 use crate::sync::recovery;
 use crate::sync::testing::{Fixture, TestHooks, permissions_apply, set_time};
+use sea_orm::Database;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
@@ -2505,4 +2506,30 @@ fn one_failed_parallel_copy_leaves_the_others_synchronized() {
     f.pass();
     f.assert_no_errors();
     assert_eq!(f.read_remote("3.txt"), "3");
+}
+
+#[test]
+fn copies_commit_their_outcome_once() {
+    let mut f = Fixture::new();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(f.local.join(name), name).unwrap();
+    }
+    f.pass();
+    f.assert_no_errors();
+    // New files have nothing to undo after an interruption: no journal.
+    let journaled = store::query(&f.db, "SELECT COUNT(*) AS n FROM operations", vec![]).unwrap();
+    assert_eq!(journaled[0].try_get::<i64>("", "n").unwrap(), 0);
+    let recent = store::recent_activity(&f.db, f.dir.id, 10).unwrap();
+    assert_eq!(recent.len(), 3);
+    // A download is journaled once, at the staged step, and closed.
+    fs::write(f.remote_file("d.txt"), "remote").unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_local("d.txt"), "remote");
+    let states = store::query(&f.db, "SELECT state FROM operations", vec![]).unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(
+        states[0].try_get::<String>("", "state").unwrap(),
+        "complete"
+    );
 }

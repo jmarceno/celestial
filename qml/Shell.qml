@@ -317,16 +317,18 @@ ApplicationWindow {
                     clip: true
                     spacing: 4
                     boundsBehavior: Flickable.StopAtBounds
-                    model: root.remotes()
+                    model: root.remotes().length
                     ScrollBar.vertical: VScrollBar { theme: root.theme }
                     delegate: SidebarItem {
-                        required property var modelData
+                        required property int index
+                        // Counted, not a list: an update keeps the items instead of recreating them
+                        readonly property var entry: root.remotes()[index] || ({})
                         theme: root.theme
-                        text: modelData.name
-                        selected: modelData.name === root.selectedName
+                        text: entry.name
+                        selected: entry.name === root.selectedName
                         width: serverList.width - (serverList.ScrollBar.vertical.visible ? 10 : 0)
                         onClicked: {
-                            root.selectedName = modelData.name
+                            root.selectedName = entry.name
                             root.detail = null
                         }
                     }
@@ -419,11 +421,12 @@ ApplicationWindow {
                         width: dirFlick.width - (dirFlick.ScrollBar.vertical.visible ? 14 : 0)
                         spacing: 8
                         Repeater {
-                            model: root.selectedRemote() ? root.selectedRemote().dirs : []
+                            model: (root.selectedRemote() ? root.selectedRemote().dirs : []).length
                             Rectangle {
                                 id: dirCard
-                                required property var modelData
-                                property var live: root.progressFor(root.selectedName, modelData)
+                                required property int index
+                                readonly property var entry: (root.selectedRemote() ? root.selectedRemote().dirs : [])[index] || ({})
+                                property var live: root.progressFor(root.selectedName, entry)
                                 width: dirCol.width
                                 height: live ? 112 : 72
                                 radius: root.theme.radius
@@ -438,21 +441,21 @@ ApplicationWindow {
                                         width: 10
                                         height: 10
                                         radius: 5
-                                        color: root.phaseColor(modelData.phase)
+                                        color: root.phaseColor(entry.phase)
                                     }
                                     ColumnLayout {
                                         Layout.fillWidth: true
                                         spacing: 2
                                         Label {
-                                            text: modelData.localDisplay + "   →   " + modelData.remoteDisplay
+                                            text: entry.localDisplay + "   →   " + entry.remoteDisplay
                                             color: root.theme.textPrimary
                                             font.pixelSize: 13
                                             elide: Text.ElideMiddle
                                             Layout.fillWidth: true
                                         }
                                         Label {
-                                            text: (modelData.errorStatus ? modelData.errorStatus + " " : "") + (modelData.status || "")
-                                            color: modelData.errorStatus ? root.theme.danger : root.theme.textMuted
+                                            text: (entry.errorStatus ? entry.errorStatus + " " : "") + (entry.status || "")
+                                            color: entry.errorStatus ? root.theme.danger : root.theme.textMuted
                                             font.pixelSize: 12
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
@@ -471,8 +474,8 @@ ApplicationWindow {
                                     anchors.fill: parent
                                     cursorShape: Qt.PointingHandCursor
                                     onClicked: {
-                                        root.detail = modelData
-                                        exclusionArea.text = (modelData.exclusions || []).join("\n")
+                                        root.detail = entry
+                                        exclusionArea.text = (entry.exclusions || []).join("\n")
                                         detailFlick.contentY = 0
                                     }
                                 }
@@ -556,13 +559,14 @@ ApplicationWindow {
                         visible: root.detail && root.detail.recent && root.detail.recent.length > 0
                     }
                     Repeater {
-                        model: root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : []
+                        model: (root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : []).length
                         RecentItem {
-                            required property var modelData
-                            item: modelData
+                            required property int index
+                            readonly property var entry: (root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : [])[index] || ({})
+                            item: entry
                             theme: root.theme
-                            when: root.ago(modelData.at, root.clock)
-                            glyph: root.actionGlyph(modelData.action)
+                            when: root.ago(entry.at, root.clock)
+                            glyph: root.actionGlyph(entry.action)
                             Layout.fillWidth: true
                         }
                     }
@@ -574,9 +578,10 @@ ApplicationWindow {
                         visible: root.detail && root.detail.errors && root.detail.errors.length > 0
                     }
                     Repeater {
-                        model: root.detail && root.detail.errors ? root.detail.errors : []
+                        model: (root.detail && root.detail.errors ? root.detail.errors : []).length
                         Rectangle {
-                            required property var modelData
+                            required property int index
+                            readonly property var entry: (root.detail && root.detail.errors ? root.detail.errors : [])[index] || ({})
                             Layout.fillWidth: true
                             implicitHeight: errorCol.implicitHeight + 20
                             radius: root.theme.radiusSm
@@ -589,13 +594,13 @@ ApplicationWindow {
                                 anchors.top: parent.top
                                 anchors.margins: 10
                                 spacing: 2
-                                Label { text: modelData.title; color: root.theme.textPrimary; font.pixelSize: 13; wrapMode: Text.WordWrap; width: errorCol.width }
-                                Label { text: modelData.detail; color: root.theme.textMuted; font.pixelSize: 12; visible: modelData.detail && modelData.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
+                                Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 13; wrapMode: Text.WordWrap; width: errorCol.width }
+                                Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 12; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
                             }
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: root.controller.activateError(root.selectedName, root.detail.localPath, root.detail.remotePath, modelData.id)
+                                onClicked: root.controller.activateError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
                             }
                         }
                     }
@@ -607,9 +612,10 @@ ApplicationWindow {
                         visible: root.detail && root.detail.recovery && root.detail.recovery.length > 0
                     }
                     Repeater {
-                        model: root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : []
+                        model: (root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : []).length
                         Rectangle {
-                            required property var modelData
+                            required property int index
+                            readonly property var entry: (root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : [])[index] || ({})
                             Layout.fillWidth: true
                             implicitHeight: recoveryRow.implicitHeight + 16
                             radius: root.theme.radiusSm
@@ -625,15 +631,15 @@ ApplicationWindow {
                                 Column {
                                     Layout.fillWidth: true
                                     spacing: 2
-                                    Label { text: modelData.rel + " (" + modelData.side + ")"; color: root.theme.textPrimary; font.pixelSize: 13; elide: Text.ElideMiddle; width: parent.width }
-                                    Label { text: modelData.reason + " · " + modelData.when; color: root.theme.textMuted; font.pixelSize: 12; elide: Text.ElideRight; width: parent.width }
+                                    Label { text: entry.rel + " (" + entry.side + ")"; color: root.theme.textPrimary; font.pixelSize: 13; elide: Text.ElideMiddle; width: parent.width }
+                                    Label { text: entry.reason + " · " + entry.when; color: root.theme.textMuted; font.pixelSize: 12; elide: Text.ElideRight; width: parent.width }
                                 }
                                 Button {
                                     text: "Restore"
                                     flat: true
                                     contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
                                     background: Rectangle { color: "transparent" }
-                                    onClicked: root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, modelData.id)
+                                    onClicked: root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
                                 }
                             }
                         }

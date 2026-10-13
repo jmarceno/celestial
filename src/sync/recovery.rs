@@ -272,6 +272,19 @@ impl Store<'_> {
 
     /// Record an operation before it changes anything.
     pub fn begin(&self, op: &str, rel: &str, action: &str, payload: Value) -> Result<(), String> {
+        self.begin_at(op, rel, action, "planned", payload)
+    }
+
+    /// Open the journal entry of an operation directly at `state`, for one
+    /// whose earlier steps leave nothing to recover.
+    pub fn begin_at(
+        &self,
+        op: &str,
+        rel: &str,
+        action: &str,
+        state: &str,
+        payload: Value,
+    ) -> Result<(), String> {
         store::insert_operation(
             self.db,
             &store::Operation {
@@ -280,7 +293,7 @@ impl Store<'_> {
                 pair_uuid: self.internal.pair_uuid.clone(),
                 rel: rel.to_owned(),
                 action: action.to_owned(),
-                state: "planned".into(),
+                state: state.into(),
                 payload,
             },
         )
@@ -292,8 +305,14 @@ impl Store<'_> {
             .map_err(|err| format!("Could not record the operation: {err}"))
     }
 
+    /// Close the journal entry. This records the outcome, so it commits with
+    /// the rest of it (see [`store::outcome`]).
     pub fn finish(&self, op: &str) -> Result<(), String> {
-        self.step(op, "complete", None)
+        let op = op.to_owned();
+        store::outcome(self.db, move |tx| {
+            store::update_operation(tx, &op, "complete", None, None)
+        })
+        .map_err(|err| format!("Could not record the operation: {err}"))
     }
 
     /// Mark an operation that stopped before changing anything durable.

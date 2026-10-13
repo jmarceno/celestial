@@ -8,7 +8,11 @@ use super::capabilities::Capabilities;
 use super::observe::{Fingerprint, LocalMeta, Stamp};
 use crate::entities::SyncDirsModel;
 use crate::util;
-use sea_orm::{ConnectionTrait, DbBackend, DbErr, QueryResult, Statement, Value};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, QueryResult,
+    Statement, TransactionTrait, Value,
+};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 pub fn now() -> i64 {
@@ -42,6 +46,77 @@ fn to_db(value: u64) -> i64 {
 
 fn from_db(value: i64) -> u64 {
     u64::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// Open the database on a single connection. SQLite has one writer: with a
+/// pool, the copy threads wait for each other in SQLite's busy handler,
+/// which sleeps for growing intervals, instead of in the pool's queue. No
+/// code path holds a transaction while it uses the connection outside it.
+pub fn connect(path: &std::path::Path) -> Result<DatabaseConnection, String> {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .busy_timeout(std::time::Duration::from_secs(30));
+    let pool = util::await_future(
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
+}
+
+/// A write that records how an item ended, run inside the transaction
+/// that settles the item.
+pub type OutcomeWrite = Box<dyn FnOnce(&DatabaseTransaction) -> Result<(), DbErr> + Send>;
+
+thread_local! {
+    static OUTCOME: RefCell<Option<Vec<OutcomeWrite>>> = const { RefCell::new(None) };
+}
+
+/// Run `f`, keeping the outcome writes it makes instead of committing them.
+/// The journal entry an operation writes before it changes anything is not
+/// an outcome write: it is committed at once.
+pub fn collecting_outcome<T>(f: impl FnOnce() -> T) -> (T, Vec<OutcomeWrite>) {
+    OUTCOME.with(|outcome| *outcome.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let writes = OUTCOME.with(|outcome| outcome.borrow_mut().take().unwrap_or_default());
+    (result, writes)
+}
+
+/// Record an outcome: kept when [`collecting_outcome`] is running on this
+/// thread, otherwise committed now in its own transaction.
+pub fn outcome(
+    db: &DatabaseConnection,
+    write: impl FnOnce(&DatabaseTransaction) -> Result<(), DbErr> + Send + 'static,
+) -> Result<(), DbErr> {
+    let write: OutcomeWrite = Box::new(write);
+    let write = OUTCOME.with(|outcome| match outcome.borrow_mut().as_mut() {
+        Some(kept) => {
+            kept.push(write);
+            None
+        }
+        None => Some(write),
+    });
+    match write {
+        Some(write) => in_transaction(db, |tx| write(tx)),
+        None => Ok(()),
+    }
+}
+
+/// Run `f` in one transaction, committed when it succeeds.
+pub fn in_transaction<T>(
+    db: &DatabaseConnection,
+    f: impl FnOnce(&DatabaseTransaction) -> Result<T, DbErr>,
+) -> Result<T, DbErr> {
+    let tx = util::await_future(db.begin())?;
+    let value = f(&tx)?;
+    util::await_future(tx.commit())?;
+    Ok(value)
 }
 
 /// Use write-ahead logging: a commit then syncs one file once instead of

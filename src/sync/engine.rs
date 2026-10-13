@@ -15,7 +15,7 @@ use crate::{
     rclone::{self, RcloneListFilter},
     util,
 };
-use sea_orm::{ActiveValue, Database, DatabaseConnection, Statement, entity::prelude::*};
+use sea_orm::{ActiveValue, DatabaseConnection, Statement, entity::prelude::*};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde_json::json;
 use std::{
@@ -124,7 +124,7 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         File::create(&db_path)
             .map_err(|err| tr::tr!("Unable to create Celestial's database file [{}].", err))?;
     }
-    let db = util::await_future(Database::connect(format!("sqlite://{}", db_path.display())))
+    let db = store::connect(&db_path)
         .map_err(|err| tr::tr!("Unable to connect to database [{}].", err))?;
     store::use_wal(&db);
     backup_before_migration(&db, &db_path)?;
@@ -403,6 +403,24 @@ fn sync_pair(
     if let Ok(Some((name, _))) = store::internal_dir(db, id) {
         watcher.ignore_internal(id, Path::new(&sync_dir.local_path).join(name));
     }
+    // A full scan lists the folders it included: watch exactly those.
+    if let (
+        true,
+        Ok(pass::Report {
+            local_tree: Some(tree),
+            ..
+        }),
+    ) = (full_scan, &result)
+    {
+        let root = Path::new(&sync_dir.local_path);
+        let folders = tree
+            .items
+            .iter()
+            .filter(|(_, meta)| meta.is_dir)
+            .map(|(rel, _)| root.join(rel))
+            .collect();
+        watcher.watch_folders(id, root, folders);
+    }
     match result {
         Err(message) => {
             tracing::warn!(pair = %sync_dir.local_path, "pass stopped: {message}");
@@ -552,7 +570,11 @@ impl pass::Hooks for WorkerHooks<'_> {
     }
 
     fn plan(&mut self, plan: &super::progress::Plan) {
-        tracing::debug!(pair = %self.sync_dir.local_path, ?plan, "pass plan");
+        if plan.files() > 0 || plan.removals > 0 {
+            tracing::info!(pair = %self.sync_dir.local_path, ?plan, "pass plan");
+        } else {
+            tracing::debug!(pair = %self.sync_dir.local_path, ?plan, "pass plan");
+        }
         self.shared.progress.start(
             self.sync_dir.id,
             self.remote_name,

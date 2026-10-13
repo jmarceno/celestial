@@ -1,5 +1,10 @@
 //! Local change hints from inotify, through the `notify` crate.
 //!
+//! Each pair's root and every folder its last full scan included are
+//! watched one by one, so excluded folders (caches, build output) cost no
+//! watches and no events. A new folder is reported by its parent; the scan
+//! that follows includes it and it is watched from then on.
+//!
 //! Events never decide what to synchronize. They only tell the worker that a
 //! pair's local tree may have changed, so an idle pair can skip the full local
 //! scan. Whenever the hints could be incomplete (no watcher, an overflowed
@@ -74,6 +79,13 @@ pub struct LocalWatcher {
     hints: Arc<Mutex<Hints>>,
     /// Watched roots and the (device, inode) they had when the watch began.
     watches: HashMap<PathBuf, (u64, u64)>,
+    /// The folders below its root that each pair watches.
+    folders: HashMap<i32, (PathBuf, HashSet<PathBuf>)>,
+    /// How many roots and pair folders use each inotify watch: nested
+    /// pairs and pairs sharing a root watch the same folders.
+    users: HashMap<PathBuf, usize>,
+    /// Pairs whose folders could not all be watched (the watch limit).
+    incomplete: HashSet<i32>,
     retry_after: HashMap<PathBuf, Instant>,
     broken_since: Option<Instant>,
 }
@@ -95,6 +107,9 @@ impl LocalWatcher {
             watcher,
             hints,
             watches: HashMap::new(),
+            folders: HashMap::new(),
+            users: HashMap::new(),
+            incomplete: HashSet::new(),
             retry_after: HashMap::new(),
             broken_since: None,
         }
@@ -122,6 +137,15 @@ impl LocalWatcher {
                     pair.verified_at = None;
                 }
             }
+        }
+        let gone: Vec<i32> = self
+            .folders
+            .keys()
+            .filter(|id| !pairs.iter().any(|(pair, _)| pair == *id))
+            .copied()
+            .collect();
+        for id in gone {
+            self.forget_folders(id);
         }
         let wanted: HashSet<&PathBuf> = pairs.iter().map(|(_, root)| root).collect();
         let unwanted: Vec<PathBuf> = self
@@ -168,6 +192,7 @@ impl LocalWatcher {
         };
         let unchanged = watching
             && !broken
+            && !self.incomplete.contains(&id)
             && !pair.dirty
             && pair
                 .verified_at
@@ -220,7 +245,7 @@ impl LocalWatcher {
         let Some(identity) = identity_of(root) else {
             return;
         };
-        match watcher.watch(root, RecursiveMode::Recursive) {
+        match add_watch(watcher, &mut self.users, root) {
             Ok(()) => {
                 self.watches.insert(root.clone(), identity);
                 self.retry_after.remove(root);
@@ -234,7 +259,6 @@ impl LocalWatcher {
                 }
             }
             Err(err) => {
-                let _ = watcher.unwatch(root);
                 tracing::warn!(root = %root.display(), "could not watch sync folder; scanning instead: {err}");
                 self.retry_after.insert(root.clone(), now + RETRY_INTERVAL);
             }
@@ -249,9 +273,92 @@ impl LocalWatcher {
     }
 
     fn unwatch(&mut self, root: &Path) {
-        self.watches.remove(root);
+        if self.watches.remove(root).is_none() {
+            return;
+        }
+        let ids: Vec<i32> = self
+            .folders
+            .iter()
+            .filter(|(_, (folders_root, _))| folders_root == root)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.forget_folders(id);
+        }
         if let Some(watcher) = self.watcher.as_mut() {
-            let _ = watcher.unwatch(root);
+            remove_watch(watcher, &mut self.users, root);
+        }
+    }
+
+    /// Watch exactly `folders` (the folders a full scan of the pair
+    /// included) below its watched root. Events in a newly watched folder
+    /// may have been missed between the scan and the watch, so adding one
+    /// requires another scan; it finds the same folders and settles.
+    pub fn watch_folders(&mut self, id: i32, root: &Path, folders: Vec<PathBuf>) {
+        if !self.watches.contains_key(root) {
+            return;
+        }
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        let wanted: HashSet<PathBuf> = folders.into_iter().filter(|dir| dir != root).collect();
+        let mut current = match self.folders.remove(&id) {
+            Some((watched_root, current)) if watched_root == root => current,
+            Some((_, old)) => {
+                for dir in &old {
+                    remove_watch(watcher, &mut self.users, dir);
+                }
+                HashSet::new()
+            }
+            None => HashSet::new(),
+        };
+        for dir in current.difference(&wanted).cloned().collect::<Vec<_>>() {
+            remove_watch(watcher, &mut self.users, &dir);
+            current.remove(&dir);
+        }
+        let mut added = false;
+        let mut complete = true;
+        for dir in wanted {
+            if current.contains(&dir) {
+                continue;
+            }
+            match add_watch(watcher, &mut self.users, &dir) {
+                Ok(()) => {
+                    current.insert(dir);
+                    added = true;
+                }
+                Err(err) if matches!(err.kind, notify::ErrorKind::MaxFilesWatch) => {
+                    tracing::warn!(root = %root.display(), watched = current.len(), "inotify watch limit reached; scanning instead");
+                    complete = false;
+                    break;
+                }
+                // Unreadable or already gone: the scan reports it.
+                Err(err) => tracing::debug!(dir = %dir.display(), "folder not watched: {err}"),
+            }
+        }
+        self.folders.insert(id, (root.to_path_buf(), current));
+        if complete {
+            self.incomplete.remove(&id);
+        } else {
+            self.incomplete.insert(id);
+        }
+        if added {
+            if let Some(pair) = lock(&self.hints).pairs.get_mut(&id) {
+                pair.dirty = true;
+                pair.verified_at = None;
+            }
+        }
+    }
+
+    fn forget_folders(&mut self, id: i32) {
+        self.incomplete.remove(&id);
+        let Some((_, folders)) = self.folders.remove(&id) else {
+            return;
+        };
+        if let Some(watcher) = self.watcher.as_mut() {
+            for dir in &folders {
+                remove_watch(watcher, &mut self.users, dir);
+            }
         }
     }
 
@@ -267,12 +374,41 @@ impl LocalWatcher {
         }
         self.watcher = None;
         self.watches.clear();
+        self.folders.clear();
+        self.users.clear();
+        self.incomplete.clear();
         self.retry_after.clear();
         self.broken_since = None;
         self.watcher = new_watcher(&self.hints);
         let mut hints = lock(&self.hints);
         hints.broken = self.watcher.is_none();
         hints.mark_all();
+    }
+}
+
+fn add_watch(
+    watcher: &mut RecommendedWatcher,
+    users: &mut HashMap<PathBuf, usize>,
+    dir: &Path,
+) -> notify::Result<()> {
+    if let Some(count) = users.get_mut(dir) {
+        *count += 1;
+        return Ok(());
+    }
+    watcher.watch(dir, RecursiveMode::NonRecursive)?;
+    users.insert(dir.to_path_buf(), 1);
+    Ok(())
+}
+
+fn remove_watch(watcher: &mut RecommendedWatcher, users: &mut HashMap<PathBuf, usize>, dir: &Path) {
+    let Some(count) = users.get_mut(dir) else {
+        return;
+    };
+    *count -= 1;
+    if *count == 0 {
+        users.remove(dir);
+        // A removed folder's watch is already gone.
+        let _ = watcher.unwatch(dir);
     }
 }
 
@@ -385,13 +521,37 @@ mod tests {
     use super::*;
     use std::{fs, thread};
 
-    fn watched(root: &Path) -> LocalWatcher {
+    /// Every folder below `root`, as a full scan would include them.
+    fn folders_of(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    found.push(path.clone());
+                    pending.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// A pair whose scan included `folders`, verified and quiet.
+    fn watched_with(root: &Path, folders: Vec<PathBuf>) -> LocalWatcher {
         let mut watcher = LocalWatcher::new();
         watcher.sync_pairs(&[(1, root.to_path_buf())]);
         assert!(!watcher.local_unchanged(1, root), "first check must scan");
+        watcher.watch_folders(1, root, folders);
+        // Newly watched folders require one more scan.
+        assert!(!watcher.local_unchanged(1, root));
         watcher.mark_verified(1);
         assert!(watcher.local_unchanged(1, root));
         watcher
+    }
+
+    fn watched(root: &Path) -> LocalWatcher {
+        watched_with(root, folders_of(root))
     }
 
     fn wait_for_change(watcher: &mut LocalWatcher, root: &Path) -> bool {
@@ -422,10 +582,63 @@ mod tests {
         fs::create_dir(temp.path().join("new")).unwrap();
         assert!(wait_for_change(&mut watcher, temp.path()));
         thread::sleep(Duration::from_millis(200));
+        // The scan that follows includes the new folder.
+        watcher.watch_folders(1, temp.path(), folders_of(temp.path()));
         watcher.local_unchanged(1, temp.path());
         watcher.mark_verified(1);
         fs::write(temp.path().join("new/file.txt"), "edit").unwrap();
         assert!(wait_for_change(&mut watcher, temp.path()));
+    }
+
+    #[test]
+    fn excluded_folders_are_not_watched() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("kept/inner")).unwrap();
+        fs::create_dir_all(temp.path().join("cache/deep")).unwrap();
+        let included = vec![temp.path().join("kept"), temp.path().join("kept/inner")];
+        let mut watcher = watched_with(temp.path(), included);
+        assert_eq!(watcher.users.len(), 3, "the root and the two kept folders");
+        fs::write(temp.path().join("cache/deep/file"), "x").unwrap();
+        fs::write(temp.path().join("cache/file"), "x").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(watcher.local_unchanged(1, temp.path()));
+        fs::write(temp.path().join("kept/inner/file"), "x").unwrap();
+        assert!(wait_for_change(&mut watcher, temp.path()));
+        // A folder the next scan no longer includes is no longer watched.
+        watcher.watch_folders(1, temp.path(), vec![temp.path().join("kept")]);
+        assert_eq!(watcher.users.len(), 2);
+    }
+
+    #[test]
+    fn unreadable_folders_do_not_stop_the_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let locked = temp.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::create_dir(temp.path().join("open")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // The scan lists the unreadable folder too; its watch fails alone.
+        let mut watcher = watched_with(temp.path(), vec![locked.clone(), temp.path().join("open")]);
+        fs::write(temp.path().join("open/file"), "x").unwrap();
+        assert!(wait_for_change(&mut watcher, temp.path()));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn nested_pairs_share_watches() {
+        let temp = tempfile::tempdir().unwrap();
+        let inner = temp.path().join("inner");
+        fs::create_dir_all(inner.join("deep")).unwrap();
+        let mut watcher = LocalWatcher::new();
+        watcher.sync_pairs(&[(1, temp.path().to_path_buf()), (2, inner.clone())]);
+        watcher.watch_folders(1, temp.path(), folders_of(temp.path()));
+        watcher.watch_folders(2, &inner, folders_of(&inner));
+        assert_eq!(watcher.users.len(), 3);
+        assert_eq!(watcher.users[&inner.join("deep")], 2);
+        // Removing the outer pair keeps the inner pair's watches.
+        watcher.sync_pairs(&[(2, inner.clone())]);
+        assert_eq!(watcher.users.len(), 2);
+        assert_eq!(watcher.users[&inner.join("deep")], 1);
     }
 
     #[test]

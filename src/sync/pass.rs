@@ -670,14 +670,22 @@ pub fn run(
             }
             let decision = match &entry.decision {
                 Decision::Retry(reason) => {
-                    settle(pair, hooks, &mut report, entry, None, Err(reason.clone()))?;
+                    settle(
+                        pair,
+                        hooks,
+                        &mut report,
+                        entry,
+                        None,
+                        Err(reason.clone()),
+                        Vec::new(),
+                    )?;
                     continue;
                 }
                 Decision::InSync
                 | Decision::Nothing
                 | Decision::DeleteLocal
                 | Decision::DeleteRemote => {
-                    settle(pair, hooks, &mut report, entry, None, Ok(false))?;
+                    settle(pair, hooks, &mut report, entry, None, Ok(false), Vec::new())?;
                     continue;
                 }
                 decision => decision,
@@ -703,14 +711,28 @@ pub fn run(
                     // A panic is handed to the pass, which stops like it
                     // would if the copy ran on its own thread.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute(cx, entry, decision)
+                        store::collecting_outcome(|| execute(cx, entry, decision))
                     }));
                     let _ = done.send((index, result));
                 });
                 copies.in_flight += 1;
             } else {
-                let result = execute(cx, entry, decision).map(|()| true);
-                settle(pair, hooks, &mut report, entry, transfer, result)?;
+                // Only a plain copy keeps its outcome for the settling
+                // transaction: other steps read back what they recorded.
+                let (result, outcome) = if plain_copy(entry) {
+                    store::collecting_outcome(|| execute(cx, entry, decision))
+                } else {
+                    (execute(cx, entry, decision), Vec::new())
+                };
+                settle(
+                    pair,
+                    hooks,
+                    &mut report,
+                    entry,
+                    transfer,
+                    result.map(|()| true),
+                    outcome,
+                )?;
             }
         }
         copies.wait_until(0, pair, &entries, hooks, &mut report)?;
@@ -795,7 +817,10 @@ pub fn run(
 }
 
 /// How the copy of entry `.0` ended, or why it panicked.
-type CopyEnd = (usize, std::thread::Result<Result<(), String>>);
+type CopyEnd = (
+    usize,
+    std::thread::Result<(Result<(), String>, Vec<store::OutcomeWrite>)>,
+);
 
 /// File copies running on other threads.
 struct Copies {
@@ -818,7 +843,8 @@ impl Copies {
             let (index, result) = self.done.recv().map_err(|err| err.to_string())?;
             self.in_flight -= 1;
             // Nothing is recorded for a copy that panicked, as after a crash.
-            let result = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            let (result, outcome) =
+                result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
             let entry = &entries[index];
             settle(
                 pair,
@@ -827,6 +853,7 @@ impl Copies {
                 entry,
                 transfer_of(entry),
                 result.map(|()| true),
+                outcome,
             )?;
         }
         Ok(())
@@ -839,8 +866,9 @@ fn plain_copy(entry: &Entry) -> bool {
     matches!(entry.decision, Decision::Upload | Decision::Download)
 }
 
-/// Record how an item ended: its transfer, the recent change, and its
-/// state (synced, or retried later).
+/// Record how an item ended in one transaction: what its operation kept
+/// for the end (`outcome`), the recent change, and its state (synced, or
+/// retried later).
 fn settle(
     pair: &Pair,
     hooks: &mut dyn Hooks,
@@ -848,20 +876,41 @@ fn settle(
     entry: &Entry,
     transfer: Option<Transfer>,
     result: Result<bool, String>,
+    outcome: Vec<store::OutcomeWrite>,
 ) -> Result<(), String> {
+    let activity = match (&transfer, &result) {
+        (Some(_), Ok(_)) => activity_of(entry),
+        _ => None,
+    };
+    if let Err(reason) = &result {
+        tracing::info!(rel = entry.rel, "will retry: {reason}");
+    }
+    let committed = store::in_transaction(pair.db, |tx| {
+        for write in outcome {
+            write(tx)?;
+        }
+        if let Some(activity) = &activity {
+            // Failing to list a recent change does not fail the item.
+            if let Err(err) = store::insert_activity(tx, pair.dir.id, activity) {
+                tracing::warn!("could not record a recent change: {err}");
+            }
+        }
+        match &result {
+            Ok(_) => store::clear_item_state(tx, pair.dir.id, &entry.rel),
+            Err(reason) => store::set_retrying(tx, pair.dir.id, &entry.rel, reason).map(|_| ()),
+        }
+    });
     if let Some(transfer) = transfer {
         hooks.item_finished(&entry.rel, transfer.files(), transfer.bytes());
-        if result.is_ok() {
-            note_activity(pair, hooks, entry);
-        }
     }
-    match result {
-        Ok(acted) => {
-            report.actions += usize::from(acted);
-            store::clear_item_state(pair.db, pair.dir.id, &entry.rel).map_err(|err| err.to_string())
-        }
-        Err(reason) => retry(pair, &entry.rel, &reason),
+    committed.map_err(|err| err.to_string())?;
+    if let Some(activity) = &activity {
+        hooks.activity(activity);
     }
+    if let Ok(acted) = result {
+        report.actions += usize::from(acted);
+    }
+    Ok(())
 }
 
 /// The file transfers an entry's decision makes.
@@ -940,11 +989,22 @@ fn plan_of(entries: &[Entry]) -> Plan {
 /// Record a synchronized file in the recent changes. Failing to record it
 /// does not fail the item.
 fn note_activity(pair: &Pair, hooks: &mut dyn Hooks, entry: &Entry) {
+    let Some(activity) = activity_of(entry) else {
+        return;
+    };
+    if let Err(err) = store::insert_activity(pair.db, pair.dir.id, &activity) {
+        tracing::warn!("could not record a recent change: {err}");
+    }
+    hooks.activity(&activity);
+}
+
+/// The recent change an entry makes, if it is listed.
+fn activity_of(entry: &Entry) -> Option<store::Activity> {
     let local = entry.local.present().filter(|meta| !meta.is_dir);
     let remote = entry.remote.present().filter(|meta| !meta.is_dir);
     let local_size = |meta: &LocalMeta| i64::try_from(meta.size).unwrap_or(i64::MAX);
     let (action, size) = match entry.decision {
-        _ if entry.prune => return,
+        _ if entry.prune => return None,
         Decision::Upload | Decision::RestoreToRemote => ("uploaded", local.map(local_size)),
         Decision::Download | Decision::RestoreToLocal => {
             ("downloaded", remote.map(|meta| meta.size))
@@ -954,22 +1014,15 @@ fn note_activity(pair: &Pair, hooks: &mut dyn Hooks, entry: &Entry) {
         Decision::KeepBoth(ConflictKind::EditEdit | ConflictKind::Bootstrap) => {
             ("conflict", local.map(local_size))
         }
-        _ => return,
+        _ => return None,
     };
     // Folders are not listed.
-    let Some(size) = size else {
-        return;
-    };
-    let activity = store::Activity {
+    Some(store::Activity {
         rel: entry.rel.clone(),
         action: action.into(),
-        size,
+        size: size?,
         finished_at: store::now(),
-    };
-    if let Err(err) = store::insert_activity(pair.db, pair.dir.id, &activity) {
-        tracing::warn!("could not record a recent change: {err}");
-    }
-    hooks.activity(&activity);
+    })
 }
 
 /// `(old, new)` when a collision group is one synchronized file whose name
@@ -1339,12 +1392,18 @@ fn upload(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
         .preferred_hash()
         .is_none()
         .then(|| rec.staging_rel(&op));
-    rec.begin(
-        &op,
-        &entry.rel,
-        "upload",
-        serde_json::json!({ "remote": destination, "snapshot": snapshot }),
-    )?;
+    // Only a replacement has something to undo after an interruption: the
+    // previous remote version it moves aside. A new file's snapshot is in
+    // staging, which the next start empties.
+    let journaled = replaced.is_some();
+    if journaled {
+        rec.begin(
+            &op,
+            &entry.rel,
+            "upload",
+            serde_json::json!({ "remote": destination, "snapshot": snapshot }),
+        )?;
+    }
     let result = upload_steps(
         cx,
         entry,
@@ -1358,9 +1417,12 @@ fn upload(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
         let _ = cx.root.unlink(snapshot);
     }
     match result {
-        Ok(()) => rec.finish(&op),
+        Ok(()) if journaled => rec.finish(&op),
+        Ok(()) => Ok(()),
         Err(err) => {
-            rec.abandon(&op, &err);
+            if journaled {
+                rec.abandon(&op, &err);
+            }
             Err(err)
         }
     }
@@ -1477,12 +1539,8 @@ fn download(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), String> {
     let op = recovery::random_id();
     let rec = cx.rec();
     let stage = rec.staging_rel(&op);
-    rec.begin(
-        &op,
-        &entry.rel,
-        "download",
-        serde_json::json!({ "stage": stage }),
-    )?;
+    // The journal entry is opened once the download is staged: until then
+    // only the staging folder changed, and the next start empties it.
     let committed = Cell::new(false);
     match download_steps(cx, entry, remote, replaced, &op, &stage, &committed) {
         Ok(()) => rec.finish(&op),
@@ -1517,10 +1575,12 @@ fn download_steps(
         .stat_local(stage)?
         .ok_or_else(|| tr::tr!("The downloaded file disappeared."))?;
     cx.root.sync_file(stage).map_err(|err| err.to_string())?;
-    cx.rec().step(
+    cx.rec().begin_at(
         op,
+        &entry.rel,
+        "download",
         "staged",
-        Some(&serde_json::json!({ "stage": stage, "stageInode": staged.inode })),
+        serde_json::json!({ "stage": stage, "stageInode": staged.inode }),
     )?;
     failpoint::hit("download:staged");
     if pair.stat_remote(&entry.rel)?.as_ref() != Some(remote) {
@@ -1878,24 +1938,24 @@ fn save(
             None => Some(pair.hash_local(rel, pair.algo())?),
         }
     };
-    let generation = store::next_generation(pair.db, pair.dir.id).map_err(|err| err.to_string())?;
-    store::save_baseline(
-        pair.db,
-        pair.dir,
-        rel,
-        &BaselineWrite {
-            is_dir: local.is_dir,
-            size: i64::try_from(local.size).unwrap_or(i64::MAX),
-            fingerprint,
-            local: *local,
-            trust_local: !local.is_racy(observe::Stamp::now()),
-            remote_size: remote.size,
-            remote_mtime: remote.mtime,
-            remote_hash: remote.hash.clone(),
-            remote_id: remote.id.clone(),
-            generation,
-        },
-    )
+    let mut write = BaselineWrite {
+        is_dir: local.is_dir,
+        size: i64::try_from(local.size).unwrap_or(i64::MAX),
+        fingerprint,
+        local: *local,
+        trust_local: !local.is_racy(observe::Stamp::now()),
+        remote_size: remote.size,
+        remote_mtime: remote.mtime,
+        remote_hash: remote.hash.clone(),
+        remote_id: remote.id.clone(),
+        generation: 0,
+    };
+    let dir = pair.dir.clone();
+    let rel = rel.to_owned();
+    store::outcome(pair.db, move |tx| {
+        write.generation = store::next_generation(tx, dir.id)?;
+        store::save_baseline(tx, &dir, &rel, &write)
+    })
     .map_err(|err| format!("Could not save synchronization history: {err}"))
 }
 

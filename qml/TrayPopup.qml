@@ -172,10 +172,12 @@ Window {
                     Layout.fillWidth: true
                 }
                 Repeater {
-                    model: root.progress.pairs || []
+                    model: (root.progress.pairs || []).length
                     Label {
-                        required property var modelData
-                        text: modelData.current ? modelData.current : modelData.localPath
+                        required property int index
+                        // Counted, not a list: an update keeps the items instead of recreating them
+                        readonly property var entry: (root.progress.pairs || [])[index] || ({})
+                        text: entry.current ? entry.current : entry.localPath
                         color: root.theme.textDim
                         font.pixelSize: 11
                         elide: Text.ElideMiddle
@@ -198,13 +200,14 @@ Window {
                 }
                 Repeater {
                     id: recentList
-                    model: root.recent()
+                    model: root.recent().length
                     RecentItem {
-                        required property var modelData
-                        item: modelData
+                        required property int index
+                        readonly property var entry: root.recent()[index] || ({})
+                        item: entry
                         theme: root.theme
-                        when: root.ago(modelData.at, root.clock)
-                        glyph: root.actionGlyph(modelData.action)
+                        when: root.ago(entry.at, root.clock)
+                        glyph: root.actionGlyph(entry.action)
                         Layout.fillWidth: true
                     }
                 }

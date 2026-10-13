@@ -71,6 +71,42 @@ fn move_legacy_config(
     Ok(())
 }
 
+/// Celestial's log, next to its configuration.
+pub fn log_path() -> PathBuf {
+    get_config_dir().join("celestial.log")
+}
+
+/// The log is moved aside at start once it is this large.
+const LOG_LIMIT: u64 = 20 * 1024 * 1024;
+
+/// Send stderr (Celestial's log and the messages of Qt and rclone) to the
+/// log file when it is not a terminal, so a session started from the app
+/// menu leaves a trace, even of a crash. One older log is kept.
+pub fn log_to_file() {
+    use std::io::IsTerminal;
+    use std::os::fd::AsRawFd;
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    let path = log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > LOG_LIMIT) {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    if let Err(err) = nix::unistd::dup2(file.as_raw_fd(), 2) {
+        tracing::warn!("could not write the log to {}: {err}", path.display());
+    }
+}
+
 /// `$XDG_RUNTIME_DIR/celestial` for the single-instance socket.
 pub fn runtime_dir() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")

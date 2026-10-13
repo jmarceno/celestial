@@ -16,6 +16,8 @@ use crate::ui::tray::TrayHandle;
 const MAIN_QML: &str = "qrc:/qt/qml/app/celestial/qml/Main.qml";
 
 pub fn run(background: bool) -> i32 {
+    crate::util::log_to_file();
+    tracing::info!("Celestial {} started", env!("CARGO_PKG_VERSION"));
     let guard = match single_instance::acquire() {
         Ok(AcquireOutcome::Secondary) => {
             eprintln!("Celestial is already running; opened the existing window.");

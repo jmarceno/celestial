@@ -63,6 +63,7 @@ pub fn run(cmd: Commands) -> i32 {
         }
         Commands::Paths => {
             println!("config:    {}", crate::util::get_config_dir().display());
+            println!("log:       {}", crate::util::log_path().display());
             println!("runtime:   {}", crate::util::runtime_dir().display());
             println!("menu:      {}", desktop::menu_entry_path().display());
             println!("autostart: {}", desktop::autostart_path().display());

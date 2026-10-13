@@ -14,7 +14,10 @@ pub use util::{APP_ID, APP_NAME};
 
 pub fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
-    let spec = std::env::var("CELESTIAL_LOG").unwrap_or_else(|_| "warn".to_string());
+    // Starts, passes and their failures are logged by default: they are what
+    // a log needs to explain a crash or a stalled synchronization.
+    let spec = std::env::var("CELESTIAL_LOG")
+        .unwrap_or_else(|_| "warn,celestial::ui=info,celestial::sync::engine=info".to_string());
     let filter = EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = fmt()
         .with_env_filter(filter)
