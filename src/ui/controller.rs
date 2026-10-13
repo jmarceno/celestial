@@ -50,7 +50,7 @@ mod qobject {
         #[qobject]
         #[qml_element]
         #[qproperty(QString, snapshot_json)]
-        #[qproperty(QString, suggestions_json)]
+        #[qproperty(QString, folders_json)]
         #[qproperty(QString, progress_json)]
         #[qproperty(QString, estimate_json)]
         #[qproperty(bool, window_visible)]
@@ -169,6 +169,13 @@ mod qobject {
         #[qinvokable]
         #[cxx_name = "listDirs"]
         fn list_dirs(self: Pin<&mut Self>, remote: &QString, path: &QString);
+
+        /// Open the system folder chooser. The choice arrives as a
+        /// `local-folder` notice, or `local-folder-fallback` when the
+        /// desktop has no portal chooser.
+        #[qinvokable]
+        #[cxx_name = "pickLocalFolder"]
+        fn pick_local_folder(self: Pin<&mut Self>, start: &QString);
     }
 }
 
@@ -187,7 +194,7 @@ struct Runtime {
 
 pub struct AppControllerRust {
     snapshot_json: QString,
-    suggestions_json: QString,
+    folders_json: QString,
     progress_json: QString,
     estimate_json: QString,
     window_visible: bool,
@@ -199,7 +206,7 @@ impl Default for AppControllerRust {
     fn default() -> Self {
         Self {
             snapshot_json: QString::from("{}"),
-            suggestions_json: QString::from("[]"),
+            folders_json: QString::from("{}"),
             progress_json: QString::from("{\"pairs\":[],\"total\":null}"),
             estimate_json: QString::from("{}"),
             window_visible: false,
@@ -261,7 +268,7 @@ impl qobject::AppController {
         let mut activate = false;
         let mut notices = Vec::new();
         let mut snapshot: Option<String> = None;
-        let mut suggestions: Option<String> = None;
+        let mut folders: Option<String> = None;
         let mut progress: Option<String> = None;
         let mut estimate: Option<String> = None;
         let mut status_at: Option<(i32, i32)> = None;
@@ -294,7 +301,7 @@ impl qobject::AppController {
             }
             for notice in rt.notices.try_iter() {
                 match notice {
-                    Notice::Suggestions(text) => suggestions = Some(text),
+                    Notice::Folders(text) => folders = Some(text),
                     Notice::Estimate(text) => estimate = Some(text),
                     Notice::Dialog { kind, title, body } => {
                         if kind == "login" || kind == "fatal" {
@@ -331,8 +338,8 @@ impl qobject::AppController {
         if activate {
             self.as_mut().activated();
         }
-        if let Some(text) = suggestions {
-            self.as_mut().set_suggestions_json(QString::from(&*text));
+        if let Some(text) = folders {
+            self.as_mut().set_folders_json(QString::from(&*text));
         }
         if let Some(text) = snapshot {
             self.as_mut().set_snapshot_json(QString::from(&*text));
@@ -504,6 +511,42 @@ impl qobject::AppController {
             remote: remote.to_string(),
             path: path.to_string(),
         });
+    }
+
+    fn pick_local_folder(self: Pin<&mut Self>, start: &QString) {
+        static OPEN: AtomicBool = AtomicBool::new(false);
+        let Some(rt) = self.rust().runtime.as_ref() else {
+            return;
+        };
+        if OPEN.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let shared = rt.shared.clone();
+        let start = start.to_string();
+        let start = if start.trim().is_empty() {
+            std::env::var_os("HOME").map(std::path::PathBuf::from)
+        } else {
+            Some(std::path::PathBuf::from(start.trim()))
+        };
+        let spawned = std::thread::Builder::new()
+            .name("folder-chooser".into())
+            .spawn(move || {
+                use crate::platform::portal::{Picked, pick_folder};
+                match pick_folder("Choose a local folder", start.as_deref()) {
+                    Ok(Picked::Folder(path)) => {
+                        shared.dialog("local-folder", "", path.to_string_lossy())
+                    }
+                    Ok(Picked::Cancelled) => {}
+                    Err(err) => {
+                        tracing::info!("portal folder chooser unavailable: {err}");
+                        shared.dialog("local-folder-fallback", "", "");
+                    }
+                }
+                OPEN.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            OPEN.store(false, Ordering::Release);
+        }
     }
 }
 

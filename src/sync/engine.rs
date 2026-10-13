@@ -909,10 +909,18 @@ fn apply_between_passes(
                 }
             }
             Command::ListDirs { remote, path } => {
-                let names = list_dir_names(&remote, &path);
-                let _ = shared.notices.send(super::Notice::Suggestions(
-                    serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()),
-                ));
+                let listing = list_dir_names(&remote, &path);
+                let (dirs, error) = match listing {
+                    Ok(dirs) => (dirs, None),
+                    Err(err) => (Vec::new(), Some(err)),
+                };
+                let json = serde_json::json!({
+                    "remote": remote,
+                    "path": path,
+                    "dirs": dirs,
+                    "error": error,
+                });
+                let _ = shared.notices.send(super::Notice::Folders(json.to_string()));
             }
             Command::AddDir {
                 remote,
@@ -1313,11 +1321,12 @@ fn add_dir(
     model.ensure_dir(remote_name, &local_text, &remote_text);
 }
 
-fn list_dir_names(remote: &str, path: &str) -> Vec<String> {
-    match rclone::sync::list(remote, path, false, RcloneListFilter::Dirs) {
-        Ok(items) => items.into_iter().map(|item| item.name).collect(),
-        Err(_) => Vec::new(),
-    }
+fn list_dir_names(remote: &str, path: &str) -> Result<Vec<String>, String> {
+    let items = rclone::sync::list(remote, path, false, RcloneListFilter::Dirs)
+        .map_err(|err| err.to_string())?;
+    let mut names: Vec<String> = items.into_iter().map(|item| item.name).collect();
+    names.sort_by_cached_key(|name| name.to_lowercase());
+    Ok(names)
 }
 
 #[allow(clippy::too_many_arguments)]

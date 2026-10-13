@@ -24,15 +24,17 @@ ApplicationWindow {
     property string selectedName: ""
     property var detail: null
     property string exclusionDraft: ""
-    property var suggestions: []
+    // Remote folder browser state. `browsePath` is "" for the remote root.
+    property string browsePath: ""
+    property var browseDirs: []
+    property bool browseLoading: false
+    property string browseError: ""
     property string popupMode: ""
     property string popupTitle: ""
     property string popupBody: ""
     property var popupRef: ({})
     property string loginKind: "gdrive"
     property bool totpEnabled: false
-    property string localDraft: ""
-    property string remoteDraft: "/"
 
     function parse(value, fallback) {
         try { return JSON.parse(value) } catch (error) { return fallback }
@@ -144,10 +146,23 @@ ApplicationWindow {
         function onProgress_jsonChanged() {
             root.progress = root.parse(root.controller.progress_json, { pairs: [], total: null })
         }
-        function onSuggestions_jsonChanged() {
-            root.suggestions = root.parse(root.controller.suggestions_json, [])
+        function onFolders_jsonChanged() {
+            var reply = root.parse(root.controller.folders_json, {})
+            // Ignore replies for a folder the browser has already left.
+            if (reply.remote !== root.selectedName || reply.path !== root.browsePath) return
+            root.browseDirs = reply.dirs || []
+            root.browseError = reply.error || ""
+            root.browseLoading = false
         }
         function onNotice(kind, title, body) {
+            if (kind === "local-folder") {
+                localField.text = body
+                return
+            }
+            if (kind === "local-folder-fallback") {
+                folderDialog.open()
+                return
+            }
             if (kind === "login") {
                 root.popupMode = "login"
                 dialog.open()
@@ -195,8 +210,32 @@ ApplicationWindow {
         onAccepted: {
             var path = folderDialog.selectedFolder.toString()
             if (path.indexOf("file://") === 0) path = path.substring(7)
-            root.localDraft = decodeURIComponent(path)
+            localField.text = decodeURIComponent(path)
         }
+    }
+
+    function cleanRemotePath(path) {
+        return path.split("/").filter(function(part) { return part.length > 0 }).join("/")
+    }
+    function browseTo(path) {
+        root.browsePath = root.cleanRemotePath(path)
+        root.browseDirs = []
+        root.browseError = ""
+        root.browseLoading = true
+        browserList.currentIndex = -1
+        root.controller.listDirs(root.selectedName, root.browsePath)
+    }
+    function browseUp() {
+        var slash = root.browsePath.lastIndexOf("/")
+        root.browseTo(slash >= 0 ? root.browsePath.substring(0, slash) : "")
+    }
+    function browseChild(name) {
+        return root.browsePath.length > 0 ? root.browsePath + "/" + name : name
+    }
+    function browseSelection() {
+        if (browserList.currentIndex >= 0 && browserList.currentIndex < root.browseDirs.length)
+            return root.browseChild(root.browseDirs[browserList.currentIndex])
+        return root.browsePath
     }
 
     RowLayout {
@@ -311,12 +350,10 @@ ApplicationWindow {
                         text: "Add folder"
                         visible: root.selectedRemote() !== null
                         onClicked: {
-                            root.localDraft = ""
-                            root.remoteDraft = "/"
-                            root.suggestions = []
+                            localField.text = ""
+                            remoteField.text = "/"
                             root.popupMode = "add"
                             dialog.open()
-                            root.controller.listDirs(root.selectedName, "/")
                         }
                     }
                     PrimaryButton {
@@ -676,24 +713,39 @@ ApplicationWindow {
                 Layout.leftMargin: 18
                 Layout.rightMargin: 18
                 spacing: 10
-                Field {
-                    id: localField
-                    label: "Local folder"
+                RowLayout {
                     Layout.fillWidth: true
-                    text: root.localDraft
-                    onTextChanged: root.estimateTimer.restart()
+                    spacing: 8
+                    Field {
+                        id: localField
+                        label: "Local folder"
+                        placeholder: "/home/you/Documents"
+                        Layout.fillWidth: true
+                        onTextChanged: root.estimateTimer.restart()
+                    }
+                    PrimaryButton {
+                        text: "Browse…"
+                        Layout.alignment: Qt.AlignBottom
+                        onClicked: root.controller.pickLocalFolder(localField.text)
+                    }
                 }
-                PrimaryButton { text: "Browse…"; onClicked: folderDialog.open() }
-                Field {
-                    id: remoteField
-                    label: "Remote folder"
+                RowLayout {
                     Layout.fillWidth: true
-                    text: root.remoteDraft
-                    onTextChanged: {
-                        root.remoteDraft = remoteField.text
-                        if (root.selectedName.length > 0)
-                            root.controller.listDirs(root.selectedName, remoteField.text)
-                        root.estimateTimer.restart()
+                    spacing: 8
+                    Field {
+                        id: remoteField
+                        label: "Remote folder"
+                        Layout.fillWidth: true
+                        onTextChanged: root.estimateTimer.restart()
+                    }
+                    PrimaryButton {
+                        text: "Browse…"
+                        Layout.alignment: Qt.AlignBottom
+                        enabled: root.selectedName.length > 0
+                        onClicked: {
+                            remoteBrowser.open()
+                            root.browseTo(remoteField.text)
+                        }
                     }
                 }
                 Label {
@@ -711,23 +763,6 @@ ApplicationWindow {
                     font.pixelSize: 12
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
-                }
-                Repeater {
-                    model: root.suggestions
-                    Button {
-                        required property string modelData
-                        text: modelData
-                        Layout.fillWidth: true
-                        flat: true
-                        contentItem: Label { text: modelData; color: root.theme.accentStrong; font.pixelSize: 13; leftPadding: 8 }
-                        background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm }
-                        onClicked: {
-                            var current = remoteField.text
-                            var slash = current.lastIndexOf("/")
-                            var prefix = slash >= 0 ? current.substring(0, slash + 1) : ""
-                            remoteField.text = prefix + modelData + "/"
-                        }
-                    }
                 }
             }
 
@@ -764,7 +799,7 @@ ApplicationWindow {
                                 totpEnabled: root.totpEnabled
                             }))
                         } else if (root.popupMode === "add") {
-                            root.controller.addDir(root.selectedName, localField.text.length > 0 ? localField.text : root.localDraft, remoteField.text)
+                            root.controller.addDir(root.selectedName, localField.text, remoteField.text)
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-remote") {
                             root.controller.deleteRemote(root.selectedName)
@@ -791,6 +826,193 @@ ApplicationWindow {
                         root.controller.confirmDeletion(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.conflictId, root.popupRef.token)
                         root.closeDialog()
                     }
+                }
+            }
+        }
+    }
+
+    // Remote folder browser: one folder level at a time, like a file dialog.
+    Popup {
+        id: remoteBrowser
+        modal: true
+        focus: true
+        anchors.centerIn: parent
+        width: Math.min(560, root.width - 60)
+        height: Math.min(520, root.height - 60)
+        padding: 16
+        closePolicy: Popup.CloseOnEscape
+        onOpened: browserList.forceActiveFocus()
+        background: Rectangle {
+            color: root.theme.cardBg
+            radius: root.theme.radiusSm
+            border.color: root.theme.borderSubtle
+            border.width: 1
+        }
+
+        function choose() {
+            remoteField.text = "/" + root.browseSelection()
+            remoteBrowser.close()
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 10
+
+            Label {
+                text: "Choose a remote folder"
+                color: root.theme.textPrimary
+                font.pixelSize: 15
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Button {
+                    id: upButton
+                    text: "Up"
+                    enabled: root.browsePath.length > 0
+                    implicitHeight: 32
+                    onClicked: root.browseUp()
+                    contentItem: Label {
+                        text: upButton.text
+                        color: upButton.enabled ? root.theme.textPrimary : root.theme.textDim
+                        font.pixelSize: 13
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 4
+                        color: upButton.down ? root.theme.borderSubtle : (upButton.hovered && upButton.enabled ? root.theme.cardBgRaised : root.theme.inputBg)
+                        border.color: root.theme.borderSubtle
+                    }
+                }
+                TextField {
+                    id: browserPath
+                    Layout.fillWidth: true
+                    implicitHeight: 32
+                    text: root.selectedName + ":/" + root.browsePath
+                    readOnly: true
+                    selectByMouse: true
+                    color: root.theme.textSecondary
+                    font.pixelSize: 13
+                    leftPadding: 8
+                    background: Rectangle {
+                        radius: 4
+                        color: root.theme.inputBg
+                        border.color: root.theme.borderSubtle
+                    }
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                color: root.theme.inputBg
+                border.color: root.theme.borderSubtle
+                radius: 4
+
+                ListView {
+                    id: browserList
+                    anchors.fill: parent
+                    anchors.margins: 1
+                    clip: true
+                    focus: true
+                    model: root.browseDirs
+                    currentIndex: -1
+                    boundsBehavior: Flickable.StopAtBounds
+                    keyNavigationEnabled: true
+                    ScrollBar.vertical: ScrollBar {
+                        policy: browserList.contentHeight > browserList.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+                    }
+                    Keys.onReturnPressed: {
+                        if (currentIndex >= 0) root.browseTo(root.browseChild(root.browseDirs[currentIndex]))
+                    }
+                    Keys.onEnterPressed: {
+                        if (currentIndex >= 0) root.browseTo(root.browseChild(root.browseDirs[currentIndex]))
+                    }
+                    Keys.onPressed: function(event) {
+                        if (event.key === Qt.Key_Backspace && root.browsePath.length > 0) {
+                            root.browseUp()
+                            event.accepted = true
+                        }
+                    }
+                    delegate: Rectangle {
+                        id: row
+                        required property string modelData
+                        required property int index
+                        width: browserList.width - (browserList.ScrollBar.vertical.visible ? browserList.ScrollBar.vertical.width : 0)
+                        height: 30
+                        color: browserList.currentIndex === row.index ? root.theme.accentMuted : (rowArea.containsMouse ? root.theme.cardBgRaised : "transparent")
+                        Label {
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 10
+                            text: row.modelData
+                            color: root.theme.textPrimary
+                            font.pixelSize: 13
+                            elide: Text.ElideRight
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        MouseArea {
+                            id: rowArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: {
+                                browserList.currentIndex = row.index
+                                browserList.forceActiveFocus()
+                            }
+                            onDoubleClicked: root.browseTo(root.browseChild(row.modelData))
+                        }
+                    }
+                }
+
+                Label {
+                    anchors.centerIn: parent
+                    width: parent.width - 32
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    visible: root.browseLoading || root.browseError.length > 0 || root.browseDirs.length === 0
+                    text: root.browseLoading ? "Loading…" : (root.browseError.length > 0 ? "Could not list this folder: " + root.browseError : "This folder has no subfolders.")
+                    color: root.browseError.length > 0 && !root.browseLoading ? root.theme.danger : root.theme.textMuted
+                    font.pixelSize: 13
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "Double-click a folder to open it. Selected: /" + root.browseSelection()
+                color: root.theme.textMuted
+                font.pixelSize: 12
+                elide: Text.ElideMiddle
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Item { Layout.fillWidth: true }
+                Button {
+                    id: browserCancel
+                    text: "Cancel"
+                    implicitHeight: 34
+                    onClicked: remoteBrowser.close()
+                    contentItem: Label {
+                        text: browserCancel.text
+                        color: root.theme.textPrimary
+                        font.pixelSize: 13
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        radius: 4
+                        color: browserCancel.down ? root.theme.borderSubtle : (browserCancel.hovered ? root.theme.cardBgRaised : root.theme.inputBg)
+                        border.color: root.theme.borderSubtle
+                    }
+                }
+                PrimaryButton {
+                    text: "Select"
+                    implicitHeight: 34
+                    enabled: !root.browseLoading && root.browseError.length === 0
+                    onClicked: remoteBrowser.choose()
                 }
             }
         }

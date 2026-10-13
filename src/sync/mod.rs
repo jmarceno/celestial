@@ -83,7 +83,8 @@ pub enum Notice {
         title: String,
         body: String,
     },
-    Suggestions(String),
+    /// Subfolders of one remote folder, for the remote folder browser.
+    Folders(String),
     /// A folder estimate, partial or final (see [`measure`]).
     Estimate(String),
 }
