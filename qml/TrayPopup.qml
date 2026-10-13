@@ -21,6 +21,7 @@ Window {
 
     width: 380
     height: Math.min(560, content.implicitHeight + 32)
+    minimumHeight: 160
     visible: false
     flags: Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
     color: root.theme.windowBg
@@ -114,9 +115,7 @@ Window {
 
     ColumnLayout {
         id: content
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
+        anchors.fill: parent
         anchors.margins: 16
         spacing: 10
 
@@ -137,63 +136,78 @@ Window {
                 font.bold: true
                 Layout.fillWidth: true
             }
-            Button {
-                text: "×"
-                flat: true
-                contentItem: Label { text: parent.text; color: root.theme.textMuted; font.pixelSize: 18 }
-                background: Rectangle { color: "transparent" }
+            CloseButton {
+                theme: root.theme
                 onClicked: root.hide()
             }
         }
-        Label {
-            text: root.snapshot.trayMessage || "Awaiting sync checks..."
-            color: root.theme.textMuted
-            font.pixelSize: 12
-            wrapMode: Text.WordWrap
+        // Status and recent changes scroll; the header and button stay put.
+        Flickable {
+            id: trayFlick
             Layout.fillWidth: true
-        }
-        TransferProgress {
-            visible: root.progress.total !== null && root.progress.total !== undefined
-            live: root.progress.total
-            showCurrent: false
-            theme: root.theme
-            Layout.fillWidth: true
-        }
-        Repeater {
-            model: root.progress.pairs || []
-            Label {
-                required property var modelData
-                text: modelData.current ? modelData.current : modelData.localPath
-                color: root.theme.textDim
-                font.pixelSize: 11
-                elide: Text.ElideMiddle
-                Layout.fillWidth: true
-            }
-        }
-        Label {
-            text: "Recent changes"
-            color: root.theme.textSecondary
-            font.pixelSize: 12
-            font.bold: true
-            Layout.topMargin: 4
-            visible: recentList.count > 0
-        }
-        Label {
-            text: "Nothing synchronized yet."
-            color: root.theme.textDim
-            font.pixelSize: 12
-            visible: recentList.count === 0
-        }
-        Repeater {
-            id: recentList
-            model: root.recent()
-            RecentItem {
-                required property var modelData
-                item: modelData
-                theme: root.theme
-                when: root.ago(modelData.at, root.clock)
-                glyph: root.actionGlyph(modelData.action)
-                Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.preferredHeight: trayBody.implicitHeight
+            contentHeight: trayBody.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: VScrollBar { theme: root.theme }
+
+            ColumnLayout {
+                id: trayBody
+                width: trayFlick.width - (trayFlick.ScrollBar.vertical.visible ? 12 : 0)
+                spacing: 10
+
+                Label {
+                    text: root.snapshot.trayMessage || "Awaiting sync checks..."
+                    color: root.theme.textMuted
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                TransferProgress {
+                    visible: root.progress.total !== null && root.progress.total !== undefined
+                    live: root.progress.total
+                    showCurrent: false
+                    theme: root.theme
+                    Layout.fillWidth: true
+                }
+                Repeater {
+                    model: root.progress.pairs || []
+                    Label {
+                        required property var modelData
+                        text: modelData.current ? modelData.current : modelData.localPath
+                        color: root.theme.textDim
+                        font.pixelSize: 11
+                        elide: Text.ElideMiddle
+                        Layout.fillWidth: true
+                    }
+                }
+                Label {
+                    text: "Recent changes"
+                    color: root.theme.textSecondary
+                    font.pixelSize: 12
+                    font.bold: true
+                    Layout.topMargin: 4
+                    visible: recentList.count > 0
+                }
+                Label {
+                    text: "Nothing synchronized yet."
+                    color: root.theme.textDim
+                    font.pixelSize: 12
+                    visible: recentList.count === 0
+                }
+                Repeater {
+                    id: recentList
+                    model: root.recent()
+                    RecentItem {
+                        required property var modelData
+                        item: modelData
+                        theme: root.theme
+                        when: root.ago(modelData.at, root.clock)
+                        glyph: root.actionGlyph(modelData.action)
+                        Layout.fillWidth: true
+                    }
+                }
             }
         }
         PrimaryButton {

@@ -84,6 +84,13 @@ ApplicationWindow {
         root.popupBody = body
         dialog.open()
     }
+    // Close, ×, and Escape: back out of the dialog without confirming it.
+    function dismissDialog() {
+        if (root.popupMode === "auth") root.controller.cancelAuth()
+        if (root.popupMode === "fatal") root.controller.quit()
+        if (root.popupMode === "login" && root.remotes().length === 0) root.controller.quit()
+        root.closeDialog()
+    }
     function closeDialog() {
         if (root.popupMode === "add") {
             root.estimateTimer.stop()
@@ -91,6 +98,12 @@ ApplicationWindow {
         }
         dialog.close()
         root.popupMode = ""
+    }
+
+    property Shortcut escapeShortcut: Shortcut {
+        sequence: "Escape"
+        enabled: dialog.opened && !remoteBrowser.opened
+        onActivated: root.dismissDialog()
     }
 
     property Timer clockTimer: Timer {
@@ -282,6 +295,8 @@ ApplicationWindow {
                     color: root.theme.textMuted
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
+                    maximumLineCount: 3
+                    elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
                 Label {
@@ -290,23 +305,32 @@ ApplicationWindow {
                     color: root.theme.accentStrong
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
+                    maximumLineCount: 3
+                    elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
                 Item { Layout.preferredHeight: 8 }
-                Repeater {
+                ListView {
+                    id: serverList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 4
+                    boundsBehavior: Flickable.StopAtBounds
                     model: root.remotes()
-                    SidebarItem {
+                    ScrollBar.vertical: VScrollBar { theme: root.theme }
+                    delegate: SidebarItem {
                         required property var modelData
+                        theme: root.theme
                         text: modelData.name
                         selected: modelData.name === root.selectedName
-                        width: root.theme.sidebarWidth - 28
+                        width: serverList.width - (serverList.ScrollBar.vertical.visible ? 10 : 0)
                         onClicked: {
                             root.selectedName = modelData.name
                             root.detail = null
                         }
                     }
                 }
-                Item { Layout.fillHeight: true }
                 PrimaryButton {
                     text: "Add server"
                     Layout.fillWidth: true
@@ -345,6 +369,7 @@ ApplicationWindow {
                         font.pixelSize: 22
                         font.bold: true
                         Layout.fillWidth: true
+                        elide: Text.ElideRight
                     }
                     PrimaryButton {
                         text: "Add folder"
@@ -382,13 +407,16 @@ ApplicationWindow {
                     visible: root.remotes().length === 0
                 }
                 Flickable {
+                    id: dirFlick
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     contentHeight: dirCol.implicitHeight
                     clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: VScrollBar { theme: root.theme }
                     Column {
                         id: dirCol
-                        width: parent.width
+                        width: dirFlick.width - (dirFlick.ScrollBar.vertical.visible ? 14 : 0)
                         spacing: 8
                         Repeater {
                             model: root.selectedRemote() ? root.selectedRemote().dirs : []
@@ -445,6 +473,7 @@ ApplicationWindow {
                                     onClicked: {
                                         root.detail = modelData
                                         exclusionArea.text = (modelData.exclusions || []).join("\n")
+                                        detailFlick.contentY = 0
                                     }
                                 }
                             }
@@ -453,166 +482,190 @@ ApplicationWindow {
                 }
             }
 
-            ColumnLayout {
+            Flickable {
+                id: detailFlick
                 anchors.fill: parent
-                anchors.margins: 22
-                spacing: 12
                 visible: root.detail !== null
-                RowLayout {
-                    Layout.fillWidth: true
-                    Button {
-                        text: "‹  Back"
-                        flat: true
-                        contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
-                        background: Rectangle { color: "transparent" }
-                        onClicked: root.detail = null
-                    }
-                    Item { Layout.fillWidth: true }
-                    PrimaryButton {
-                        text: "Stop syncing"
-                        danger: true
-                        onClicked: {
-                            root.popupMode = "confirm-dir"
-                            root.popupTitle = "Stop syncing this directory?"
-                            root.popupBody = root.detail.localDisplay + " → " + root.detail.remoteDisplay
-                            dialog.open()
+                clip: true
+                contentWidth: width
+                contentHeight: detailCol.implicitHeight + 22
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: VScrollBar { theme: root.theme }
+
+                function ensureVisible(item, rect) {
+                    var top = item.mapToItem(detailFlick.contentItem, rect.x, rect.y).y
+                    var bottom = top + rect.height
+                    if (top < contentY) contentY = Math.max(0, top - 12)
+                    else if (bottom > contentY + height) contentY = Math.min(contentHeight - height, bottom - height + 12)
+                }
+
+                ColumnLayout {
+                    id: detailCol
+                    x: 22
+                    y: 22
+                    width: detailFlick.width - 44 - (detailFlick.ScrollBar.vertical.visible ? 10 : 0)
+                    spacing: 12
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Button {
+                            text: "‹  Back"
+                            flat: true
+                            contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
+                            background: Rectangle { color: "transparent" }
+                            onClicked: root.detail = null
+                        }
+                        Item { Layout.fillWidth: true }
+                        PrimaryButton {
+                            text: "Stop syncing"
+                            danger: true
+                            onClicked: {
+                                root.popupMode = "confirm-dir"
+                                root.popupTitle = "Stop syncing this directory?"
+                                root.popupBody = root.detail.localDisplay + " → " + root.detail.remoteDisplay
+                                dialog.open()
+                            }
                         }
                     }
-                }
-                Label {
-                    text: root.detail ? (root.detail.localDisplay + "  →  " + root.detail.remoteDisplay) : ""
-                    color: root.theme.textPrimary
-                    font.pixelSize: 18
-                    font.bold: true
-                    Layout.fillWidth: true
-                    elide: Text.ElideMiddle
-                }
-                Label {
-                    text: root.detail ? root.detail.status : ""
-                    color: root.theme.textMuted
-                    font.pixelSize: 13
-                }
-                TransferProgress {
-                    property var current: root.progressFor(root.selectedName, root.detail)
-                    visible: current !== null
-                    live: current
-                    theme: root.theme
-                    Layout.fillWidth: true
-                }
-                Label {
-                    text: "Recent changes"
-                    color: root.theme.textSecondary
-                    font.pixelSize: 13
-                    font.bold: true
-                    visible: root.detail && root.detail.recent && root.detail.recent.length > 0
-                }
-                Repeater {
-                    model: root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : []
-                    RecentItem {
-                        required property var modelData
-                        item: modelData
+                    Label {
+                        text: root.detail ? (root.detail.localDisplay + "  →  " + root.detail.remoteDisplay) : ""
+                        color: root.theme.textPrimary
+                        font.pixelSize: 18
+                        font.bold: true
+                        Layout.fillWidth: true
+                        wrapMode: Text.WrapAnywhere
+                    }
+                    Label {
+                        text: root.detail ? root.detail.status : ""
+                        color: root.theme.textMuted
+                        font.pixelSize: 13
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    TransferProgress {
+                        property var current: root.progressFor(root.selectedName, root.detail)
+                        visible: current !== null
+                        live: current
                         theme: root.theme
-                        when: root.ago(modelData.at, root.clock)
-                        glyph: root.actionGlyph(modelData.action)
-                        width: root.width - root.theme.sidebarWidth - 44
+                        Layout.fillWidth: true
                     }
-                }
-                Label {
-                    text: "Sync errors"
-                    color: root.theme.textSecondary
-                    font.pixelSize: 13
-                    font.bold: true
-                    visible: root.detail && root.detail.errors && root.detail.errors.length > 0
-                }
-                Repeater {
-                    model: root.detail && root.detail.errors ? root.detail.errors : []
-                    Rectangle {
-                        required property var modelData
-                        width: root.width - root.theme.sidebarWidth - 44
-                        implicitHeight: errorCol.implicitHeight + 20
-                        radius: root.theme.radiusSm
-                        color: root.theme.cardBg
-                        border.color: root.theme.borderSubtle
-                        Column {
-                            id: errorCol
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            anchors.margins: 10
-                            spacing: 2
-                            Label { text: modelData.title; color: root.theme.textPrimary; font.pixelSize: 13; wrapMode: Text.WordWrap; width: errorCol.width }
-                            Label { text: modelData.detail; color: root.theme.textMuted; font.pixelSize: 12; visible: modelData.detail && modelData.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.controller.activateError(root.selectedName, root.detail.localPath, root.detail.remotePath, modelData.id)
+                    Label {
+                        text: "Recent changes"
+                        color: root.theme.textSecondary
+                        font.pixelSize: 13
+                        font.bold: true
+                        visible: root.detail && root.detail.recent && root.detail.recent.length > 0
+                    }
+                    Repeater {
+                        model: root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : []
+                        RecentItem {
+                            required property var modelData
+                            item: modelData
+                            theme: root.theme
+                            when: root.ago(modelData.at, root.clock)
+                            glyph: root.actionGlyph(modelData.action)
+                            Layout.fillWidth: true
                         }
                     }
-                }
-                Label {
-                    text: "Preserved versions"
-                    color: root.theme.textSecondary
-                    font.pixelSize: 13
-                    font.bold: true
-                    visible: root.detail && root.detail.recovery && root.detail.recovery.length > 0
-                }
-                Repeater {
-                    model: root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : []
-                    Rectangle {
-                        required property var modelData
-                        width: root.width - root.theme.sidebarWidth - 44
-                        implicitHeight: recoveryRow.implicitHeight + 16
-                        radius: root.theme.radiusSm
-                        color: root.theme.cardBg
-                        border.color: root.theme.borderSubtle
-                        RowLayout {
-                            id: recoveryRow
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            anchors.margins: 8
-                            spacing: 8
+                    Label {
+                        text: "Sync errors"
+                        color: root.theme.textSecondary
+                        font.pixelSize: 13
+                        font.bold: true
+                        visible: root.detail && root.detail.errors && root.detail.errors.length > 0
+                    }
+                    Repeater {
+                        model: root.detail && root.detail.errors ? root.detail.errors : []
+                        Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: errorCol.implicitHeight + 20
+                            radius: root.theme.radiusSm
+                            color: root.theme.cardBg
+                            border.color: root.theme.borderSubtle
                             Column {
-                                Layout.fillWidth: true
+                                id: errorCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 10
                                 spacing: 2
-                                Label { text: modelData.rel + " (" + modelData.side + ")"; color: root.theme.textPrimary; font.pixelSize: 13; elide: Text.ElideMiddle; width: parent.width }
-                                Label { text: modelData.reason + " · " + modelData.when; color: root.theme.textMuted; font.pixelSize: 12; elide: Text.ElideRight; width: parent.width }
+                                Label { text: modelData.title; color: root.theme.textPrimary; font.pixelSize: 13; wrapMode: Text.WordWrap; width: errorCol.width }
+                                Label { text: modelData.detail; color: root.theme.textMuted; font.pixelSize: 12; visible: modelData.detail && modelData.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
                             }
-                            Button {
-                                text: "Restore"
-                                flat: true
-                                contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
-                                background: Rectangle { color: "transparent" }
-                                onClicked: root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, modelData.id)
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.controller.activateError(root.selectedName, root.detail.localPath, root.detail.remotePath, modelData.id)
                             }
                         }
                     }
-                }
-                Label { text: "File/folder exclusions"; color: root.theme.textSecondary; font.pixelSize: 13; font.bold: true }
-                Label {
-                    text: "Edit or remove any starting rule and save. One rule per line: glob paths (~/ is home, / is absolute), regex: followed by a regular expression, or builtin:rust-target for Rust build folders. Regex paths are relative to this folder."
-                    color: root.theme.textDim
-                    font.pixelSize: 12
-                    wrapMode: Text.WordWrap
-                    Layout.fillWidth: true
-                }
-                ScrollView {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
+                    Label {
+                        text: "Preserved versions"
+                        color: root.theme.textSecondary
+                        font.pixelSize: 13
+                        font.bold: true
+                        visible: root.detail && root.detail.recovery && root.detail.recovery.length > 0
+                    }
+                    Repeater {
+                        model: root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : []
+                        Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: recoveryRow.implicitHeight + 16
+                            radius: root.theme.radiusSm
+                            color: root.theme.cardBg
+                            border.color: root.theme.borderSubtle
+                            RowLayout {
+                                id: recoveryRow
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.margins: 8
+                                spacing: 8
+                                Column {
+                                    Layout.fillWidth: true
+                                    spacing: 2
+                                    Label { text: modelData.rel + " (" + modelData.side + ")"; color: root.theme.textPrimary; font.pixelSize: 13; elide: Text.ElideMiddle; width: parent.width }
+                                    Label { text: modelData.reason + " · " + modelData.when; color: root.theme.textMuted; font.pixelSize: 12; elide: Text.ElideRight; width: parent.width }
+                                }
+                                Button {
+                                    text: "Restore"
+                                    flat: true
+                                    contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
+                                    background: Rectangle { color: "transparent" }
+                                    onClicked: root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, modelData.id)
+                                }
+                            }
+                        }
+                    }
+                    Label { text: "File/folder exclusions"; color: root.theme.textSecondary; font.pixelSize: 13; font.bold: true }
+                    Label {
+                        text: "Edit or remove any starting rule and save. One rule per line: glob paths (~/ is home, / is absolute), regex: followed by a regular expression, or builtin:rust-target for Rust build folders. Regex paths are relative to this folder."
+                        color: root.theme.textDim
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    // Grows with its rules; the page scrolls, so every line stays reachable.
                     TextArea {
                         id: exclusionArea
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Math.max(160, implicitHeight)
                         color: root.theme.textPrimary
-                        wrapMode: TextEdit.NoWrap
+                        wrapMode: TextEdit.WrapAnywhere
                         font.family: "monospace"
                         font.pixelSize: 13
                         selectByMouse: true
-                        background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: root.theme.borderSubtle }
+                        padding: 10
+                        background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: exclusionArea.activeFocus ? root.theme.accent : root.theme.borderSubtle }
+                        // Keep the caret visible while typing near the bottom of the page.
+                        onCursorRectangleChanged: if (activeFocus) detailFlick.ensureVisible(exclusionArea, cursorRectangle)
                     }
-                }
-                PrimaryButton {
-                    text: "Save exclusions"
-                    onClicked: root.controller.saveExclusions(root.detail.localPath, exclusionArea.text)
+                    PrimaryButton {
+                        text: "Save exclusions"
+                        Layout.bottomMargin: 22
+                        onClicked: root.controller.saveExclusions(root.detail.localPath, exclusionArea.text)
+                    }
                 }
             }
         }
@@ -625,7 +678,9 @@ ApplicationWindow {
         anchors.centerIn: parent
         width: Math.min(520, root.width - 80)
         padding: 0
-        closePolicy: Popup.CloseOnEscape
+        height: Math.min(implicitHeight, root.height - 40)
+        // Escape goes through dismissDialog() so it does what Close does.
+        closePolicy: Popup.NoAutoClose
         background: Rectangle {
             color: root.theme.cardBg
             radius: root.theme.radius
@@ -634,135 +689,157 @@ ApplicationWindow {
         }
         contentItem: ColumnLayout {
             spacing: 12
-            width: dialog.width
-            anchors.margins: 18
 
-            Label {
-                text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync a folder" : root.popupTitle)
-                color: root.theme.textPrimary
-                font.pixelSize: 18
-                font.bold: true
+            RowLayout {
                 Layout.fillWidth: true
                 Layout.leftMargin: 18
-                Layout.rightMargin: 18
-                Layout.topMargin: 18
-                wrapMode: Text.WordWrap
-            }
-            Label {
-                text: root.popupBody
-                color: root.theme.textSecondary
-                font.pixelSize: 13
-                wrapMode: Text.WordWrap
-                visible: root.popupBody.length > 0 && root.popupMode !== "login" && root.popupMode !== "add"
-                Layout.fillWidth: true
-                Layout.leftMargin: 18
-                Layout.rightMargin: 18
-            }
-
-            ColumnLayout {
-                visible: root.popupMode === "login"
-                Layout.fillWidth: true
-                Layout.leftMargin: 18
-                Layout.rightMargin: 18
-                spacing: 10
-                Label { text: "Server type"; color: root.theme.textSecondary; font.pixelSize: 12; font.bold: true }
-                ComboBox {
-                    id: kindBox
+                Layout.rightMargin: 12
+                Layout.topMargin: 14
+                spacing: 8
+                Label {
+                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync a folder" : root.popupTitle)
+                    color: root.theme.textPrimary
+                    font.pixelSize: 18
+                    font.bold: true
                     Layout.fillWidth: true
-                    model: ["Google Drive", "Dropbox", "pCloud", "Nextcloud", "Owncloud", "Proton Drive", "WebDAV"]
-                    currentIndex: 0
-                    onActivated: {
-                        var kinds = ["gdrive", "dropbox", "pcloud", "nextcloud", "owncloud", "protondrive", "webdav"]
-                        root.loginKind = kinds[currentIndex]
-                    }
-                    delegate: ItemDelegate {
-                        width: kindBox.width
-                        text: modelData
-                        contentItem: Label { text: modelData; color: root.theme.textPrimary; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
-                        background: Rectangle { color: highlighted ? root.theme.cardBgRaised : root.theme.cardBg }
-                    }
-                    contentItem: Label { text: kindBox.displayText; color: root.theme.textPrimary; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
-                    background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: root.theme.borderSubtle }
+                    Layout.topMargin: 4
+                    wrapMode: Text.WordWrap
                 }
-                Field { id: nameField; label: "Name"; Layout.fillWidth: true }
-                Field { id: urlField; label: "Server URL"; Layout.fillWidth: true; visible: root.loginKind === "nextcloud" || root.loginKind === "owncloud" || root.loginKind === "webdav" }
-                Field { id: userField; label: "Username"; Layout.fillWidth: true; visible: root.loginKind === "nextcloud" || root.loginKind === "owncloud" || root.loginKind === "webdav" || root.loginKind === "protondrive" }
-                Field { id: passField; label: "Password"; password: true; Layout.fillWidth: true; visible: userField.visible }
-                RowLayout {
-                    visible: root.loginKind === "protondrive"
-                    CheckBox {
-                        id: totpCheck
-                        checked: root.totpEnabled
-                        onToggled: root.totpEnabled = checked
-                        indicator: Rectangle {
-                            implicitWidth: 18
-                            implicitHeight: 18
-                            radius: 4
-                            border.color: root.theme.accent
-                            color: totpCheck.checked ? root.theme.accent : "transparent"
+                CloseButton {
+                    theme: root.theme
+                    Layout.alignment: Qt.AlignTop
+                    onClicked: root.dismissDialog()
+                }
+            }
+
+            // Long forms and messages scroll; the title and buttons stay put.
+            Flickable {
+                id: dialogFlick
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.preferredHeight: dialogBody.implicitHeight
+                contentHeight: dialogBody.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: VScrollBar { theme: root.theme }
+
+                ColumnLayout {
+                    id: dialogBody
+                    x: 18
+                    width: dialogFlick.width - 36
+                    spacing: 12
+
+                    Label {
+                        text: root.popupBody
+                        color: root.theme.textSecondary
+                        font.pixelSize: 13
+                        wrapMode: Text.WordWrap
+                        visible: root.popupBody.length > 0 && root.popupMode !== "login" && root.popupMode !== "add"
+                        Layout.fillWidth: true
+                    }
+
+                    ColumnLayout {
+                        visible: root.popupMode === "login"
+                        Layout.fillWidth: true
+                        spacing: 10
+                        Label { text: "Server type"; color: root.theme.textSecondary; font.pixelSize: 12; font.bold: true }
+                        ComboBox {
+                            id: kindBox
+                            Layout.fillWidth: true
+                            model: ["Google Drive", "Dropbox", "pCloud", "Nextcloud", "Owncloud", "Proton Drive", "WebDAV"]
+                            currentIndex: 0
+                            onActivated: {
+                                var kinds = ["gdrive", "dropbox", "pcloud", "nextcloud", "owncloud", "protondrive", "webdav"]
+                                root.loginKind = kinds[currentIndex]
+                            }
+                            delegate: ItemDelegate {
+                                width: kindBox.width
+                                text: modelData
+                                contentItem: Label { text: modelData; color: root.theme.textPrimary; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { color: highlighted ? root.theme.cardBgRaised : root.theme.cardBg }
+                            }
+                            contentItem: Label { text: kindBox.displayText; color: root.theme.textPrimary; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: root.theme.borderSubtle }
+                        }
+                        Field { id: nameField; label: "Name"; Layout.fillWidth: true }
+                        Field { id: urlField; label: "Server URL"; Layout.fillWidth: true; visible: root.loginKind === "nextcloud" || root.loginKind === "owncloud" || root.loginKind === "webdav" }
+                        Field { id: userField; label: "Username"; Layout.fillWidth: true; visible: root.loginKind === "nextcloud" || root.loginKind === "owncloud" || root.loginKind === "webdav" || root.loginKind === "protondrive" }
+                        Field { id: passField; label: "Password"; password: true; Layout.fillWidth: true; visible: userField.visible }
+                        RowLayout {
+                            visible: root.loginKind === "protondrive"
+                            CheckBox {
+                                id: totpCheck
+                                checked: root.totpEnabled
+                                onToggled: root.totpEnabled = checked
+                                indicator: Rectangle {
+                                    implicitWidth: 18
+                                    implicitHeight: 18
+                                    radius: 4
+                                    border.color: root.theme.accent
+                                    color: totpCheck.checked ? root.theme.accent : "transparent"
+                                }
+                            }
+                            Label { text: "This account uses a 2FA code"; color: root.theme.textSecondary; font.pixelSize: 13 }
+                        }
+                        Field { id: totpField; label: "2FA code"; Layout.fillWidth: true; visible: root.loginKind === "protondrive" && root.totpEnabled; placeholder: "6 digits" }
+                    }
+
+                    ColumnLayout {
+                        visible: root.popupMode === "add"
+                        Layout.fillWidth: true
+                        spacing: 10
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            Field {
+                                id: localField
+                                label: "Local folder"
+                                placeholder: "/home/you/Documents"
+                                Layout.fillWidth: true
+                                onTextChanged: root.estimateTimer.restart()
+                            }
+                            PrimaryButton {
+                                text: "Browse…"
+                                Layout.alignment: Qt.AlignBottom
+                                onClicked: root.controller.pickLocalFolder(localField.text)
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            Field {
+                                id: remoteField
+                                label: "Remote folder"
+                                Layout.fillWidth: true
+                                onTextChanged: root.estimateTimer.restart()
+                            }
+                            PrimaryButton {
+                                text: "Browse…"
+                                Layout.alignment: Qt.AlignBottom
+                                enabled: root.selectedName.length > 0
+                                onClicked: {
+                                    remoteBrowser.open()
+                                    root.browseTo(remoteField.text)
+                                }
+                            }
+                        }
+                        Label {
+                            text: root.estimateCurrent() ? (root.estimate.text || "") : ""
+                            visible: text.length > 0
+                            color: root.theme.textSecondary
+                            font.pixelSize: 12
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+                        Label {
+                            text: root.estimateCurrent() && root.estimate.warning ? root.estimate.warning : ""
+                            visible: text.length > 0
+                            color: root.theme.warning
+                            font.pixelSize: 12
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
                         }
                     }
-                    Label { text: "This account uses a 2FA code"; color: root.theme.textSecondary; font.pixelSize: 13 }
-                }
-                Field { id: totpField; label: "2FA code"; Layout.fillWidth: true; visible: root.loginKind === "protondrive" && root.totpEnabled; placeholder: "6 digits" }
-            }
-
-            ColumnLayout {
-                visible: root.popupMode === "add"
-                Layout.fillWidth: true
-                Layout.leftMargin: 18
-                Layout.rightMargin: 18
-                spacing: 10
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-                    Field {
-                        id: localField
-                        label: "Local folder"
-                        placeholder: "/home/you/Documents"
-                        Layout.fillWidth: true
-                        onTextChanged: root.estimateTimer.restart()
-                    }
-                    PrimaryButton {
-                        text: "Browse…"
-                        Layout.alignment: Qt.AlignBottom
-                        onClicked: root.controller.pickLocalFolder(localField.text)
-                    }
-                }
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-                    Field {
-                        id: remoteField
-                        label: "Remote folder"
-                        Layout.fillWidth: true
-                        onTextChanged: root.estimateTimer.restart()
-                    }
-                    PrimaryButton {
-                        text: "Browse…"
-                        Layout.alignment: Qt.AlignBottom
-                        enabled: root.selectedName.length > 0
-                        onClicked: {
-                            remoteBrowser.open()
-                            root.browseTo(remoteField.text)
-                        }
-                    }
-                }
-                Label {
-                    text: root.estimateCurrent() ? (root.estimate.text || "") : ""
-                    visible: text.length > 0
-                    color: root.theme.textSecondary
-                    font.pixelSize: 12
-                    wrapMode: Text.WordWrap
-                    Layout.fillWidth: true
-                }
-                Label {
-                    text: root.estimateCurrent() && root.estimate.warning ? root.estimate.warning : ""
-                    visible: text.length > 0
-                    color: root.theme.warning
-                    font.pixelSize: 12
-                    wrapMode: Text.WordWrap
-                    Layout.fillWidth: true
                 }
             }
 
@@ -777,12 +854,7 @@ ApplicationWindow {
                     flat: true
                     contentItem: Label { text: parent.text; color: root.theme.textSecondary; font.pixelSize: 13 }
                     background: Rectangle { color: "transparent" }
-                    onClicked: {
-                        if (root.popupMode === "auth") root.controller.cancelAuth()
-                        if (root.popupMode === "fatal") root.controller.quit()
-                        if (root.popupMode === "login" && root.remotes().length === 0) root.controller.quit()
-                        root.closeDialog()
-                    }
+                    onClicked: root.dismissDialog()
                 }
                 PrimaryButton {
                     text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : "Confirm")))
@@ -857,11 +929,19 @@ ApplicationWindow {
         contentItem: ColumnLayout {
             spacing: 10
 
-            Label {
-                text: "Choose a remote folder"
-                color: root.theme.textPrimary
-                font.pixelSize: 15
-                font.bold: true
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    text: "Choose a remote folder"
+                    color: root.theme.textPrimary
+                    font.pixelSize: 15
+                    font.bold: true
+                    Layout.fillWidth: true
+                }
+                CloseButton {
+                    theme: root.theme
+                    onClicked: remoteBrowser.close()
+                }
             }
 
             RowLayout {
@@ -921,9 +1001,7 @@ ApplicationWindow {
                     currentIndex: -1
                     boundsBehavior: Flickable.StopAtBounds
                     keyNavigationEnabled: true
-                    ScrollBar.vertical: ScrollBar {
-                        policy: browserList.contentHeight > browserList.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
-                    }
+                    ScrollBar.vertical: VScrollBar { theme: root.theme }
                     Keys.onReturnPressed: {
                         if (currentIndex >= 0) root.browseTo(root.browseChild(root.browseDirs[currentIndex]))
                     }
