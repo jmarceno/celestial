@@ -79,6 +79,11 @@ pub enum Command {
         remote: String,
         path: String,
     },
+    StatsDir {
+        remote: String,
+        local: String,
+        remote_path: String,
+    },
 }
 
 #[derive(Debug, Clone)]

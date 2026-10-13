@@ -176,6 +176,15 @@ mod qobject {
         fn cancel_estimate(self: Pin<&mut Self>);
 
         #[qinvokable]
+        #[cxx_name = "requestStats"]
+        fn request_stats(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+        );
+
+        #[qinvokable]
         #[cxx_name = "listDirs"]
         fn list_dirs(self: Pin<&mut Self>, remote: &QString, path: &QString);
 
@@ -492,6 +501,19 @@ impl qobject::AppController {
                 remote_path.to_string(),
             );
         }
+    }
+
+    fn request_stats(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+    ) {
+        self.send(Command::StatsDir {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+        });
     }
 
     fn cancel_estimate(self: Pin<&mut Self>) {

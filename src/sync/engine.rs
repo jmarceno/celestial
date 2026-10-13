@@ -1070,6 +1070,9 @@ fn apply_between_passes(
                     Err(err) => shared.dialog("error", tr::tr!("Nothing was restored"), err),
                 }
             }
+            Command::StatsDir { remote, local, remote_path } => {
+                super::measure::request(shared, remote, local, remote_path);
+            }
         }
         shared.publish(model);
     }

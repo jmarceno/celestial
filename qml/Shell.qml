@@ -62,6 +62,9 @@ ApplicationWindow {
         root.detail = entry
         exclusionArea.text = (entry.exclusions || []).join("\n")
         detailFlick.contentY = 0
+        if (entry && root.selectedName.length > 0) {
+            root.controller.requestStats(root.selectedName, entry.localPath, entry.remotePath)
+        }
     }
     function openPendingDetail() {
         if (!root.pendingDetail) return
@@ -598,6 +601,22 @@ ApplicationWindow {
                         live: current
                         theme: root.theme
                         Layout.fillWidth: true
+                    }
+                    // Folder stats
+                    Label {
+                        text: "Folder stats"
+                        color: root.theme.textSecondary
+                        font.pixelSize: 12
+                        font.bold: true
+                        visible: root.detail && root.estimate.local === root.detail.localPath && root.estimate.remotePath === root.detail.remotePath && root.estimate.done
+                    }
+                    Label {
+                        text: root.estimate.text ? root.estimate.text : ""
+                        color: root.theme.textMuted
+                        font.pixelSize: 13
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                        visible: root.detail && root.estimate.local === root.detail.localPath && root.estimate.remotePath === root.detail.remotePath && root.estimate.done
                     }
                     Label {
                         text: "Recent changes"
