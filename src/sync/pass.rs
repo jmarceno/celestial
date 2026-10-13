@@ -42,7 +42,7 @@ pub struct Pair<'a> {
 /// Callbacks into the worker between items.
 pub trait Hooks {
     /// Process pending commands. `false` aborts the pass without further
-    /// writes (quit, or the pair was stopped).
+    /// writes (the pair was stopped).
     fn checkpoint(&mut self) -> bool;
     fn progress(&mut self, text: String);
     /// What the pass is about to transfer, once everything is decided.
@@ -523,7 +523,7 @@ pub fn run(
     let mut entries: Vec<Entry> = Vec::with_capacity(rels.len());
     let mut skip_under: Option<String> = None;
     for (index, rel) in rels.into_iter().enumerate() {
-        // Deciding can hash files: stay responsive to stop and quit.
+        // Deciding can hash files: stay responsive to stop.
         if index % 64 == 63 {
             if !hooks.checkpoint() {
                 return Ok(Report {

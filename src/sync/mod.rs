@@ -14,14 +14,14 @@ mod reconcile;
 mod recovery;
 mod store;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 mod watch;
 
 pub use engine::spawn;
 
 use crate::login::LoginRequest;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug)]
 pub enum Command {
@@ -73,7 +73,6 @@ pub enum Command {
         remote: String,
         path: String,
     },
-    Quit,
 }
 
 #[derive(Debug, Clone)]
@@ -92,8 +91,6 @@ pub enum Notice {
 #[derive(Clone)]
 pub struct Shared {
     pub bus: model::SnapshotBus,
-    pub quit: Arc<AtomicBool>,
-    pub stopped: Arc<AtomicBool>,
     pub cancel_auth: Arc<AtomicBool>,
     pub notices: crossbeam_channel::Sender<Notice>,
     pub tray: Arc<dyn Fn(String, String) + Send + Sync>,
@@ -128,9 +125,5 @@ impl Shared {
             title: title.into(),
             body: body.into(),
         });
-    }
-
-    pub fn quit_requested(&self) -> bool {
-        self.quit.load(Ordering::Relaxed)
     }
 }

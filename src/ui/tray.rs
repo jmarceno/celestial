@@ -15,7 +15,6 @@ pub enum TrayEvent {
     /// The icon was clicked at these screen coordinates (0, 0 when the
     /// host does not say): show the status window.
     Status(i32, i32),
-    Quit,
 }
 
 struct CelestialTray {
@@ -88,7 +87,9 @@ impl Tray for CelestialTray {
             .into(),
             StandardItem {
                 label: tr::tr!("Close"),
-                activate: Box::new(|tray: &mut Self| tray.send(TrayEvent::Quit)),
+                // Quit right here on the tray thread, without waiting for
+                // the window's event loop or the sync; see `crate::exit`.
+                activate: Box::new(|_: &mut Self| crate::exit::now(0)),
                 ..Default::default()
             }
             .into(),

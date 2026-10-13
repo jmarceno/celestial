@@ -427,14 +427,14 @@ pub fn format_duration(secs: u64) -> String {
 }
 
 /// Read the stats of active pairs about once a second and keep the tray's
-/// progress line current. Runs until quit.
+/// progress line current. Runs for the life of the process.
 pub fn spawn_meter(shared: Shared) {
     let spawned = thread::Builder::new()
         .name("celestial-meter".into())
         .spawn(move || {
             let mut shown: Option<String> = None;
             let mut shown_at: Option<Instant> = None;
-            while !shared.quit_requested() {
+            loop {
                 thread::sleep(METER_INTERVAL);
                 shared
                     .progress

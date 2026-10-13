@@ -154,8 +154,6 @@ impl Fixture {
         let (notices, _) = crossbeam_channel::unbounded();
         let shared = Shared {
             bus: model::SnapshotBus::new(),
-            quit: Arc::default(),
-            stopped: Arc::default(),
             cancel_auth: Arc::default(),
             notices,
             tray: Arc::new(|_, _| {}),

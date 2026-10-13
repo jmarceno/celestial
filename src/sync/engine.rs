@@ -58,7 +58,6 @@ pub fn spawn(
                 );
                 }
             }
-            shared.stopped.store(true, Ordering::Relaxed);
         })
         .expect("spawn sync worker")
 }
@@ -113,6 +112,10 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         json!({ "path": config.display().to_string() }).to_string(),
     )
     .map_err(|err| format!("Could not set the rclone config path: {err}"))?;
+    if let Err(err) = rclone::claim_exit_signals() {
+        tracing::warn!("could not settle rclone's signal handling: {err}");
+    }
+    crate::exit::on_signals();
     super::progress::spawn_meter(shared.clone());
 
     let mut db_path = util::get_config_dir();
@@ -162,9 +165,6 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
 
     loop {
         pump(&rx, &mut queue);
-        if shared.quit_requested() {
-            break;
-        }
         apply_deletes(&mut model, &db, &mut queue, shared);
         shared.publish(&mut model);
         apply_between_passes(
@@ -175,9 +175,6 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
             &mut schedule,
             &mut capabilities,
         );
-        if shared.quit_requested() {
-            break;
-        }
 
         // A failed read is not an empty configuration: keep the last known
         // state, report the failure and try again.
@@ -216,9 +213,6 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         for remote in remotes {
             pump(&rx, &mut queue);
             apply_deletes(&mut model, &db, &mut queue, shared);
-            if shared.quit_requested() {
-                break;
-            }
             model.ensure_remote(&remote.name);
             let sync_dirs = match util::await_future(
                 SyncDirsEntity::find()
@@ -283,9 +277,6 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
             let caps = capabilities[&remote.name].clone();
 
             for sync_dir in sync_dirs {
-                if shared.quit_requested() {
-                    break;
-                }
                 pump(&rx, &mut queue);
                 apply_deletes(&mut model, &db, &mut queue, shared);
                 if !matches!(sync_dir.exists(&db), Ok(true)) {
@@ -320,14 +311,10 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
         }
         shared.publish(&mut model);
 
-        if shared.quit_requested() {
-            break;
-        }
         let pause = if schedule.settling { 100 } else { 500 };
         schedule.settling = false;
         wait_command(&rx, &mut queue, Duration::from_millis(pause));
     }
-    Ok(())
 }
 
 /// Check one pair and run a pass when its local tree may have changed, its
@@ -522,7 +509,7 @@ struct WorkerHooks<'a> {
 }
 
 /// Ordinary progress is published at most this often; errors, conflicts,
-/// stop and quit are not throttled.
+/// and stop are not throttled.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
 impl pass::Hooks for WorkerHooks<'_> {
@@ -543,14 +530,13 @@ impl pass::Hooks for WorkerHooks<'_> {
                             .dialog("error", tr::tr!("File/Folder Exclusions"), err);
                     }
                 }
-                Command::Quit => self.shared.quit.store(true, Ordering::Relaxed),
                 other => kept.push_back(other),
             }
         }
         *self.queue = kept;
         process_deletions(self.model, self.db, self.shared);
-        // Stop before any further write once the pair is gone or on quit.
-        !self.shared.quit_requested() && matches!(self.sync_dir.exists(self.db), Ok(true))
+        // Stop before any further write once the pair is gone.
+        matches!(self.sync_dir.exists(self.db), Ok(true))
     }
 
     fn progress(&mut self, text: String) {
@@ -714,7 +700,6 @@ fn apply_deletes(
                 local,
                 remote_path,
             } => model.dir_deletions.push((remote, local, remote_path)),
-            Command::Quit => kept.push_back(Command::Quit),
             other => kept.push_back(other),
         }
     }
@@ -886,11 +871,7 @@ fn apply_between_passes(
     capabilities: &mut HashMap<String, Capabilities>,
 ) {
     while let Some(cmd) = queue.pop_front() {
-        if shared.quit_requested() {
-            break;
-        }
         match cmd {
-            Command::Quit => shared.quit.store(true, Ordering::Relaxed),
             Command::DeleteRemote(name) => {
                 model.remote_deletions.push(name);
                 process_deletions(model, db, shared);
@@ -920,7 +901,9 @@ fn apply_between_passes(
                     "dirs": dirs,
                     "error": error,
                 });
-                let _ = shared.notices.send(super::Notice::Folders(json.to_string()));
+                let _ = shared
+                    .notices
+                    .send(super::Notice::Folders(json.to_string()));
             }
             Command::AddDir {
                 remote,

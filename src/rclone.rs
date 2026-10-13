@@ -130,6 +130,32 @@ pub fn version() -> Result<String, RcloneError> {
         .ok_or_else(|| RcloneError::new("core/version returned no version"))
 }
 
+/// Make rclone take SIGINT and SIGTERM over now rather than during the first
+/// real transfer: it does so once, the first time a copy writes to a partial
+/// file, so a throwaway local copy settles it. [`crate::exit::on_signals`]
+/// then takes the signals back for good.
+pub fn claim_exit_signals() -> Result<(), String> {
+    let dir = std::env::temp_dir().join(format!("celestial-exit-hook-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let result = std::fs::write(dir.join("src"), b"x")
+        .map_err(|err| err.to_string())
+        .and_then(|()| {
+            librclone::rpc(
+                "operations/copyfile",
+                json!({
+                    "srcFs": dir.display().to_string(),
+                    "srcRemote": "src",
+                    "dstFs": dir.display().to_string(),
+                    "dstRemote": "dst",
+                })
+                .to_string(),
+            )
+            .map(|_| ())
+        });
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
 /// What `core/stats` reports about one stats group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupStats {

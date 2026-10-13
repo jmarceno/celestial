@@ -54,7 +54,6 @@ mod qobject {
         #[qproperty(QString, progress_json)]
         #[qproperty(QString, estimate_json)]
         #[qproperty(bool, window_visible)]
-        #[qproperty(bool, quit_requested)]
         type AppController = super::AppControllerRust;
 
         #[qsignal]
@@ -189,7 +188,6 @@ struct Runtime {
     seen_progress: u64,
     background: bool,
     saw_snapshot: bool,
-    exit_requested: bool,
 }
 
 pub struct AppControllerRust {
@@ -198,7 +196,6 @@ pub struct AppControllerRust {
     progress_json: QString,
     estimate_json: QString,
     window_visible: bool,
-    quit_requested: bool,
     runtime: Option<Runtime>,
 }
 
@@ -210,7 +207,6 @@ impl Default for AppControllerRust {
             progress_json: QString::from("{\"pairs\":[],\"total\":null}"),
             estimate_json: QString::from("{}"),
             window_visible: false,
-            quit_requested: false,
             runtime: None,
         }
     }
@@ -224,14 +220,11 @@ impl qobject::AppController {
         };
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
-        let stopped = Arc::new(AtomicBool::new(false));
         let cancel_auth = Arc::new(AtomicBool::new(false));
         let tray = boot.tray.clone();
         let progress_tray = boot.tray.clone();
         let shared = Shared {
             bus: crate::sync::model::SnapshotBus::new(),
-            quit: Arc::new(AtomicBool::new(false)),
-            stopped,
             cancel_auth,
             notices: notice_tx,
             tray: Arc::new(move |message, phase| {
@@ -257,7 +250,6 @@ impl qobject::AppController {
             seen_progress: 0,
             background: boot.background,
             saw_snapshot: false,
-            exit_requested: false,
         });
         self.as_mut().set_window_visible(!boot.background);
         tracing::info!("QML bootstrap complete");
@@ -272,7 +264,6 @@ impl qobject::AppController {
         let mut progress: Option<String> = None;
         let mut estimate: Option<String> = None;
         let mut status_at: Option<(i32, i32)> = None;
-        let mut exit_now = false;
         {
             let mut rust = self.as_mut().rust_mut();
             let Some(rt) = rust.runtime.as_mut() else {
@@ -283,11 +274,6 @@ impl qobject::AppController {
                     match event {
                         TrayEvent::Open => show = true,
                         TrayEvent::Status(x, y) => status_at = Some((x, y)),
-                        TrayEvent::Quit => {
-                            rt.exit_requested = true;
-                            rt.shared.quit.store(true, Ordering::Relaxed);
-                            let _ = rt.commands.send(Command::Quit);
-                        }
                     }
                 }
             }
@@ -328,9 +314,6 @@ impl qobject::AppController {
                 rt.seen_progress = generation;
                 progress = Some(rt.shared.progress.json());
             }
-            if rt.exit_requested && rt.shared.stopped.load(Ordering::Relaxed) {
-                exit_now = true;
-            }
         }
         if show {
             self.as_mut().set_window_visible(true);
@@ -360,10 +343,6 @@ impl qobject::AppController {
                 QString::from(&*body),
             );
         }
-        if exit_now {
-            self.as_mut().set_quit_requested(true);
-            std::process::exit(0);
-        }
     }
 
     fn hide_window(mut self: Pin<&mut Self>) {
@@ -374,14 +353,9 @@ impl qobject::AppController {
         self.as_mut().set_window_visible(true);
     }
 
-    fn quit(mut self: Pin<&mut Self>) {
-        let mut rust = self.as_mut().rust_mut();
-        let Some(rt) = rust.runtime.as_mut() else {
-            std::process::exit(0);
-        };
-        rt.exit_requested = true;
-        rt.shared.quit.store(true, Ordering::Relaxed);
-        let _ = rt.commands.send(Command::Quit);
+    /// Quit at once, even mid-transfer; see [`crate::exit`].
+    fn quit(self: Pin<&mut Self>) {
+        crate::exit::now(0);
     }
 
     fn submit_login(self: Pin<&mut Self>, payload: &QString) {

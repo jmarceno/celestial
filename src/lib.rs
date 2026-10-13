@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod entities;
+pub mod exit;
 pub mod login;
 pub mod migrations;
 pub mod platform;

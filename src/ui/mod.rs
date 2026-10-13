@@ -33,6 +33,7 @@ pub fn run(background: bool) -> i32 {
         return 1;
     }
 
+    crate::exit::on_signals();
     crate::platform::desktop::refresh_stale_entries();
 
     if std::env::var_os("QT_FORCE_STDERR_LOGGING").is_none() {
@@ -83,7 +84,9 @@ pub fn run(background: bool) -> i32 {
 
     let code = app.as_mut().map(|app| app.exec()).unwrap_or(1);
     drop(guard);
-    code
+    // The event loop also ends when the session closes: leave at once
+    // rather than wait on the sync; see `crate::exit`.
+    crate::exit::now(code)
 }
 
 fn apply_render_backend_fallback() {
