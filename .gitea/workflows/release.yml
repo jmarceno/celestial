@@ -5,9 +5,9 @@ name: release
 #
 # Everything else is automatic: the version (Cargo.toml when newer than every
 # release tag, otherwise the latest tag with the patch bumped), the portable
-# build on Ubuntu 22.04 (glibc 2.35), its smoke test, and the release with
-# tag v<version> on the dispatched commit, then copied to GitHub. A commit
-# that already has a release tag is refused.
+# build on Ubuntu 24.04 (glibc 2.39, Qt 6.4), its smoke test, and the release
+# with tag v<version> on the dispatched commit, then copied to GitHub. A
+# commit that already has a release tag is refused.
 on:
   workflow_dispatch:
 
@@ -33,10 +33,10 @@ jobs:
       - name: Stamp version
         run: .gitea/scripts/release-stamp-cargo.sh Cargo.toml Cargo.lock celestial "${{ steps.plan.outputs.version }}"
 
-      - name: Build portable bundle (Ubuntu 22.04)
+      - name: Build portable bundle (Ubuntu 24.04)
         run: |
           set -euo pipefail
-          image=celestial-release-builder:22.04
+          image=celestial-release-builder:24.04
           docker build -t "$image" -f packaging/release/Containerfile packaging/release
           .gitea/scripts/container-build.sh "$image" build/portable \
             -v celestial-release-cargo:/opt/cargo/registry \
