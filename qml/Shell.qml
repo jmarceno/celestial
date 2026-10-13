@@ -545,7 +545,7 @@ ApplicationWindow {
                     x: 22
                     y: 22
                     width: detailFlick.width - 44 - (detailFlick.ScrollBar.vertical.visible ? 10 : 0)
-                    spacing: 12
+                    spacing: 6
                     RowLayout {
                         Layout.fillWidth: true
                         Button {
@@ -602,36 +602,42 @@ ApplicationWindow {
                     Label {
                         text: "Recent changes"
                         color: root.theme.textSecondary
-                        font.pixelSize: 13
+                        font.pixelSize: 12
                         font.bold: true
                         visible: root.detail && root.detail.recent && root.detail.recent.length > 0
                     }
-                    Repeater {
+                    ListView {
+                        Layout.fillWidth: true
+                        spacing: 2
+                        clip: true
                         model: (root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : []).length
-                        RecentItem {
+                        delegate: RecentItem {
                             required property int index
                             readonly property var entry: (root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : [])[index] || ({})
                             item: entry
                             theme: root.theme
                             when: root.ago(entry.at, root.clock)
                             glyph: root.actionGlyph(entry.action)
-                            Layout.fillWidth: true
+                            width: ListView.view.width
                         }
                     }
                     Label {
                         text: "Sync errors"
                         color: root.theme.textSecondary
-                        font.pixelSize: 13
+                        font.pixelSize: 12
                         font.bold: true
                         visible: root.errorEntries.length > 0
                     }
-                    Repeater {
+                    ListView {
+                        Layout.fillWidth: true
+                        spacing: 2
+                        clip: true
                         model: root.errorEntries.length
-                        Rectangle {
+                        delegate: Rectangle {
                             required property int index
                             readonly property var entry: root.errorEntries[index] || ({})
-                            Layout.fillWidth: true
-                            implicitHeight: errorCol.implicitHeight + 20
+                            width: ListView.view.width
+                            implicitHeight: errorCol.implicitHeight + 8
                             radius: root.theme.radiusSm
                             color: root.theme.cardBg
                             border.color: root.theme.borderSubtle
@@ -640,10 +646,10 @@ ApplicationWindow {
                                 anchors.left: parent.left
                                 anchors.right: parent.right
                                 anchors.top: parent.top
-                                anchors.margins: 10
-                                spacing: 2
-                                Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 13; wrapMode: Text.WordWrap; width: errorCol.width }
-                                Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 12; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
+                                anchors.margins: 6
+                                spacing: 1
+                                Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 12; wrapMode: Text.WordWrap; width: errorCol.width }
+                                Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
                             }
                             MouseArea {
                                 anchors.fill: parent
@@ -655,17 +661,20 @@ ApplicationWindow {
                     Label {
                         text: "Warnings"
                         color: root.theme.textSecondary
-                        font.pixelSize: 13
+                        font.pixelSize: 12
                         font.bold: true
                         visible: root.warningEntries.length > 0
                     }
-                    Repeater {
+                    ListView {
+                        Layout.fillWidth: true
+                        spacing: 2
+                        clip: true
                         model: root.warningEntries.length
-                        Rectangle {
+                        delegate: Rectangle {
                             required property int index
                             readonly property var entry: root.warningEntries[index] || ({})
-                            Layout.fillWidth: true
-                            implicitHeight: warningRow.implicitHeight + 20
+                            width: ListView.view.width
+                            implicitHeight: warningRow.implicitHeight + 8
                             radius: root.theme.radiusSm
                             color: root.theme.warningBg
                             border.color: root.theme.warning
@@ -674,18 +683,18 @@ ApplicationWindow {
                                 anchors.left: parent.left
                                 anchors.right: parent.right
                                 anchors.top: parent.top
-                                anchors.margins: 10
-                                spacing: 8
+                                anchors.margins: 6
+                                spacing: 4
                                 Column {
                                     Layout.fillWidth: true
-                                    spacing: 2
-                                    Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 13; wrapMode: Text.WordWrap; width: parent.width }
-                                    Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 12; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: parent.width }
+                                    spacing: 1
+                                    Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 12; wrapMode: Text.WordWrap; width: parent.width }
+                                    Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: parent.width }
                                 }
                                 Button {
                                     text: "Dismiss"
                                     flat: true
-                                    contentItem: Label { text: parent.text; color: root.theme.warning; font.pixelSize: 13 }
+                                    contentItem: Label { text: parent.text; color: root.theme.warning; font.pixelSize: 12 }
                                     background: Rectangle { color: "transparent" }
                                     onClicked: root.controller.dismissError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
                                 }

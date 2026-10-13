@@ -155,7 +155,7 @@ Window {
             ColumnLayout {
                 id: trayBody
                 width: trayFlick.width - (trayFlick.ScrollBar.vertical.visible ? 12 : 0)
-                spacing: 10
+                spacing: 4
 
                 Label {
                     text: root.snapshot.trayMessage || "Awaiting sync checks..."
@@ -187,9 +187,9 @@ Window {
                 Label {
                     text: "Recent changes"
                     color: root.theme.textSecondary
-                    font.pixelSize: 12
+                    font.pixelSize: 11
                     font.bold: true
-                    Layout.topMargin: 4
+                    Layout.topMargin: 2
                     visible: recentList.count > 0
                 }
                 Label {
@@ -198,17 +198,20 @@ Window {
                     font.pixelSize: 12
                     visible: recentList.count === 0
                 }
-                Repeater {
+                ListView {
                     id: recentList
+                    Layout.fillWidth: true
+                    spacing: 2
+                    clip: true
                     model: root.recent().length
-                    RecentItem {
+                    delegate: RecentItem {
                         required property int index
                         readonly property var entry: root.recent()[index] || ({})
                         item: entry
                         theme: root.theme
                         when: root.ago(entry.at, root.clock)
                         glyph: root.actionGlyph(entry.action)
-                        Layout.fillWidth: true
+                        width: ListView.view.width
                     }
                 }
             }

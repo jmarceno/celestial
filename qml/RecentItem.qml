@@ -12,7 +12,7 @@ Rectangle {
     property string when: ""
     property string glyph: ""
     readonly property bool deleted: item.action === "deleted_local" || item.action === "deleted_remote"
-    implicitHeight: row.implicitHeight + 12
+    implicitHeight: row.implicitHeight + 6
 
     function fileUrl(path) {
         return "file://" + path.split("/").map(encodeURIComponent).join("/")
@@ -26,31 +26,31 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        anchors.leftMargin: 10
-        anchors.rightMargin: 6
-        spacing: 10
+        anchors.leftMargin: 6
+        anchors.rightMargin: 4
+        spacing: 6
         Label {
             text: root.glyph
             color: root.deleted ? root.theme.textDim : root.theme.accentStrong
-            font.pixelSize: 14
+            font.pixelSize: 12
             font.bold: true
-            Layout.preferredWidth: 14
+            Layout.preferredWidth: 12
             horizontalAlignment: Text.AlignHCenter
         }
         Column {
             Layout.fillWidth: true
-            spacing: 1
+            spacing: 0
             Label {
                 text: root.item.name || ""
                 color: root.deleted ? root.theme.textMuted : root.theme.textPrimary
-                font.pixelSize: 13
+                font.pixelSize: 12
                 elide: Text.ElideMiddle
                 width: parent.width
             }
             Label {
                 text: [root.item.label, root.item.sizeText, root.when].filter(function(part) { return part && part.length > 0 }).join(" · ")
                 color: root.theme.textMuted
-                font.pixelSize: 11
+                font.pixelSize: 10
                 elide: Text.ElideRight
                 width: parent.width
             }
@@ -59,7 +59,7 @@ Rectangle {
             text: "Folder"
             flat: true
             visible: root.item.folder && root.item.folder.length > 0
-            contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 12 }
+            contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 11 }
             background: Rectangle { color: "transparent" }
             onClicked: Qt.openUrlExternally(root.fileUrl(root.item.folder))
         }
@@ -67,7 +67,7 @@ Rectangle {
     MouseArea {
         id: area
         anchors.fill: parent
-        anchors.rightMargin: 64
+        anchors.rightMargin: 56
         hoverEnabled: true
         cursorShape: root.deleted ? Qt.ArrowCursor : Qt.PointingHandCursor
         onClicked: {
