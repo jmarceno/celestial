@@ -768,6 +768,11 @@ pub fn run(
 
     let states = store::load_item_states(pair.db, pair.dir.id).map_err(|err| err.to_string())?;
     for state in states.values() {
+        // A limitation warning the person dismissed stays hidden; the item
+        // remains blocked, but it is not counted or reported again.
+        if state.dismissed && observe::is_limitation(&state.reason) {
+            continue;
+        }
         if state.state == store::RETRYING {
             report.retrying += 1;
             report.next_retry = Some(

@@ -2,6 +2,7 @@
 use super::*;
 use crate::entities::{RemotesActiveModel, SyncItemsActiveModel};
 use crate::sync::model::FILE_IGNORE_NAME;
+use crate::sync::observe;
 use crate::sync::recovery;
 use crate::sync::testing::{Fixture, TestHooks, permissions_apply, set_time};
 use sea_orm::Database;
@@ -1064,6 +1065,51 @@ fn leftover_partial_downloads_are_not_uploaded() {
     f.pass();
     assert!(!f.remote_file("file.txt.Ab3dE6gH.partial").exists());
     assert_eq!(f.errors().len(), 1);
+}
+
+#[test]
+fn dismissed_limitation_warnings_do_not_reappear() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    // A symbolic link is a limitation: it is shown as a warning, not an error.
+    std::os::unix::fs::symlink(
+        f.local.join("file.txt"),
+        f.local.join("link"),
+    )
+    .unwrap();
+    f.pass();
+    assert_eq!(f.errors().len(), 1);
+    let error = &f.errors()[0].error;
+    assert!(matches!(
+        error,
+        SyncError::Item {
+            state, reason, ..
+        } if *state == store::BLOCKED && observe::is_limitation(reason)
+    ));
+    // The snapshot marks it as a warning.
+    let snapshot = f.model.snapshot();
+    let warnings = &snapshot["remotes"][0]["dirs"][0]["errors"];
+    assert_eq!(warnings[0]["warning"], true);
+    // Dismissing it remembers the item; the next pass does not report it again.
+    let id = f.errors()[0].id;
+    let (remote, local, remote_path) = f.names();
+    let mut schedule = Schedule::default();
+    dismiss_error(
+        &f.db,
+        &mut f.model,
+        &mut schedule,
+        &remote,
+        &local,
+        &remote_path,
+        id,
+    );
+    assert!(f.errors().is_empty());
+    let state = item_states(&f)["link"].clone();
+    assert!(state.dismissed);
+    // A later pass re-blocks the link but keeps the dismissal.
+    f.pass();
+    assert!(f.errors().is_empty());
+    assert!(item_states(&f)["link"].dismissed);
 }
 
 #[test]

@@ -454,6 +454,8 @@ pub struct ItemState {
     pub attempts: i64,
     pub next_attempt: Option<i64>,
     pub reason: String,
+    /// A limitation warning the person dismissed; it is not reported again.
+    pub dismissed: bool,
 }
 
 /// First retry after one minute, doubling to at most one hour.
@@ -468,12 +470,13 @@ pub fn load_item_states<C: ConnectionTrait>(
 ) -> Result<BTreeMap<String, ItemState>, DbErr> {
     query(
         db,
-        "SELECT rel_path, state, attempts, next_attempt, reason FROM item_states WHERE sync_dir_id = ?",
+        "SELECT rel_path, state, attempts, next_attempt, reason, dismissed FROM item_states WHERE sync_dir_id = ?",
         vec![sync_dir_id.into()],
     )?
     .iter()
     .map(|row| {
         let rel: String = get(row, "rel_path")?;
+        let dismissed: i64 = get(row, "dismissed")?;
         Ok((
             rel.clone(),
             ItemState {
@@ -482,6 +485,7 @@ pub fn load_item_states<C: ConnectionTrait>(
                 attempts: get(row, "attempts")?,
                 next_attempt: get(row, "next_attempt")?,
                 reason: get(row, "reason")?,
+                dismissed: dismissed != 0,
             },
         ))
     })
@@ -513,6 +517,7 @@ pub fn set_retrying<C: ConnectionTrait>(
         attempts,
         next_attempt: Some(next),
         reason: reason.to_owned(),
+        dismissed: false,
     })
 }
 
@@ -564,6 +569,21 @@ pub fn clear_item_state<C: ConnectionTrait>(
         db,
         "DELETE FROM item_states WHERE sync_dir_id = ? AND rel_path = ?",
         vec![sync_dir_id.into(), rel.into()],
+    )
+    .map(|_| ())
+}
+
+/// Remember that the person dismissed a limitation warning. The item stays
+/// blocked; the flag keeps the next pass from reporting it again.
+pub fn dismiss_item<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    rel: &str,
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "UPDATE item_states SET dismissed = 1, updated_at = ? WHERE sync_dir_id = ? AND rel_path = ?",
+        vec![now().into(), sync_dir_id.into(), rel.into()],
     )
     .map(|_| ())
 }

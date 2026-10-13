@@ -474,6 +474,7 @@ fn error_json(err: &StoredError) -> Value {
             json!({
                 "id": err.id,
                 "kind": state,
+                "warning": super::observe::is_limitation(reason),
                 "title": util::fmt_home(path),
                 "detail": detail,
             })

@@ -253,6 +253,15 @@ pub const NON_UTF8: &str = "The name is not valid UTF-8, so it cannot be represe
 pub const NOT_REGULAR: &str = "Only regular files and folders are synchronized; symbolic links and special files are skipped.";
 pub const LEFTOVER_PARTIAL: &str = "This looks like an unfinished download left by an earlier version. It is not uploaded; delete it if the complete file is present.";
 
+/// A limitation of the sync itself: a kind of item that is never
+/// synchronized (a symbolic link, a special file, a name the remote cannot
+/// represent, a leftover partial download). It is not an error the person can
+/// fix by re-checking; it is shown as a dismissable warning, and a dismissed
+/// one is not reported again.
+pub fn is_limitation(reason: &str) -> bool {
+    reason == NON_UTF8 || reason == NOT_REGULAR || reason == LEFTOVER_PARTIAL
+}
+
 /// rclone's temporary download name: `<name>.<8 characters>.partial`.
 pub fn is_rclone_partial(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".partial") else {

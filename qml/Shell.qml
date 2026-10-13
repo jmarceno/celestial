@@ -37,6 +37,13 @@ ApplicationWindow {
     property var popupRef: ({})
     property string loginKind: "gdrive"
     property bool totpEnabled: false
+    // Sync issues split by severity: real errors stay actionable,
+    // limitation warnings (symlinks, special files, non-UTF-8 names,
+    // leftover partials) are dismissable and stay dismissed.
+    readonly property var errorEntries: (root.detail && root.detail.errors ? root.detail.errors : [])
+        .filter(function (e) { return e.warning !== true })
+    readonly property var warningEntries: (root.detail && root.detail.errors ? root.detail.errors : [])
+        .filter(function (e) { return e.warning === true })
 
     function parse(value, fallback) {
         try { return JSON.parse(value) } catch (error) { return fallback }
@@ -616,13 +623,13 @@ ApplicationWindow {
                         color: root.theme.textSecondary
                         font.pixelSize: 13
                         font.bold: true
-                        visible: root.detail && root.detail.errors && root.detail.errors.length > 0
+                        visible: root.errorEntries.length > 0
                     }
                     Repeater {
-                        model: (root.detail && root.detail.errors ? root.detail.errors : []).length
+                        model: root.errorEntries.length
                         Rectangle {
                             required property int index
-                            readonly property var entry: (root.detail && root.detail.errors ? root.detail.errors : [])[index] || ({})
+                            readonly property var entry: root.errorEntries[index] || ({})
                             Layout.fillWidth: true
                             implicitHeight: errorCol.implicitHeight + 20
                             radius: root.theme.radiusSm
@@ -642,6 +649,46 @@ ApplicationWindow {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: root.controller.activateError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
+                            }
+                        }
+                    }
+                    Label {
+                        text: "Warnings"
+                        color: root.theme.textSecondary
+                        font.pixelSize: 13
+                        font.bold: true
+                        visible: root.warningEntries.length > 0
+                    }
+                    Repeater {
+                        model: root.warningEntries.length
+                        Rectangle {
+                            required property int index
+                            readonly property var entry: root.warningEntries[index] || ({})
+                            Layout.fillWidth: true
+                            implicitHeight: warningRow.implicitHeight + 20
+                            radius: root.theme.radiusSm
+                            color: root.theme.warningBg
+                            border.color: root.theme.warning
+                            RowLayout {
+                                id: warningRow
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 10
+                                spacing: 8
+                                Column {
+                                    Layout.fillWidth: true
+                                    spacing: 2
+                                    Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 13; wrapMode: Text.WordWrap; width: parent.width }
+                                    Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 12; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: parent.width }
+                                }
+                                Button {
+                                    text: "Dismiss"
+                                    flat: true
+                                    contentItem: Label { text: parent.text; color: root.theme.warning; font.pixelSize: 13 }
+                                    background: Rectangle { color: "transparent" }
+                                    onClicked: root.controller.dismissError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
+                                }
                             }
                         }
                     }

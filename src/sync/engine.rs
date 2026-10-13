@@ -1096,6 +1096,19 @@ fn dismiss_error(
         SyncError::Item { rel, state, .. } if state == store::RETRYING => {
             store::retry_now(db, sync_dir.id, rel)
         }
+        // A limitation (symlink, special file, non-UTF-8 name, leftover
+        // partial) can never be synchronized. Dismissing it remembers the
+        // item, so the next pass does not report it again.
+        SyncError::Item {
+            rel,
+            state,
+            reason,
+            ..
+        }
+            if *state == store::BLOCKED && super::observe::is_limitation(reason) =>
+        {
+            store::dismiss_item(db, sync_dir.id, rel)
+        }
         SyncError::Item { rel, .. } => store::clear_item_state(db, sync_dir.id, rel),
         SyncError::Conflict { id, .. } => {
             store::acknowledge_conflict(db, sync_dir.id, *id).map(|_| ())
