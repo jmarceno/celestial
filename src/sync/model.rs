@@ -58,6 +58,8 @@ pub struct DirState {
     pub recovery: Vec<Value>,
     /// Recently synchronized files, newest first.
     pub recent: Vec<Value>,
+    /// Waiting for the person to start it; no pass runs.
+    pub paused: bool,
 }
 
 impl DirState {
@@ -68,6 +70,7 @@ impl DirState {
             errors: Vec::new(),
             recovery: Vec::new(),
             recent: Vec::new(),
+            paused: false,
         }
     }
 
@@ -164,6 +167,24 @@ impl Model {
         };
         dir.phase = phase.to_owned();
         true
+    }
+
+    /// A paused pair waits for the person; resuming it awaits its first check.
+    pub fn set_paused(&mut self, remote: &str, local: &str, remote_path: &str, paused: bool) {
+        let Some(dir) = self.dir_mut(remote, local, remote_path) else {
+            return;
+        };
+        if dir.paused == paused {
+            return;
+        }
+        dir.paused = paused;
+        if paused {
+            dir.status = tr::tr!("Paused. Review the exclusions, then start syncing.");
+            dir.phase = "paused".into();
+        } else {
+            dir.status = tr::tr!("Awaiting sync check...");
+            dir.phase = "loading".into();
+        }
     }
 
     /// Whether the pair is paused by a pair-level problem.
@@ -351,6 +372,7 @@ impl Model {
                             "remoteDisplay": format!("/{remote}"),
                             "status": dir.status,
                             "phase": dir.phase,
+                            "paused": dir.paused,
                             "errorStatus": dir.error_status(),
                             "errors": dir.errors.iter().map(error_json).collect::<Vec<_>>(),
                             "exclusions": read_exclusions(local),

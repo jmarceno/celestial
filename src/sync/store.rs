@@ -189,6 +189,23 @@ pub fn next_generation<C: ConnectionTrait>(db: &C, sync_dir_id: i32) -> Result<i
     )
 }
 
+/// Pairs that wait for the person to start them.
+pub fn paused_pairs<C: ConnectionTrait>(db: &C) -> Result<std::collections::HashSet<i32>, DbErr> {
+    query(db, "SELECT id FROM sync_dirs WHERE paused != 0", vec![])?
+        .iter()
+        .map(|row| get::<i32>(row, "id"))
+        .collect()
+}
+
+pub fn set_paused<C: ConnectionTrait>(db: &C, sync_dir_id: i32, paused: bool) -> Result<(), DbErr> {
+    exec(
+        db,
+        "UPDATE sync_dirs SET paused = ? WHERE id = ?",
+        vec![paused.into(), sync_dir_id.into()],
+    )
+    .map(|_| ())
+}
+
 /// The recorded name and (device, inode) of the pair's internal folder.
 /// A folder name and its (device, inode).
 pub type FolderIdentity = (String, (u64, u64));

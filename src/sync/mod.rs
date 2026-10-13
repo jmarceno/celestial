@@ -37,6 +37,12 @@ pub enum Command {
         local: String,
         remote_path: String,
     },
+    /// Start a pair that was added paused.
+    ResumeDir {
+        remote: String,
+        local: String,
+        remote_path: String,
+    },
     SaveExclusions {
         local: String,
         text: String,

@@ -7,6 +7,7 @@ mod m20261007_000001_sync_items_unique_paths;
 mod m20261007_000002_sync_state;
 mod m20261007_000003_internal_dir;
 mod m20261008_000001_sync_activity;
+mod m20261013_000001_paused_pairs;
 
 pub struct Migrator;
 
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000002_sync_state::Migration),
             Box::new(m20261007_000003_internal_dir::Migration),
             Box::new(m20261008_000001_sync_activity::Migration),
+            Box::new(m20261013_000001_paused_pairs::Migration),
         ]
     }
 }

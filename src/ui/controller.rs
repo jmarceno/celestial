@@ -105,6 +105,16 @@ mod qobject {
         #[cxx_name = "addDir"]
         fn add_dir(self: Pin<&mut Self>, remote: &QString, local: &QString, remote_path: &QString);
 
+        /// Start a folder pair that was added paused.
+        #[qinvokable]
+        #[cxx_name = "resumeDir"]
+        fn resume_dir(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+        );
+
         #[qinvokable]
         #[cxx_name = "saveExclusions"]
         fn save_exclusions(self: Pin<&mut Self>, local: &QString, text: &QString);
@@ -385,6 +395,14 @@ impl qobject::AppController {
 
     fn add_dir(self: Pin<&mut Self>, remote: &QString, local: &QString, remote_path: &QString) {
         self.send(Command::AddDir {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+        });
+    }
+
+    fn resume_dir(self: Pin<&mut Self>, remote: &QString, local: &QString, remote_path: &QString) {
+        self.send(Command::ResumeDir {
             remote: remote.to_string(),
             local: local.to_string(),
             remote_path: remote_path.to_string(),

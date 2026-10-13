@@ -197,9 +197,18 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
             continue;
         }
         prompted_login = false;
+        let paused = match store::paused_pairs(&db) {
+            Ok(paused) => paused,
+            Err(err) => {
+                database_unavailable(shared, &mut model, &err);
+                wait_command(&rx, &mut queue, Duration::from_secs(5));
+                continue;
+            }
+        };
         let pairs: Vec<(i32, PathBuf)> = match util::await_future(SyncDirsEntity::find().all(&db)) {
             Ok(dirs) => dirs
                 .into_iter()
+                .filter(|dir| !paused.contains(&dir.id))
                 .map(|dir| (dir.id, PathBuf::from(dir.local_path)))
                 .collect(),
             Err(err) => {
@@ -227,6 +236,13 @@ fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(
             };
             for dir in &sync_dirs {
                 model.ensure_dir(&remote.name, &dir.local_path, &dir.remote_path);
+            }
+            let sync_dirs: Vec<SyncDirsModel> = sync_dirs
+                .into_iter()
+                .filter(|dir| !paused.contains(&dir.id))
+                .collect();
+            if sync_dirs.is_empty() {
+                continue;
             }
             if !capabilities.contains_key(&remote.name) {
                 // An unreachable remote is probed again on its check
@@ -644,8 +660,15 @@ fn reload_model(db: &DatabaseConnection, model: &mut Model) -> Result<(), DbErr>
                 .filter(SyncDirsColumn::RemoteId.eq(remote.id))
                 .all(db),
         )?;
+        let paused = store::paused_pairs(db)?;
         for dir in dirs {
             model.ensure_dir(&remote.name, &dir.local_path, &dir.remote_path);
+            model.set_paused(
+                &remote.name,
+                &dir.local_path,
+                &dir.remote_path,
+                paused.contains(&dir.id),
+            );
             let recent = store::recent_activity(db, dir.id, model::RECENT_SHOWN as i64)?
                 .iter()
                 .map(|activity| model::activity_json(&dir.local_path, activity))
@@ -909,6 +932,26 @@ fn apply_between_passes(
             Command::SaveExclusions { local, text } => {
                 if let Err(err) = model::write_exclusions(&local, &text) {
                     shared.dialog("error", tr::tr!("File/Folder Exclusions"), err);
+                }
+            }
+            Command::ResumeDir {
+                remote,
+                local,
+                remote_path,
+            } => {
+                let Some((_, dir)) = find_pair(db, &remote, &local, &remote_path) else {
+                    continue;
+                };
+                match store::set_paused(db, dir.id, false) {
+                    Ok(()) => {
+                        model.set_paused(&remote, &local, &remote_path, false);
+                        schedule.wake(dir.id);
+                    }
+                    Err(err) => shared.dialog(
+                        "error",
+                        tr::tr!("Unable to start synchronization"),
+                        err.to_string(),
+                    ),
                 }
             }
             Command::ListDirs { remote, path } => {
@@ -1305,17 +1348,27 @@ fn add_dir(
         shared.dialog("error", tr::tr!("File/Folder Exclusions"), err);
         return;
     }
-    if util::await_future(
-        SyncDirsActiveModel {
+    // A new pair starts paused so its exclusions can be edited before the
+    // first pass transfers anything.
+    let inserted: Result<(), DbErr> = util::await_future(async {
+        let tx = db.begin().await?;
+        let dir = SyncDirsActiveModel {
             remote_id: ActiveValue::Set(db_remote.id),
             local_path: ActiveValue::Set(local_text.clone()),
             remote_path: ActiveValue::Set(remote_text.clone()),
             ..Default::default()
         }
-        .insert(db),
-    )
-    .is_err()
-    {
+        .insert(&tx)
+        .await?;
+        tx.execute(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE sync_dirs SET paused = 1 WHERE id = ?",
+            vec![dir.id.into()],
+        ))
+        .await?;
+        tx.commit().await
+    });
+    if inserted.is_err() {
         shared.dialog(
             "error",
             tr::tr!("Unable to connect to database [{}].", "insert"),
@@ -1324,6 +1377,12 @@ fn add_dir(
         return;
     }
     model.ensure_dir(remote_name, &local_text, &remote_text);
+    model.set_paused(remote_name, &local_text, &remote_text, true);
+    shared.dialog(
+        "dir-added",
+        "",
+        json!({ "local": local_text, "remotePath": remote_text }).to_string(),
+    );
 }
 
 fn list_dir_names(remote: &str, path: &str) -> Result<Vec<String>, String> {

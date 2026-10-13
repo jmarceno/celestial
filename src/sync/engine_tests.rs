@@ -1979,6 +1979,37 @@ fn settings_read_failures_are_errors_not_empty_configuration() {
 }
 
 #[test]
+fn paused_pairs_stay_paused_until_started() {
+    let f = Fixture::new();
+    let (local, remote_path) = (&f.dir.local_path, &f.dir.remote_path);
+    store::set_paused(&f.db, f.dir.id, true).unwrap();
+    let mut model = Model::new();
+    reload_model(&f.db, &mut model).unwrap();
+    let dir = model.dir(&f.remote.name, local, remote_path).unwrap();
+    assert!(dir.paused);
+    assert_eq!(dir.phase, "paused");
+
+    let mut schedule = Schedule::default();
+    let mut queue = VecDeque::from([Command::ResumeDir {
+        remote: f.remote.name.clone(),
+        local: local.clone(),
+        remote_path: remote_path.clone(),
+    }]);
+    apply_between_passes(
+        &f.shared,
+        &f.db,
+        &mut model,
+        &mut queue,
+        &mut schedule,
+        &mut HashMap::new(),
+    );
+    assert!(store::paused_pairs(&f.db).unwrap().is_empty());
+    let dir = model.dir(&f.remote.name, local, remote_path).unwrap();
+    assert!(!dir.paused);
+    assert!(schedule.remote_checks.due(f.dir.id));
+}
+
+#[test]
 fn versions_of_unresolved_conflicts_are_never_pruned() {
     let mut f = Fixture::new();
     f.seed("file.txt");

@@ -23,6 +23,8 @@ ApplicationWindow {
     property int clock: 0
     property string selectedName: ""
     property var detail: null
+    // A folder just added: open its page once the snapshot lists it.
+    property var pendingDetail: null
     property string exclusionDraft: ""
     // Remote folder browser state. `browsePath` is "" for the remote root.
     property string browsePath: ""
@@ -48,6 +50,26 @@ ApplicationWindow {
             if (list[i].name === root.selectedName) return list[i]
         }
         return list.length > 0 ? list[0] : null
+    }
+    function openDetail(entry) {
+        root.detail = entry
+        exclusionArea.text = (entry.exclusions || []).join("\n")
+        detailFlick.contentY = 0
+    }
+    function openPendingDetail() {
+        if (!root.pendingDetail) return
+        var remote = root.selectedRemote()
+        var dirs = remote ? (remote.dirs || []) : []
+        for (var i = 0; i < dirs.length; i++) {
+            if (dirs[i].localPath === root.pendingDetail.local && dirs[i].remotePath === root.pendingDetail.remotePath) {
+                root.pendingDetail = null
+                root.openDetail(dirs[i])
+                return
+            }
+        }
+    }
+    function resumeDir(entry) {
+        root.controller.resumeDir(root.selectedName, entry.localPath, entry.remotePath)
     }
     function phaseColor(phase) {
         if (phase === "done") return root.theme.statusGreen
@@ -137,6 +159,7 @@ ApplicationWindow {
             root.snapshot = root.parse(root.controller.snapshot_json, { remotes: [] })
             if (root.selectedName.length === 0 && root.remotes().length > 0)
                 root.selectedName = root.remotes()[0].name
+            root.openPendingDetail()
             if (!root.detail)
                 return
             var remote = root.selectedRemote()
@@ -191,6 +214,11 @@ ApplicationWindow {
                 root.popupTitle = title
                 root.popupBody = body
                 dialog.open()
+                return
+            }
+            if (kind === "dir-added") {
+                root.pendingDetail = root.parse(body, null)
+                root.openPendingDetail()
                 return
             }
             if (kind === "auth-done") {
@@ -437,6 +465,8 @@ ApplicationWindow {
                                     anchors.fill: parent
                                     anchors.margins: 14
                                     spacing: 12
+                                    // Above the card's MouseArea so the start button gets its clicks.
+                                    z: 1
                                     Rectangle {
                                         width: 10
                                         height: 10
@@ -468,16 +498,17 @@ ApplicationWindow {
                                             Layout.topMargin: 4
                                         }
                                     }
+                                    PrimaryButton {
+                                        text: "▶  Start"
+                                        visible: dirCard.entry.paused === true
+                                        onClicked: root.resumeDir(dirCard.entry)
+                                    }
                                     Label { text: "›"; color: root.theme.textDim; font.pixelSize: 18 }
                                 }
                                 MouseArea {
                                     anchors.fill: parent
                                     cursorShape: Qt.PointingHandCursor
-                                    onClicked: {
-                                        root.detail = entry
-                                        exclusionArea.text = (entry.exclusions || []).join("\n")
-                                        detailFlick.contentY = 0
-                                    }
+                                    onClicked: root.openDetail(dirCard.entry)
                                 }
                             }
                         }
@@ -518,6 +549,16 @@ ApplicationWindow {
                             onClicked: root.detail = null
                         }
                         Item { Layout.fillWidth: true }
+                        PrimaryButton {
+                            text: "▶  Start syncing"
+                            visible: root.detail !== null && root.detail.paused === true
+                            onClicked: {
+                                // Unsaved exclusion edits apply before the first pass.
+                                if (exclusionArea.text !== (root.detail.exclusions || []).join("\n"))
+                                    root.controller.saveExclusions(root.detail.localPath, exclusionArea.text)
+                                root.resumeDir(root.detail)
+                            }
+                        }
                         PrimaryButton {
                             text: "Stop syncing"
                             danger: true
@@ -863,7 +904,7 @@ ApplicationWindow {
                     onClicked: root.dismissDialog()
                 }
                 PrimaryButton {
-                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Sync" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : "Confirm")))
+                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : "Confirm")))
                     visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space"
                     onClicked: {
                         if (root.popupMode === "login") {
