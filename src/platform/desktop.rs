@@ -220,6 +220,60 @@ fn exec_target(contents: &str) -> Option<String> {
     Some(w.to_string())
 }
 
+/// `major.minor.patch` from `celestial --version` output.
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = s.split_whitespace().last()?.split('.');
+    let mut next = || parts.next()?.parse().ok();
+    Some((next()?, next()?, next()?))
+}
+
+/// Overwrite the launcher a desktop entry points at with the portable `.run`
+/// running now, unless that launcher reports a newer version. Otherwise an
+/// older install keeps starting at login against a database a newer build
+/// already migrated, and refuses to run.
+fn replace_older_launcher(target: &Path, current: &Path) {
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if same(target, current) {
+        return;
+    }
+    if let (Ok(a), Ok(b)) = (std::fs::read(target), std::fs::read(current)) {
+        if a == b {
+            return;
+        }
+    }
+    let ours = parse_version(env!("CARGO_PKG_VERSION"));
+    let theirs = std::process::Command::new(target)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| parse_version(&String::from_utf8_lossy(&o.stdout)));
+    if let (Some(ours), Some(theirs)) = (ours, theirs) {
+        if theirs > ours {
+            return;
+        }
+    }
+    // Copy beside it and rename: replacing a running executable in place
+    // fails with "Text file busy".
+    let staged = target.with_extension("new");
+    let result = std::fs::copy(current, &staged)
+        .and_then(|_| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        })
+        .and_then(|_| std::fs::rename(&staged, target));
+    match result {
+        Ok(()) => tracing::info!(path = %target.display(), "replaced older installed launcher"),
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            tracing::warn!(path = %target.display(), "could not replace installed launcher: {e}");
+        }
+    }
+}
+
 /// Add the app-menu entry on the first run, and repoint existing entries
 /// whose absolute launcher path no longer exists (the `.run` was moved or
 /// renamed) at the portable launcher running now.
@@ -246,7 +300,11 @@ pub fn refresh_stale_entries() {
         };
         // Bare names (`Exec=celestial`) resolve via PATH; leave them alone.
         let target = Path::new(&target);
-        if !target.is_absolute() || target.is_file() {
+        if !target.is_absolute() {
+            continue;
+        }
+        if target.is_file() {
+            replace_older_launcher(target, &current);
             continue;
         }
         match write_entry(&path, &current) {
