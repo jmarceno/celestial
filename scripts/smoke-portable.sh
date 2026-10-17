@@ -43,8 +43,11 @@ fi
 
 echo "--- headless GUI start ---"
 LOG="$SANDBOX/gui.log"
-# The watchdog exits 2 within 10 s if QML fails; success = bootstrap log line.
-DISPLAY="${DISPLAY:-:0}" QT_QPA_PLATFORM=offscreen CELESTIAL_LOG=info timeout 8 "$ABS_RUN" >"$LOG" 2>&1 || true
+# CELESTIAL_LOG_STDERR keeps the app from moving stderr into its own log file,
+# which would leave $LOG empty. The watchdog exits 2 within 10 s if QML fails;
+# success = bootstrap log line.
+DISPLAY="${DISPLAY:-:0}" QT_QPA_PLATFORM=offscreen CELESTIAL_LOG=info \
+  CELESTIAL_LOG_STDERR=1 timeout 8 "$ABS_RUN" >"$LOG" 2>&1 || true
 if ! grep -q "QML bootstrap complete" "$LOG"; then
   cat "$LOG" >&2
   echo "error: QML UI did not load" >&2

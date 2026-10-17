@@ -82,10 +82,18 @@ const LOG_LIMIT: u64 = 20 * 1024 * 1024;
 /// Send stderr (Celestial's log and the messages of Qt and rclone) to the
 /// log file when it is not a terminal, so a session started from the app
 /// menu leaves a trace, even of a crash. One older log is kept.
+///
+/// `CELESTIAL_LOG_STDERR` (set to anything non-empty) keeps stderr as it is.
+/// A caller that redirected stderr on purpose — the portable smoke test, a
+/// wrapper capturing output — would otherwise see an empty stream and read
+/// the log file instead.
 pub fn log_to_file() {
     use std::io::IsTerminal;
     use std::os::fd::AsRawFd;
     if std::io::stderr().is_terminal() {
+        return;
+    }
+    if std::env::var_os("CELESTIAL_LOG_STDERR").is_some_and(|v| !v.is_empty()) {
         return;
     }
     let path = log_path();
