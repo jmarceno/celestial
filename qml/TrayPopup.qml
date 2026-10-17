@@ -19,9 +19,11 @@ Window {
 
     signal openRequested()
 
-    width: 380
-    height: Math.min(560, content.implicitHeight + 32)
-    minimumHeight: 160
+    width: 420
+    // Fixed and roomy: sizing to the content opened it before the list had laid out.
+    height: 540
+    minimumWidth: 320
+    minimumHeight: 320
     visible: false
     flags: Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
     color: root.theme.windowBg
