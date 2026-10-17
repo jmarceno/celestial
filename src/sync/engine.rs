@@ -1496,6 +1496,47 @@ fn list_dir_names(remote: &str, path: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// How long a missing local folder may take to appear before it is reported.
+/// FUSE filesystems such as VerFSNext mount their folders after login, often
+/// after Celestial has started.
+#[cfg(not(test))]
+const LOCAL_ROOT_GRACE: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const LOCAL_ROOT_GRACE: Duration = Duration::ZERO;
+
+/// When each pair's local folder was first found unavailable.
+static LOCAL_ROOT_WAITS: std::sync::Mutex<Option<HashMap<i32, Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether the local folder can be synchronized. An empty folder for a pair
+/// that has synchronized before is a mount point whose filesystem is not
+/// mounted yet.
+fn local_root_ready(db: &DatabaseConnection, sync_dir: &SyncDirsModel) -> Result<(), String> {
+    let mut entries = fs::read_dir(&sync_dir.local_path).map_err(|err| err.to_string())?;
+    if entries.next().is_none() && store::load_baselines(db, sync_dir).is_ok_and(|b| !b.is_empty())
+    {
+        return Err("the folder is empty; its drive may not be mounted yet".into());
+    }
+    Ok(())
+}
+
+/// Whether to keep waiting quietly for an unavailable local folder.
+pub(super) fn waiting_for_local_root(id: i32, grace: Duration) -> bool {
+    let mut waits = LOCAL_ROOT_WAITS.lock().unwrap_or_else(|err| err.into_inner());
+    let since = *waits
+        .get_or_insert_with(HashMap::new)
+        .entry(id)
+        .or_insert_with(Instant::now);
+    since.elapsed() < grace
+}
+
+pub(super) fn local_root_returned(id: i32) {
+    let mut waits = LOCAL_ROOT_WAITS.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(waits) = waits.as_mut() {
+        waits.remove(&id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pair_roots_available(
     db: &DatabaseConnection,
@@ -1507,7 +1548,17 @@ pub(super) fn pair_roots_available(
     if !matches!(sync_dir.exists(db), Ok(true)) {
         return false;
     }
-    if let Err(err) = fs::read_dir(&sync_dir.local_path) {
+    if let Err(err) = local_root_ready(db, sync_dir) {
+        if waiting_for_local_root(sync_dir.id, LOCAL_ROOT_GRACE) {
+            model.set_status(
+                &remote.name,
+                &sync_dir.local_path,
+                &sync_dir.remote_path,
+                tr::tr!("Waiting for the local folder to become available..."),
+            );
+            shared.publish(model);
+            return false;
+        }
         pair_error(
             model,
             shared,
@@ -1520,6 +1571,7 @@ pub(super) fn pair_roots_available(
         );
         return false;
     }
+    local_root_returned(sync_dir.id);
     match rclone::sync::stat(&remote.name, &sync_dir.remote_path) {
         Ok(Some(item)) if item.is_dir => true,
         result => {

@@ -2700,3 +2700,15 @@ fn deleting_all_preserved_versions_empties_the_list() {
     assert_eq!(kept, 0);
     assert!(pass::recovery_list(&pair).unwrap().is_empty());
 }
+
+#[test]
+fn unavailable_local_root_waits_before_reporting() {
+    use super::{local_root_returned, waiting_for_local_root};
+    use std::time::Duration;
+    let id = -4242;
+    assert!(waiting_for_local_root(id, Duration::from_secs(60)));
+    assert!(!waiting_for_local_root(id, Duration::ZERO));
+    local_root_returned(id);
+    assert!(waiting_for_local_root(id, Duration::from_secs(60)));
+    local_root_returned(id);
+}
