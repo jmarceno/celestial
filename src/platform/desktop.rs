@@ -227,10 +227,38 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     Some((next()?, next()?, next()?))
 }
 
-/// Overwrite the launcher a desktop entry points at with the portable `.run`
-/// running now, unless that launcher reports a newer version. Otherwise an
-/// older install keeps starting at login against a database a newer build
-/// already migrated, and refuses to run.
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Whether the launcher `target` is at least as new as the binary running now,
+/// so it must be left alone. The reported version decides between releases;
+/// two builds of one version are told apart by which file was written last.
+fn keeps_launcher(target: &Path, current: &Path) -> bool {
+    let Ok(output) = std::process::Command::new(target)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let (Some(ours), Some(theirs)) = (
+        parse_version(env!("CARGO_PKG_VERSION")),
+        parse_version(&String::from_utf8_lossy(&output.stdout)),
+    ) else {
+        return false;
+    };
+    theirs > ours || (theirs == ours && modified(target) > modified(current))
+}
+
+/// Overwrite the launcher a desktop entry points at with the binary running
+/// now, unless that launcher is newer.
+///
+/// An installed copy older than the database refuses to start: a newer build
+/// migrated the database and the old one does not know the applied
+/// migrations. Every start therefore installs the running binary over the old
+/// launcher, so the autostart and the menu entry always launch a binary that
+/// can run.
 fn replace_older_launcher(target: &Path, current: &Path) {
     let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -244,27 +272,26 @@ fn replace_older_launcher(target: &Path, current: &Path) {
             return;
         }
     }
-    let ours = parse_version(env!("CARGO_PKG_VERSION"));
-    let theirs = std::process::Command::new(target)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .and_then(|o| parse_version(&String::from_utf8_lossy(&o.stdout)));
-    if let (Some(ours), Some(theirs)) = (ours, theirs) {
-        if theirs > ours {
-            return;
-        }
+    if keeps_launcher(target, current) {
+        tracing::info!(
+            path = %target.display(),
+            "kept the installed launcher: it is not older than this build"
+        );
+        return;
     }
-    // Copy beside it and rename: replacing a running executable in place
-    // fails with "Text file busy".
+    // Write through a symlink to the file it names, and copy beside that file
+    // before renaming: replacing a running executable in place fails with
+    // "Text file busy".
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
     let staged = target.with_extension("new");
     let result = std::fs::copy(current, &staged)
         .and_then(|_| {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
         })
-        .and_then(|_| std::fs::rename(&staged, target));
+        .and_then(|_| std::fs::rename(&staged, &target));
     match result {
         Ok(()) => tracing::info!(path = %target.display(), "replaced older installed launcher"),
         Err(e) => {
@@ -274,45 +301,49 @@ fn replace_older_launcher(target: &Path, current: &Path) {
     }
 }
 
-/// Add the app-menu entry on the first run, and repoint existing entries
-/// whose absolute launcher path no longer exists (the `.run` was moved or
-/// renamed) at the portable launcher running now.
+/// Point one desktop entry at the binary running now: overwrite the launcher
+/// it names when that one is older, or repoint the entry when it is gone.
+fn refresh_entry(path: &Path, current: &Path) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Some(target) = exec_target(&contents) else {
+        return;
+    };
+    // Bare names (`Exec=celestial`) resolve via PATH; leave them alone.
+    let target = Path::new(&target);
+    if !target.is_absolute() {
+        return;
+    }
+    if target.is_file() {
+        replace_older_launcher(target, current);
+        return;
+    }
+    match write_entry(path, current) {
+        Ok(_) => tracing::info!(path = %path.display(), "repointed stale desktop entry"),
+        Err(e) => tracing::warn!(path = %path.display(), "could not refresh desktop entry: {e}"),
+    }
+}
+
+/// Make the installed entries launch the binary that is running now.
 ///
-/// Existing icons are refreshed on any GUI launch. Launcher paths are only
-/// updated from the portable bundle; autostart is never created here.
+/// Every GUI launch, from any build, installs itself over the launcher the
+/// menu entry and the autostart entry name when that launcher is older, and
+/// repoints an entry whose launcher is gone (the file was moved or deleted).
+/// An autostart the user never enabled is not created; only the portable
+/// bundle adds the menu entry on its first run.
 pub fn refresh_stale_entries() {
     // An upgrade can change the embedded logo while keeping the same launcher.
     if (menu_entry_path().is_file() || autostart_path().is_file()) && install_icon().is_none() {
         tracing::warn!("could not refresh the installed application icon");
     }
-    if std::env::var_os("CELESTIAL_PORTABLE_EXE").is_none() {
-        return;
-    }
     let current = resolve_binary_path();
-    migrate_legacy_entries(&current);
-    add_menu_entry_on_first_run(&current);
+    if std::env::var_os("CELESTIAL_PORTABLE_EXE").is_some() {
+        migrate_legacy_entries(&current);
+        add_menu_entry_on_first_run(&current);
+    }
     for path in [menu_entry_path(), autostart_path()] {
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some(target) = exec_target(&contents) else {
-            continue;
-        };
-        // Bare names (`Exec=celestial`) resolve via PATH; leave them alone.
-        let target = Path::new(&target);
-        if !target.is_absolute() {
-            continue;
-        }
-        if target.is_file() {
-            replace_older_launcher(target, &current);
-            continue;
-        }
-        match write_entry(&path, &current) {
-            Ok(_) => tracing::info!(path = %path.display(), "repointed stale desktop entry"),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "could not refresh desktop entry: {e}")
-            }
-        }
+        refresh_entry(&path, &current);
     }
 }
 
@@ -335,5 +366,125 @@ mod tests {
         );
         assert_eq!(exec_target("Exec=\"/b/c\"\n").as_deref(), Some("/b/c"));
         assert_eq!(exec_target("Name=x\n"), None);
+    }
+
+    /// An executable that answers `--version` like the real binary does.
+    /// `marker` distinguishes two builds that report the same version.
+    fn fake_binary(path: &Path, version: &str, marker: &str) {
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\necho celestial {version}\n# {marker}\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Post-date a file so it looks installed after the binary running now.
+    fn set_write_time(path: &Path, secs_from_now: u64) {
+        let when = std::time::SystemTime::now() + std::time::Duration::from_secs(secs_from_now);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    fn write_time_of(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn running_binary_replaces_an_older_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("celestial");
+        let current = temp.path().join("celestial.run");
+        fake_binary(&target, "0.8.2", "installed");
+        fake_binary(&current, "0.8.3", "running");
+        replace_older_launcher(&target, &current);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            std::fs::read(&current).unwrap()
+        );
+    }
+
+    #[test]
+    fn same_version_installed_later_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("celestial");
+        let current = temp.path().join("celestial.run");
+        fake_binary(&target, "0.8.3", "installed");
+        fake_binary(&current, "0.8.3", "running");
+        // A build of the same version installed after this one wins, so a
+        // second checkout cannot undo a newer install.
+        set_write_time(&target, 60);
+        let installed_at = write_time_of(&target);
+        replace_older_launcher(&target, &current);
+        assert_ne!(
+            std::fs::read(&target).unwrap(),
+            std::fs::read(&current).unwrap()
+        );
+        assert_eq!(write_time_of(&target), installed_at);
+    }
+
+    #[test]
+    fn newer_installed_launcher_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("celestial");
+        let current = temp.path().join("celestial.run");
+        fake_binary(&target, "0.9.0", "installed");
+        fake_binary(&current, "0.8.3", "running");
+        replace_older_launcher(&target, &current);
+        assert_ne!(
+            std::fs::read(&target).unwrap(),
+            std::fs::read(&current).unwrap()
+        );
+    }
+
+    #[test]
+    fn identical_launcher_is_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("celestial");
+        let current = temp.path().join("celestial.run");
+        fake_binary(&target, "0.8.3", "installed");
+        std::fs::copy(&target, &current).unwrap();
+        let installed_at = write_time_of(&target);
+        replace_older_launcher(&target, &current);
+        assert_eq!(write_time_of(&target), installed_at);
+    }
+
+    #[test]
+    fn a_symlinked_launcher_is_replaced_through_the_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("bin/celestial");
+        std::fs::create_dir(temp.path().join("bin")).unwrap();
+        let current = temp.path().join("celestial.run");
+        fake_binary(&real, "0.8.2", "installed");
+        fake_binary(&current, "0.8.3", "running");
+        let link = temp.path().join("celestial");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        replace_older_launcher(&link, &current);
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            std::fs::read(&current).unwrap()
+        );
+    }
+
+    #[test]
+    fn entry_is_repointed_when_its_launcher_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("celestial.desktop");
+        let current = temp.path().join("celestial.run");
+        fake_binary(&current, "0.8.3", "running");
+        let gone = temp.path().join("deleted/celestial");
+        std::fs::write(&entry, desktop_entry(&gone, None)).unwrap();
+        refresh_entry(&entry, &current);
+        let contents = std::fs::read_to_string(&entry).unwrap();
+        assert_eq!(
+            exec_target(&contents).as_deref(),
+            Some(current.to_str().unwrap())
+        );
     }
 }

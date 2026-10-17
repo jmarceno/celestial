@@ -94,6 +94,13 @@ Its first start adds an app-menu entry. Keep the executable at a stable path.
 keeping the executable, configuration, and synchronization history. Later
 starts leave the menu entry removed; `celestial install` restores it.
 
+Every start, from any build, installs itself over the launcher the menu entry
+and the autostart entry name when that launcher is older, and repoints an entry
+whose launcher was deleted. That way login and the menu always launch the build
+you started last, instead of an old copy that cannot open a database a newer
+build already migrated. A launcher from a newer release is left in place, and
+an autostart entry you never enabled is not created.
+
 ### 3. Connect a folder
 
 1. Choose **Add server**, select a provider, and sign in.
