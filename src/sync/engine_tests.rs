@@ -2610,3 +2610,64 @@ fn copies_commit_their_outcome_once() {
         "complete"
     );
 }
+
+#[test]
+fn a_file_still_being_written_is_uploaded_once_it_is_closed() {
+    use std::io::Write;
+    let mut f = Fixture::new();
+    crate::sync::writers::enable_for_test(0);
+    let path = f.local.join("recording.mkv");
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(b"header").unwrap();
+    f.pass();
+    assert!(!f.remote_file("recording.mkv").exists());
+    let state = &item_states(&f)["recording.mkv"];
+    assert_eq!(state.state, store::RETRYING);
+    assert_eq!(state.attempts, 0);
+    assert!(state.next_attempt.unwrap() > store::now());
+    // Still open when the wait ends: it keeps waiting, without a backoff.
+    file.write_all(b" and frames").unwrap();
+    f.retry_all();
+    f.pass();
+    assert!(!f.remote_file("recording.mkv").exists());
+    assert_eq!(item_states(&f)["recording.mkv"].attempts, 0);
+    file.write_all(b" and the end").unwrap();
+    drop(file);
+    f.retry_all();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(
+        f.read_remote("recording.mkv"),
+        "header and frames and the end"
+    );
+    assert!(item_states(&f).is_empty());
+}
+
+#[test]
+fn a_synced_file_rewritten_in_place_keeps_its_remote_version_until_done() {
+    use std::io::Write;
+    let mut f = Fixture::new();
+    f.seed("video.mkv");
+    crate::sync::writers::enable_for_test(0);
+    let mut file = fs::File::create(f.local.join("video.mkv")).unwrap();
+    file.write_all(b"partial").unwrap();
+    f.pass();
+    assert_eq!(f.read_remote("video.mkv"), "original");
+    drop(file);
+    f.retry_all();
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_remote("video.mkv"), "partial");
+}
+
+#[test]
+fn a_just_modified_file_waits_for_the_quiet_age() {
+    let mut f = Fixture::new();
+    crate::sync::writers::enable_for_test(crate::sync::writers::QUIET_SECS);
+    fs::write(f.local.join("fresh.txt"), "fresh").unwrap();
+    f.pass();
+    assert!(!f.remote_file("fresh.txt").exists());
+    let state = &item_states(&f)["fresh.txt"];
+    assert_eq!(state.state, store::RETRYING);
+    assert!(state.next_attempt.unwrap() <= store::now() + crate::sync::writers::QUIET_SECS + 1);
+}

@@ -12,11 +12,12 @@ use super::exclusions::Rules;
 use super::failpoint;
 use super::localfs::Root;
 use super::model::SyncError;
-use super::observe::{self, Fingerprint, HashError, LocalMeta, LocalTree, Obs, RemoteMeta};
+use super::observe::{self, Fingerprint, HashError, LocalMeta, LocalTree, Obs, RemoteMeta, Stamp};
 use super::progress::Plan;
 use super::reconcile::{self, ConflictKind, Decision, Delta, History, Input, Kind, Side};
 use super::recovery::{self, Internal, Store as Recovery};
 use super::store::{self, Baseline, BaselineWrite};
+use super::writers::{Wait, Writers};
 use crate::entities::{RemotesModel, SyncDirsModel};
 use crate::rclone::{self, ListOptions, RcloneListFilter};
 use sea_orm::DatabaseConnection;
@@ -141,6 +142,8 @@ struct Entry {
     skip_children: bool,
     /// Why the item is blocked, when it is.
     blocked: Option<String>,
+    /// The local file is still being written: left alone until then.
+    waiting: Option<Wait>,
     /// An excess conflict copy to move into recovery on both sides.
     prune: bool,
 }
@@ -519,6 +522,7 @@ pub fn run(
     rels.sort_by(|left, right| left.split('/').cmp(right.split('/')));
 
     let now = store::now();
+    let writers = Writers::new(root_path);
     let total = rels.len();
     let mut entries: Vec<Entry> = Vec::with_capacity(rels.len());
     let mut skip_under: Option<String> = None;
@@ -553,6 +557,7 @@ pub fn run(
             skip_children: false,
             blocked: blocked.get(&rel).cloned(),
             prune: false,
+            waiting: None,
             rel,
         };
         if entry.blocked.is_some() {
@@ -565,6 +570,17 @@ pub fn run(
             if state.state == store::RETRYING && state.next_attempt.is_some_and(|at| at > now) {
                 entry.deferred = true;
                 entry.decision = Decision::Retry(state.reason.clone());
+                entries.push(entry);
+                continue;
+            }
+        }
+        // Copying a file mid-write uploads a truncated version, and every
+        // later write replaces it again. Nothing touches it until it is done.
+        if let Some(meta) = entry.local.present() {
+            entry.waiting = writers.wait(&entry.rel, meta, Stamp::now());
+            if let Some(wait) = &entry.waiting {
+                entry.deferred = true;
+                entry.decision = Decision::Retry(wait.reason.clone());
                 entries.push(entry);
                 continue;
             }
@@ -646,6 +662,11 @@ pub fn run(
             if !hooks.checkpoint() {
                 copies.wait_until(0, pair, &entries, hooks, &mut report)?;
                 return Ok(true);
+            }
+            if let Some(wait) = &entry.waiting {
+                store::set_waiting(pair.db, pair.dir.id, &entry.rel, &wait.reason, wait.until)
+                    .map_err(|err| err.to_string())?;
+                continue;
             }
             if failed[index] || entry.deferred || entry.prune {
                 continue;
@@ -1367,6 +1388,7 @@ fn fresh_entry(rel: &str, local: Option<LocalMeta>, remote: Option<RemoteMeta>) 
         skip_children: false,
         blocked: None,
         prune: false,
+        waiting: None,
     }
 }
 

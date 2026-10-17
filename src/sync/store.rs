@@ -521,6 +521,26 @@ pub fn set_retrying<C: ConnectionTrait>(
     })
 }
 
+/// Hold an item until `next_attempt` without counting a failed attempt:
+/// another program is still writing it.
+pub fn set_waiting<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    rel: &str,
+    reason: &str,
+    next_attempt: i64,
+) -> Result<(), DbErr> {
+    set_state(
+        db,
+        sync_dir_id,
+        rel,
+        RETRYING,
+        0,
+        Some(next_attempt),
+        reason,
+    )
+}
+
 /// Block an item until the person changes it (renames a collision, etc.).
 pub fn set_blocked<C: ConnectionTrait>(
     db: &C,

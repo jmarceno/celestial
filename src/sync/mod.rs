@@ -16,6 +16,7 @@ mod store;
 #[cfg(test)]
 pub(crate) mod testing;
 mod watch;
+mod writers;
 
 pub use engine::spawn;
 
