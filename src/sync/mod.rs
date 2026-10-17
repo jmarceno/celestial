@@ -69,6 +69,13 @@ pub enum Command {
         remote_path: String,
         recovery_id: i64,
     },
+    /// Delete a preserved version for good.
+    DiscardVersion {
+        remote: String,
+        local: String,
+        remote_path: String,
+        recovery_id: i64,
+    },
     DismissError {
         remote: String,
         local: String,

@@ -1070,6 +1070,30 @@ fn apply_between_passes(
                     Err(err) => shared.dialog("error", tr::tr!("Nothing was restored"), err),
                 }
             }
+            Command::DiscardVersion {
+                remote,
+                local,
+                remote_path,
+                recovery_id,
+            } => {
+                let result = find_pair(db, &remote, &local, &remote_path)
+                    .ok_or_else(|| tr::tr!("The synced folder no longer exists."))
+                    .and_then(|(remote, dir)| {
+                        let caps = caps_for(db, capabilities, &remote.name)?;
+                        let pair = Pair {
+                            db,
+                            remote: &remote,
+                            dir: &dir,
+                            caps: &caps,
+                        };
+                        let result = pass::discard(&pair, recovery_id);
+                        refresh_recovery(model, &pair);
+                        result
+                    });
+                if let Err(err) = result {
+                    shared.dialog("error", tr::tr!("Nothing was deleted"), err);
+                }
+            }
             Command::StatsDir { remote, local, remote_path } => {
                 super::measure::request(shared, remote, local, remote_path);
             }

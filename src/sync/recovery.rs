@@ -693,23 +693,7 @@ impl Store<'_> {
                 {
                     continue;
                 }
-                let removed = if item.side == "local" {
-                    match fs::remove_file(&item.stored_path) {
-                        Ok(()) => Ok(()),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(err) => Err(err.to_string()),
-                    }
-                } else {
-                    match rclone::sync::delete(&self.remote.name, &item.stored_path) {
-                        Ok(()) => Ok(()),
-                        Err(err) => {
-                            match rclone::sync::stat(&self.remote.name, &item.stored_path) {
-                                Ok(None) => Ok(()),
-                                _ => Err(err.error),
-                            }
-                        }
-                    }
-                };
+                let removed = self.remove_stored(item);
                 match removed {
                     Ok(()) => {
                         store::mark_recovery(self.db, item.id, "pruned_at")
@@ -724,6 +708,36 @@ impl Store<'_> {
             remove_empty_dirs(&self.internal.recovery());
         }
         Ok(pruned)
+    }
+
+    /// Delete a preserved version's stored copy; a copy already gone counts
+    /// as deleted.
+    fn remove_stored(&self, item: &RecoveryItem) -> Result<(), String> {
+        if item.side == "local" {
+            match fs::remove_file(&item.stored_path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err.to_string()),
+            }
+        } else {
+            match rclone::sync::delete(&self.remote.name, &item.stored_path) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    match rclone::sync::stat(&self.remote.name, &item.stored_path) {
+                        Ok(None) => Ok(()),
+                        _ => Err(err.error),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Delete one preserved version the user no longer wants.
+    pub fn discard(&self, item: &RecoveryItem) -> Result<(), String> {
+        self.remove_stored(item)?;
+        store::mark_recovery(self.db, item.id, "pruned_at").map_err(|err| err.to_string())?;
+        remove_empty_dirs(&self.internal.recovery());
+        Ok(())
     }
 }
 

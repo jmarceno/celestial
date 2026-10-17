@@ -151,6 +151,16 @@ mod qobject {
         );
 
         #[qinvokable]
+        #[cxx_name = "deleteVersion"]
+        fn delete_version(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+            id: i64,
+        );
+
+        #[qinvokable]
         #[cxx_name = "dismissError"]
         fn dismiss_error(
             self: Pin<&mut Self>,
@@ -465,6 +475,21 @@ impl qobject::AppController {
         id: i64,
     ) {
         self.send(Command::Restore {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+            recovery_id: id,
+        });
+    }
+
+    fn delete_version(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+        id: i64,
+    ) {
+        self.send(Command::DiscardVersion {
             remote: remote.to_string(),
             local: local.to_string(),
             remote_path: remote_path.to_string(),

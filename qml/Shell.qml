@@ -763,6 +763,19 @@ ApplicationWindow {
                                     background: Rectangle { color: "transparent" }
                                     onClicked: root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
                                 }
+                                Button {
+                                    text: "Delete"
+                                    flat: true
+                                    contentItem: Label { text: parent.text; color: root.theme.textMuted; font.pixelSize: 13 }
+                                    background: Rectangle { color: "transparent" }
+                                    onClicked: {
+                                        root.popupMode = "confirm-version"
+                                        root.popupTitle = "Delete preserved version?"
+                                        root.popupBody = "The preserved " + entry.side + " copy of '" + entry.rel + "' (" + entry.when + ") is deleted for good and can no longer be restored."
+                                        root.popupRef = { remote: root.selectedName, local: root.detail.localPath, remotePath: root.detail.remotePath, id: entry.id }
+                                        dialog.open()
+                                    }
+                                }
                             }
                         }
                     }
@@ -985,8 +998,8 @@ ApplicationWindow {
                     onClicked: root.dismissDialog()
                 }
                 PrimaryButton {
-                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : "Confirm")))
-                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space"
+                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : (root.popupMode === "confirm-version" ? "Delete" : "Confirm"))))
+                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space" || root.popupMode === "confirm-version"
                     onClicked: {
                         if (root.popupMode === "login") {
                             root.controller.submitLogin(JSON.stringify({
@@ -1012,6 +1025,9 @@ ApplicationWindow {
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-dismiss" || root.popupMode === "confirm-space") {
                             root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
+                            root.closeDialog()
+                        } else if (root.popupMode === "confirm-version") {
+                            root.controller.deleteVersion(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
                             root.closeDialog()
                         } else if (root.popupMode === "conflict-info") {
                             root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)

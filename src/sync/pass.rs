@@ -2288,6 +2288,16 @@ pub fn restore(pair: &Pair, id: i64) -> Result<String, String> {
     Ok(rel)
 }
 
+/// Delete a preserved version for good; returns its item path.
+pub fn discard(pair: &Pair, id: i64) -> Result<String, String> {
+    let cx = context(pair)?;
+    let item = store::recovery_by_id(pair.db, &cx.internal.pair_uuid, id)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| tr::tr!("This preserved version is no longer available."))?;
+    cx.rec().discard(&item)?;
+    Ok(item.rel)
+}
+
 /// Preserved versions to offer for restoring, newest first.
 pub fn recovery_list(pair: &Pair) -> Result<Vec<store::RecoveryItem>, String> {
     let uuid = store::pair_uuid(pair.db, pair.dir.id).map_err(|err| err.to_string())?;
