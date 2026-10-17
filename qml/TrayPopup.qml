@@ -201,6 +201,8 @@ Window {
                 ListView {
                     id: recentList
                     Layout.fillWidth: true
+                    implicitHeight: contentHeight
+                    interactive: false
                     spacing: 2
                     clip: true
                     model: root.recent().length

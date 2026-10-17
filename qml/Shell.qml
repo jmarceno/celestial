@@ -627,6 +627,8 @@ ApplicationWindow {
                     }
                     ListView {
                         Layout.fillWidth: true
+                        implicitHeight: contentHeight
+                        interactive: false
                         spacing: 2
                         clip: true
                         model: (root.detail && root.detail.recent ? root.detail.recent.slice(0, 5) : []).length
@@ -649,6 +651,8 @@ ApplicationWindow {
                     }
                     ListView {
                         Layout.fillWidth: true
+                        implicitHeight: contentHeight
+                        interactive: false
                         spacing: 2
                         clip: true
                         model: root.errorEntries.length
@@ -686,6 +690,8 @@ ApplicationWindow {
                     }
                     ListView {
                         Layout.fillWidth: true
+                        implicitHeight: contentHeight
+                        interactive: false
                         spacing: 2
                         clip: true
                         model: root.warningEntries.length
