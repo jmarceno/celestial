@@ -27,7 +27,6 @@ pub const REMOTE_RECOVERY_ROOT: &str = ".celestial-recovery";
 const MARKER: &str = ".celestial-owner";
 /// Preserved versions kept per item, and for how long.
 pub const KEEP_VERSIONS: usize = 10;
-pub const KEEP_SECS: i64 = 30 * 24 * 3600;
 /// Visible conflict copies kept per item.
 pub const MAX_CONFLICT_COPIES: usize = 10;
 
@@ -670,9 +669,10 @@ impl Store<'_> {
     }
 
     /// Delete preserved versions beyond the retention policy: the newest
-    /// versions of each item are kept for a limited time, but never those of
-    /// unresolved conflicts or incomplete operations, nor the only copy of
-    /// an item that no longer exists anywhere.
+    /// versions of each item are kept for the pair's chosen number of days
+    /// (the only copy of an item that no longer exists anywhere too), but
+    /// those of unresolved conflicts or incomplete operations are never
+    /// deleted.
     pub fn prune(&self, live: &HashSet<String>) -> Result<usize, String> {
         let items = store::list_recovery(self.db, &self.internal.pair_uuid)
             .map_err(|err| err.to_string())?;
@@ -682,14 +682,17 @@ impl Store<'_> {
         for item in &items {
             by_item.entry(item.rel.as_str()).or_default().push(item);
         }
+        let days =
+            store::keep_versions_days(self.db, self.dir.id).map_err(|err| err.to_string())?;
         let now = store::now();
         let mut pruned = 0;
         for (rel, versions) in by_item {
             // Already sorted newest first.
             for (index, item) in versions.iter().enumerate() {
-                let fresh = now - item.created_at < KEEP_SECS;
+                let fresh = days == 0 || now - item.created_at < days * 24 * 3600;
                 let only_copy = index == 0 && !live.contains(rel);
-                if (index < KEEP_VERSIONS && fresh) || only_copy || protected.contains(&item.op_id)
+                if (fresh && (index < KEEP_VERSIONS || only_copy))
+                    || protected.contains(&item.op_id)
                 {
                     continue;
                 }

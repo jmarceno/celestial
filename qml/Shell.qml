@@ -779,6 +779,42 @@ ApplicationWindow {
                             }
                         }
                     }
+                    Button {
+                        text: "Delete all preserved versions"
+                        flat: true
+                        visible: root.detail && root.detail.recovery && root.detail.recovery.length > 0
+                        contentItem: Label { text: parent.text; color: root.theme.textMuted; font.pixelSize: 13 }
+                        background: Rectangle { color: "transparent" }
+                        onClicked: {
+                            root.popupMode = "confirm-all-versions"
+                            root.popupTitle = "Delete all preserved versions?"
+                            root.popupBody = "Every preserved version of this folder is deleted for good and can no longer be restored. Versions an unresolved conflict still needs are kept."
+                            root.popupRef = { remote: root.selectedName, local: root.detail.localPath, remotePath: root.detail.remotePath }
+                            dialog.open()
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+                        Label { text: "Keep preserved versions for"; color: root.theme.textSecondary; font.pixelSize: 13 }
+                        ComboBox {
+                            id: keepBox
+                            readonly property var days: [1, 7, 30, 90, 365, 0]
+                            Layout.preferredWidth: 160
+                            model: ["1 day", "7 days", "30 days", "90 days", "1 year", "Forever"]
+                            currentIndex: Math.max(0, days.indexOf(root.detail && root.detail.keepDays !== undefined ? root.detail.keepDays : 30))
+                            onActivated: root.controller.setKeepVersions(root.selectedName, root.detail.localPath, root.detail.remotePath, days[currentIndex])
+                            delegate: ItemDelegate {
+                                width: keepBox.width
+                                text: modelData
+                                contentItem: Label { text: modelData; color: root.theme.textPrimary; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { color: highlighted ? root.theme.cardBgRaised : root.theme.cardBg }
+                            }
+                            contentItem: Label { text: keepBox.displayText; color: root.theme.textPrimary; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: root.theme.borderSubtle }
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
                     Label { text: "File/folder exclusions"; color: root.theme.textSecondary; font.pixelSize: 13; font.bold: true }
                     Label {
                         text: "Edit or remove any starting rule and save. One rule per line: glob paths (~/ is home, / is absolute), regex: followed by a regular expression, or builtin:rust-target for Rust build folders. Regex paths are relative to this folder."
@@ -998,8 +1034,8 @@ ApplicationWindow {
                     onClicked: root.dismissDialog()
                 }
                 PrimaryButton {
-                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : (root.popupMode === "confirm-version" ? "Delete" : "Confirm"))))
-                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space" || root.popupMode === "confirm-version"
+                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : (root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions" ? "Delete" : "Confirm"))))
+                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space" || root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions"
                     onClicked: {
                         if (root.popupMode === "login") {
                             root.controller.submitLogin(JSON.stringify({
@@ -1025,6 +1061,9 @@ ApplicationWindow {
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-dismiss" || root.popupMode === "confirm-space") {
                             root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
+                            root.closeDialog()
+                        } else if (root.popupMode === "confirm-all-versions") {
+                            root.controller.deleteAllVersions(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath)
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-version") {
                             root.controller.deleteVersion(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)

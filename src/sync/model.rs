@@ -60,6 +60,8 @@ pub struct DirState {
     pub recent: Vec<Value>,
     /// Waiting for the person to start it; no pass runs.
     pub paused: bool,
+    /// How many days preserved versions are kept; 0 keeps them for good.
+    pub keep_days: i64,
 }
 
 impl DirState {
@@ -71,6 +73,7 @@ impl DirState {
             recovery: Vec::new(),
             recent: Vec::new(),
             paused: false,
+            keep_days: 30,
         }
     }
 
@@ -280,6 +283,12 @@ impl Model {
         true
     }
 
+    pub fn set_keep_days(&mut self, remote: &str, local: &str, remote_path: &str, days: i64) {
+        if let Some(dir) = self.dir_mut(remote, local, remote_path) {
+            dir.keep_days = days;
+        }
+    }
+
     pub fn set_recent(
         &mut self,
         remote: &str,
@@ -377,6 +386,7 @@ impl Model {
                             "errors": dir.errors.iter().map(error_json).collect::<Vec<_>>(),
                             "exclusions": read_exclusions(local),
                             "recovery": dir.recovery,
+                            "keepDays": dir.keep_days,
                             "recent": dir.recent,
                         })
                     })

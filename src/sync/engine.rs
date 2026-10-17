@@ -526,6 +526,17 @@ fn refresh_recovery(model: &mut Model, pair: &Pair) {
         &pair.dir.remote_path,
         values,
     );
+    match store::keep_versions_days(pair.db, pair.dir.id) {
+        Ok(days) => {
+            model.set_keep_days(
+                &pair.remote.name,
+                &pair.dir.local_path,
+                &pair.dir.remote_path,
+                days,
+            );
+        }
+        Err(err) => tracing::warn!("could not read how long versions are kept: {err}"),
+    }
 }
 
 struct WorkerHooks<'a> {
@@ -1092,6 +1103,58 @@ fn apply_between_passes(
                     });
                 if let Err(err) = result {
                     shared.dialog("error", tr::tr!("Nothing was deleted"), err);
+                }
+            }
+            Command::DiscardAllVersions {
+                remote,
+                local,
+                remote_path,
+            } => {
+                let result = find_pair(db, &remote, &local, &remote_path)
+                    .ok_or_else(|| tr::tr!("The synced folder no longer exists."))
+                    .and_then(|(remote, dir)| {
+                        let caps = caps_for(db, capabilities, &remote.name)?;
+                        let pair = Pair {
+                            db,
+                            remote: &remote,
+                            dir: &dir,
+                            caps: &caps,
+                        };
+                        let result = pass::discard_all(&pair);
+                        refresh_recovery(model, &pair);
+                        result
+                    });
+                match result {
+                    Ok((_, 0)) => {}
+                    Ok((_, kept)) => shared.dialog(
+                        "info",
+                        tr::tr!("Some versions were kept"),
+                        tr::tr!(
+                            "{} preserved versions belong to an unresolved conflict or an unfinished operation and were kept.",
+                            kept
+                        ),
+                    ),
+                    Err(err) => shared.dialog("error", tr::tr!("Not everything was deleted"), err),
+                }
+            }
+            Command::SetKeepVersions {
+                remote,
+                local,
+                remote_path,
+                days,
+            } => {
+                let result = find_pair(db, &remote, &local, &remote_path)
+                    .ok_or_else(|| tr::tr!("The synced folder no longer exists."))
+                    .and_then(|(_, dir)| {
+                        store::set_keep_versions_days(db, dir.id, days)
+                            .map_err(|err| err.to_string())?;
+                        model.set_keep_days(&remote, &local, &remote_path, days.max(0));
+                        // The next pass applies the new retention.
+                        schedule.wake(dir.id);
+                        Ok(())
+                    });
+                if let Err(err) = result {
+                    shared.dialog("error", tr::tr!("The setting was not saved"), err);
                 }
             }
             Command::StatsDir { remote, local, remote_path } => {

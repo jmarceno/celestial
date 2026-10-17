@@ -2320,6 +2320,25 @@ pub fn discard(pair: &Pair, id: i64) -> Result<String, String> {
     Ok(item.rel)
 }
 
+/// Delete every preserved version of the pair for good, except those an
+/// unresolved conflict or an incomplete operation still needs. Returns how
+/// many were deleted and how many were kept.
+pub fn discard_all(pair: &Pair) -> Result<(usize, usize), String> {
+    let cx = context(pair)?;
+    let uuid = &cx.internal.pair_uuid;
+    let protected = store::protected_operations(pair.db, uuid).map_err(|err| err.to_string())?;
+    let (mut deleted, mut kept) = (0, 0);
+    for item in store::list_recovery(pair.db, uuid).map_err(|err| err.to_string())? {
+        if protected.contains(&item.op_id) {
+            kept += 1;
+            continue;
+        }
+        cx.rec().discard(&item)?;
+        deleted += 1;
+    }
+    Ok((deleted, kept))
+}
+
 /// Preserved versions to offer for restoring, newest first.
 pub fn recovery_list(pair: &Pair) -> Result<Vec<store::RecoveryItem>, String> {
     let uuid = store::pair_uuid(pair.db, pair.dir.id).map_err(|err| err.to_string())?;

@@ -206,6 +206,30 @@ pub fn set_paused<C: ConnectionTrait>(db: &C, sync_dir_id: i32, paused: bool) ->
     .map(|_| ())
 }
 
+/// How many days the pair keeps preserved versions; 0 keeps them for good.
+pub fn keep_versions_days<C: ConnectionTrait>(db: &C, sync_dir_id: i32) -> Result<i64, DbErr> {
+    query(
+        db,
+        "SELECT keep_versions_days FROM sync_dirs WHERE id = ?",
+        vec![sync_dir_id.into()],
+    )?
+    .first()
+    .map_or(Ok(30), |row| get(row, "keep_versions_days"))
+}
+
+pub fn set_keep_versions_days<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    days: i64,
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "UPDATE sync_dirs SET keep_versions_days = ? WHERE id = ?",
+        vec![days.max(0).into(), sync_dir_id.into()],
+    )
+    .map(|_| ())
+}
+
 /// The recorded name and (device, inode) of the pair's internal folder.
 /// A folder name and its (device, inode).
 pub type FolderIdentity = (String, (u64, u64));

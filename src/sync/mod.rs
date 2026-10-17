@@ -70,6 +70,19 @@ pub enum Command {
         remote_path: String,
         recovery_id: i64,
     },
+    /// Delete every preserved version of a pair for good.
+    DiscardAllVersions {
+        remote: String,
+        local: String,
+        remote_path: String,
+    },
+    /// How many days a pair keeps preserved versions; 0 keeps them for good.
+    SetKeepVersions {
+        remote: String,
+        local: String,
+        remote_path: String,
+        days: i64,
+    },
     /// Delete a preserved version for good.
     DiscardVersion {
         remote: String,

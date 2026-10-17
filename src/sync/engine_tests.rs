@@ -1402,7 +1402,7 @@ fn acknowledging_a_conflict_removes_it() {
 }
 
 #[test]
-fn retention_keeps_recent_versions_and_the_only_copy_of_deleted_items() {
+fn retention_keeps_recent_versions_for_the_chosen_number_of_days() {
     let mut f = Fixture::new();
     f.seed("live.txt");
     let internal = recovery::ensure_internal(&f.db, &f.dir).unwrap();
@@ -1433,6 +1433,7 @@ fn retention_keeps_recent_versions_and_the_only_copy_of_deleted_items() {
     };
     let recent: Vec<_> = (0..12).map(|index| add("live.txt", 0, index)).collect();
     let expired = add("gone.txt", 40, 0);
+    let week_old = add("gone2.txt", 7, 0);
     let root = crate::sync::localfs::Root::open(&f.local, None).unwrap();
     let rec = recovery::Store {
         db: &f.db,
@@ -1446,8 +1447,19 @@ fn retention_keeps_recent_versions_and_the_only_copy_of_deleted_items() {
     // Ten newest versions of a live item remain.
     assert_eq!(recent.iter().filter(|path| path.exists()).count(), 10);
     assert!(!recent[0].exists() && !recent[1].exists());
-    // The only copy of a deleted item is kept even when old.
-    assert!(expired.exists());
+    // The only copy of a deleted item is kept while it is recent enough.
+    assert!(!expired.exists());
+    assert!(week_old.exists());
+    // Kept for good: nothing more goes, however old.
+    store::set_keep_versions_days(&f.db, f.dir.id, 0).unwrap();
+    let ancient = add("gone3.txt", 4000, 0);
+    rec.prune(&live).unwrap();
+    assert!(ancient.exists() && week_old.exists());
+    // A shorter period applies on the next prune.
+    store::set_keep_versions_days(&f.db, f.dir.id, 1).unwrap();
+    rec.prune(&live).unwrap();
+    assert!(!ancient.exists() && !week_old.exists());
+    assert_eq!(recent.iter().filter(|path| path.exists()).count(), 10);
 }
 
 #[test]
@@ -2670,4 +2682,21 @@ fn a_just_modified_file_waits_for_the_quiet_age() {
     let state = &item_states(&f)["fresh.txt"];
     assert_eq!(state.state, store::RETRYING);
     assert!(state.next_attempt.unwrap() <= store::now() + crate::sync::writers::QUIET_SECS + 1);
+}
+
+#[test]
+fn deleting_all_preserved_versions_empties_the_list() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    for edit in ["one", "two", "three"] {
+        fs::write(f.remote_file("file.txt"), edit).unwrap();
+        set_time(&f.remote_file("file.txt"), 1_700_000_000);
+        f.pass();
+    }
+    let pair = f.pair();
+    assert!(!pass::recovery_list(&pair).unwrap().is_empty());
+    let (deleted, kept) = pass::discard_all(&pair).unwrap();
+    assert!(deleted > 0);
+    assert_eq!(kept, 0);
+    assert!(pass::recovery_list(&pair).unwrap().is_empty());
 }

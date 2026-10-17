@@ -151,6 +151,25 @@ mod qobject {
         );
 
         #[qinvokable]
+        #[cxx_name = "deleteAllVersions"]
+        fn delete_all_versions(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+        );
+
+        #[qinvokable]
+        #[cxx_name = "setKeepVersions"]
+        fn set_keep_versions(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+            days: i64,
+        );
+
+        #[qinvokable]
         #[cxx_name = "deleteVersion"]
         fn delete_version(
             self: Pin<&mut Self>,
@@ -479,6 +498,34 @@ impl qobject::AppController {
             local: local.to_string(),
             remote_path: remote_path.to_string(),
             recovery_id: id,
+        });
+    }
+
+    fn delete_all_versions(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+    ) {
+        self.send(Command::DiscardAllVersions {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+        });
+    }
+
+    fn set_keep_versions(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+        days: i64,
+    ) {
+        self.send(Command::SetKeepVersions {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+            days,
         });
     }
 
