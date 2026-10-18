@@ -891,7 +891,12 @@ ApplicationWindow {
                         spacing: 10
                         CheckBox {
                             id: intervalCheck
+                            // A bare box: the label is a sibling, like the 2FA
+                            // checkbox. A custom contentItem would be drawn
+                            // over the indicator, which has no reserved
+                            // padding of its own.
                             checked: false
+                            Layout.alignment: Qt.AlignVCenter
                             onToggled: if (!root.seedingDetail) root.applyInterval()
                             indicator: Rectangle {
                                 implicitWidth: 18
@@ -901,7 +906,12 @@ ApplicationWindow {
                                 border.width: 1
                                 color: intervalCheck.checked ? root.theme.accent : "transparent"
                             }
-                            contentItem: Label { text: "Only synchronize this folder every"; color: root.theme.textSecondary; font.pixelSize: 13 }
+                        }
+                        Label {
+                            text: "Only synchronize this folder every"
+                            color: root.theme.textSecondary
+                            font.pixelSize: 13
+                            Layout.alignment: Qt.AlignVCenter
                         }
                         TextField {
                             id: intervalField
