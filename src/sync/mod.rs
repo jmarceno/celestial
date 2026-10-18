@@ -83,6 +83,22 @@ pub enum Command {
         remote_path: String,
         days: i64,
     },
+    /// The largest file a pair keeps a preserved copy of, in megabytes;
+    /// 0 keeps no copies at all.
+    SetRecoveryMax {
+        remote: String,
+        local: String,
+        remote_path: String,
+        megabytes: i64,
+    },
+    /// How long a pair waits between synchronization passes, in seconds;
+    /// 0 synchronizes as changes are detected.
+    SetSyncInterval {
+        remote: String,
+        local: String,
+        remote_path: String,
+        seconds: i64,
+    },
     /// Delete a preserved version for good.
     DiscardVersion {
         remote: String,

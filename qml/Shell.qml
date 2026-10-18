@@ -26,6 +26,8 @@ ApplicationWindow {
     // A folder just added: open its page once the snapshot lists it.
     property var pendingDetail: null
     property string exclusionDraft: ""
+    // Opening a folder seeds its settings; seeding must not save them back.
+    property bool seedingDetail: false
     // Remote folder browser state. `browsePath` is "" for the remote root.
     property string browsePath: ""
     property var browseDirs: []
@@ -60,11 +62,44 @@ ApplicationWindow {
     }
     function openDetail(entry) {
         root.detail = entry
+        // Seeding the settings must not save them back.
+        root.seedingDetail = true
         exclusionArea.text = (entry.exclusions || []).join("\n")
+        recoveryMaxField.text = String(Math.round((entry.recoveryMaxBytes !== undefined ? entry.recoveryMaxBytes : 100000000) / 1000000))
+        root.setIntervalFields(entry.syncIntervalSecs || 0)
+        root.seedingDetail = false
         detailFlick.contentY = 0
         if (entry && root.selectedName.length > 0) {
             root.controller.requestStats(root.selectedName, entry.localPath, entry.remotePath)
         }
+    }
+    // The single number the interval is stored as, shown with its unit.
+    function setIntervalFields(secs) {
+        intervalCheck.checked = secs > 0
+        if (secs <= 0) {
+            intervalField.text = "3"
+            intervalUnit.currentIndex = 1
+        } else if (secs % 86400 === 0) {
+            intervalField.text = String(secs / 86400)
+            intervalUnit.currentIndex = 2
+        } else if (secs % 3600 === 0) {
+            intervalField.text = String(secs / 3600)
+            intervalUnit.currentIndex = 1
+        } else {
+            intervalField.text = String(Math.max(1, Math.round(secs / 60)))
+            intervalUnit.currentIndex = 0
+        }
+    }
+    function intervalSeconds() {
+        var count = parseInt(intervalField.text)
+        if (isNaN(count) || count < 1) return 0
+        var unit = intervalUnit.currentIndex === 0 ? 60 : (intervalUnit.currentIndex === 1 ? 3600 : 86400)
+        return count * unit
+    }
+    function applyInterval() {
+        if (!root.detail) return
+        var secs = intervalCheck.checked ? root.intervalSeconds() : 0
+        root.controller.setSyncInterval(root.selectedName, root.detail.localPath, root.detail.remotePath, secs)
     }
     function openPendingDetail() {
         if (!root.pendingDetail) return
@@ -814,6 +849,104 @@ ApplicationWindow {
                             background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: root.theme.borderSubtle }
                         }
                         Item { Layout.fillWidth: true }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+                        Label { text: "Keep a copy of files up to"; color: root.theme.textSecondary; font.pixelSize: 13 }
+                        TextField {
+                            id: recoveryMaxField
+                            Layout.preferredWidth: 96
+                            implicitHeight: 34
+                            horizontalAlignment: TextInput.AlignRight
+                            validator: IntValidator { bottom: 0; top: 1000000 }
+                            color: root.theme.textPrimary
+                            font.pixelSize: 13
+                            selectByMouse: true
+                            leftPadding: 10
+                            rightPadding: 10
+                            background: Rectangle {
+                                radius: root.theme.radiusSm
+                                color: root.theme.inputBg
+                                border.color: recoveryMaxField.activeFocus ? root.theme.accent : root.theme.borderSubtle
+                            }
+                            onEditingFinished: {
+                                var megabytes = parseInt(text)
+                                if (isNaN(megabytes) || megabytes < 0) megabytes = 0
+                                if (root.detail) root.controller.setRecoveryMaxMb(root.selectedName, root.detail.localPath, root.detail.remotePath, megabytes)
+                            }
+                        }
+                        Label { text: "MB"; color: root.theme.textMuted; font.pixelSize: 13 }
+                        Item { Layout.fillWidth: true }
+                    }
+                    Label {
+                        text: "A bigger file is replaced or deleted without a preserved copy, so one large file cannot fill the recovery folder. 0 keeps no copies at all."
+                        color: root.theme.textDim
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+                        CheckBox {
+                            id: intervalCheck
+                            checked: false
+                            onToggled: if (!root.seedingDetail) root.applyInterval()
+                            indicator: Rectangle {
+                                implicitWidth: 18
+                                implicitHeight: 18
+                                radius: 4
+                                border.color: root.theme.accent
+                                border.width: 1
+                                color: intervalCheck.checked ? root.theme.accent : "transparent"
+                            }
+                            contentItem: Label { text: "Only synchronize this folder every"; color: root.theme.textSecondary; font.pixelSize: 13 }
+                        }
+                        TextField {
+                            id: intervalField
+                            Layout.preferredWidth: 72
+                            implicitHeight: 34
+                            enabled: intervalCheck.checked
+                            horizontalAlignment: TextInput.AlignRight
+                            validator: IntValidator { bottom: 1; top: 100000 }
+                            text: "3"
+                            color: intervalCheck.checked ? root.theme.textPrimary : root.theme.textDim
+                            font.pixelSize: 13
+                            selectByMouse: true
+                            leftPadding: 10
+                            rightPadding: 10
+                            background: Rectangle {
+                                radius: root.theme.radiusSm
+                                color: root.theme.inputBg
+                                border.color: intervalField.activeFocus ? root.theme.accent : root.theme.borderSubtle
+                            }
+                            onEditingFinished: if (!root.seedingDetail) root.applyInterval()
+                        }
+                        ComboBox {
+                            id: intervalUnit
+                            Layout.preferredWidth: 130
+                            enabled: intervalCheck.checked
+                            model: ["minutes", "hours", "days"]
+                            currentIndex: 1
+                            onActivated: if (!root.seedingDetail) root.applyInterval()
+                            delegate: ItemDelegate {
+                                width: intervalUnit.width
+                                text: modelData
+                                contentItem: Label { text: modelData; color: root.theme.textPrimary; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
+                                background: Rectangle { color: highlighted ? root.theme.cardBgRaised : root.theme.cardBg }
+                            }
+                            contentItem: Label { text: intervalUnit.displayText; color: intervalUnit.enabled ? root.theme.textPrimary : root.theme.textDim; font.pixelSize: 13; leftPadding: 10; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: root.theme.borderSubtle }
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+                    Label {
+                        text: "A folder on a schedule is checked only that often: local changes do not start a pass in between, and a file that is still changing is uploaded as it was when the pass started instead of waiting. Off by default."
+                        color: root.theme.textDim
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
                     }
                     Label { text: "File/folder exclusions"; color: root.theme.textSecondary; font.pixelSize: 13; font.bold: true }
                     Label {

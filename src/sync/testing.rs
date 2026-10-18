@@ -6,10 +6,12 @@ use super::model::{self, Model, SyncError};
 use super::observe;
 use super::pass::{self, Hooks, Pair, Report};
 use super::{Shared, store};
-use crate::entities::{RemotesActiveModel, RemotesModel, SyncDirsActiveModel, SyncDirsModel};
+use crate::entities::{
+    RemotesActiveModel, RemotesModel, SyncDirsActiveModel, SyncDirsEntity, SyncDirsModel,
+};
 use crate::migrations::{Migrator, MigratorTrait};
 use crate::util;
-use sea_orm::{ActiveModelTrait, ActiveValue, Database, DatabaseConnection};
+use sea_orm::{ActiveModelTrait, ActiveValue, Database, DatabaseConnection, EntityTrait};
 use serde_json::json;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -188,6 +190,30 @@ impl Fixture {
             dir: &self.dir,
             caps: &self.caps,
         }
+    }
+
+    /// Re-read the pair's row, as the worker does at the top of each loop, so
+    /// settings changed through SQL take effect.
+    pub fn reload_dir(&mut self) {
+        self.dir = util::await_future(SyncDirsEntity::find_by_id(self.dir.id).one(&self.db))
+            .unwrap()
+            .expect("sync pair");
+    }
+
+    /// Set the pair's stored limits: the largest file that keeps a preserved
+    /// copy, and how long it waits between passes.
+    pub fn set_limits(&mut self, recovery_max_bytes: i64, sync_interval_secs: i64) {
+        store::exec(
+            &self.db,
+            "UPDATE sync_dirs SET recovery_max_bytes = ?, sync_interval_secs = ? WHERE id = ?",
+            vec![
+                recovery_max_bytes.into(),
+                sync_interval_secs.into(),
+                self.dir.id.into(),
+            ],
+        )
+        .unwrap();
+        self.reload_dir();
     }
 
     /// Run a pass the way the worker does, recording its outcome in the model.

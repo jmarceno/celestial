@@ -19,6 +19,11 @@ pub struct Model {
     pub pair_uuid: Option<String>,
     /// Incremented by every committed operation in this pair.
     pub generation: i64,
+    /// The largest file the pair keeps a preserved copy of; 0 keeps none.
+    pub recovery_max_bytes: i64,
+    /// How long the pair waits between passes; 0 synchronizes as changes are
+    /// detected.
+    pub sync_interval_secs: i64,
 }
 
 impl Model {

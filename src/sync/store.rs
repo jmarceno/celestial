@@ -230,6 +230,61 @@ pub fn set_keep_versions_days<C: ConnectionTrait>(
     .map(|_| ())
 }
 
+/// The limit a pair has before one is stored for it: the largest file it
+/// keeps a preserved copy of. A file bigger than the pair's limit is replaced
+/// or deleted without a copy in recovery; `0` keeps no copies at all.
+pub const DEFAULT_RECOVERY_MAX_BYTES: i64 = 100_000_000;
+
+pub fn recovery_max_bytes<C: ConnectionTrait>(db: &C, sync_dir_id: i32) -> Result<i64, DbErr> {
+    query(
+        db,
+        "SELECT recovery_max_bytes FROM sync_dirs WHERE id = ?",
+        vec![sync_dir_id.into()],
+    )?
+    .first()
+    .map_or(Ok(DEFAULT_RECOVERY_MAX_BYTES), |row| {
+        get(row, "recovery_max_bytes")
+    })
+}
+
+pub fn set_recovery_max_bytes<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    bytes: i64,
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "UPDATE sync_dirs SET recovery_max_bytes = ? WHERE id = ?",
+        vec![bytes.max(0).into(), sync_dir_id.into()],
+    )
+    .map(|_| ())
+}
+
+/// How long the pair waits between passes; `0` synchronizes as changes are
+/// detected.
+pub fn sync_interval_secs<C: ConnectionTrait>(db: &C, sync_dir_id: i32) -> Result<i64, DbErr> {
+    query(
+        db,
+        "SELECT sync_interval_secs FROM sync_dirs WHERE id = ?",
+        vec![sync_dir_id.into()],
+    )?
+    .first()
+    .map_or(Ok(0), |row| get(row, "sync_interval_secs"))
+}
+
+pub fn set_sync_interval_secs<C: ConnectionTrait>(
+    db: &C,
+    sync_dir_id: i32,
+    secs: i64,
+) -> Result<(), DbErr> {
+    exec(
+        db,
+        "UPDATE sync_dirs SET sync_interval_secs = ? WHERE id = ?",
+        vec![secs.max(0).into(), sync_dir_id.into()],
+    )
+    .map(|_| ())
+}
+
 /// The recorded name and (device, inode) of the pair's internal folder.
 /// A folder name and its (device, inode).
 pub type FolderIdentity = (String, (u64, u64));
@@ -1199,6 +1254,8 @@ pub(crate) mod tests {
             remote_path: "root".into(),
             pair_uuid: None,
             generation: 0,
+            recovery_max_bytes: DEFAULT_RECOVERY_MAX_BYTES,
+            sync_interval_secs: 0,
         }
     }
 

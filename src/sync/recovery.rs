@@ -249,6 +249,15 @@ pub struct Store<'a> {
 }
 
 impl Store<'_> {
+    /// Whether this pair keeps a preserved copy of a file of `size` bytes.
+    /// A bigger file is replaced or deleted without one, so a large folder
+    /// does not fill the recovery store with versions of its biggest file;
+    /// a limit of `0` keeps no copies at all.
+    pub fn keeps_version(&self, size: u64) -> bool {
+        let limit = self.dir.recovery_max_bytes;
+        limit > 0 && i64::try_from(size).is_ok_and(|size| size <= limit)
+    }
+
     fn version_folder(&self, op: &str) -> String {
         format!("{}-{}", Stamp::now().secs, op)
     }
@@ -548,13 +557,18 @@ impl Store<'_> {
                         // After an exchange the stage holds the displaced
                         // version: preserve it.
                         Some(displaced) if committed => {
-                            self.preserve_path(
-                                &stage,
-                                &op.rel,
-                                &displaced,
-                                &tr::tr!("Replaced by the remote version"),
-                                &op.id,
-                            )?;
+                            if self.keeps_version(displaced.size) {
+                                self.preserve_path(
+                                    &stage,
+                                    &op.rel,
+                                    &displaced,
+                                    &tr::tr!("Replaced by the remote version"),
+                                    &op.id,
+                                )?;
+                            } else {
+                                // Bigger than this pair keeps a copy of.
+                                let _ = self.root.unlink(&stage);
+                            }
                         }
                         // The download never reached the item: discard it.
                         Some(_) => {

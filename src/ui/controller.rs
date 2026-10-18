@@ -169,6 +169,30 @@ mod qobject {
             days: i64,
         );
 
+        /// The largest file the pair keeps a preserved copy of, in megabytes;
+        /// 0 keeps no copies at all.
+        #[qinvokable]
+        #[cxx_name = "setRecoveryMaxMb"]
+        fn set_recovery_max_mb(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+            megabytes: i64,
+        );
+
+        /// How long the pair waits between passes, in seconds; 0 synchronizes
+        /// as changes are detected.
+        #[qinvokable]
+        #[cxx_name = "setSyncInterval"]
+        fn set_sync_interval(
+            self: Pin<&mut Self>,
+            remote: &QString,
+            local: &QString,
+            remote_path: &QString,
+            seconds: i64,
+        );
+
         #[qinvokable]
         #[cxx_name = "deleteVersion"]
         fn delete_version(
@@ -541,6 +565,36 @@ impl qobject::AppController {
             local: local.to_string(),
             remote_path: remote_path.to_string(),
             recovery_id: id,
+        });
+    }
+
+    fn set_recovery_max_mb(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+        megabytes: i64,
+    ) {
+        self.send(Command::SetRecoveryMax {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+            megabytes,
+        });
+    }
+
+    fn set_sync_interval(
+        self: Pin<&mut Self>,
+        remote: &QString,
+        local: &QString,
+        remote_path: &QString,
+        seconds: i64,
+    ) {
+        self.send(Command::SetSyncInterval {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
+            seconds,
         });
     }
 

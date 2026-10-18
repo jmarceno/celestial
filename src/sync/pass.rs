@@ -149,6 +149,14 @@ struct Entry {
 }
 
 impl Pair<'_> {
+    /// A pair that synchronizes on an interval. Its files may keep changing
+    /// while they are hashed and uploaded, so a moving source is uploaded as
+    /// it was observed at the start of the pass instead of being retried
+    /// until it stands still.
+    pub fn coarse(&self) -> bool {
+        self.dir.sync_interval_secs > 0
+    }
+
     fn local_path(&self, rel: &str) -> PathBuf {
         Path::new(&self.dir.local_path).join(rel)
     }
@@ -231,6 +239,10 @@ impl Pair<'_> {
         match self.hash_local(rel, &expected.algo) {
             Ok(fp) if fp.value == expected.value => (Delta::MetadataOnly, Some(fp)),
             Ok(fp) => (Delta::Changed, Some(fp)),
+            // A file that keeps changing is uploaded as it was observed when
+            // the pass started; a pair that synchronizes as changes arrive
+            // retries it once it stands still.
+            Err(_) if self.coarse() => (Delta::Changed, None),
             Err(reason) => (Delta::Unknown(reason), None),
         }
     }
@@ -313,6 +325,7 @@ impl Cx<'_> {
                     (Delta::Same, Some(fp))
                 }
                 Ok(fp) => (Delta::Changed, Some(fp)),
+                Err(_) if pair.coarse() => (Delta::Changed, None),
                 Err(reason) => (Delta::Unknown(reason), None),
             };
         }
@@ -576,13 +589,17 @@ pub fn run(
         }
         // Copying a file mid-write uploads a truncated version, and every
         // later write replaces it again. Nothing touches it until it is done.
-        if let Some(meta) = entry.local.present() {
-            entry.waiting = writers.wait(&entry.rel, meta, Stamp::now());
-            if let Some(wait) = &entry.waiting {
-                entry.deferred = true;
-                entry.decision = Decision::Retry(wait.reason.clone());
-                entries.push(entry);
-                continue;
+        // A pair that synchronizes on an interval uploads it as it is:
+        // waiting for a continuously written file would postpone it for good.
+        if !pair.coarse() {
+            if let Some(meta) = entry.local.present() {
+                entry.waiting = writers.wait(&entry.rel, meta, Stamp::now());
+                if let Some(wait) = &entry.waiting {
+                    entry.deferred = true;
+                    entry.decision = Decision::Retry(wait.reason.clone());
+                    entries.push(entry);
+                    continue;
+                }
             }
         }
         decide(&cx, &mut entry);
@@ -1251,9 +1268,13 @@ fn execute_removal(cx: &Cx, entry: &Entry, step: Removal) -> Result<(), String> 
                     err
                 )
             })?;
-        } else {
+        } else if cx.rec().keeps_version(expected.size) {
             cx.rec()
                 .preserve_local(&entry.rel, expected, &reason, &op)?;
+        } else {
+            // Bigger than this pair keeps a copy of: it is removed without
+            // one rather than filling the recovery folder.
+            cx.root.unlink(&entry.rel).map_err(|err| err.to_string())?;
         }
     }
     if remote_step {
@@ -1269,7 +1290,7 @@ fn execute_removal(cx: &Cx, entry: &Entry, step: Removal) -> Result<(), String> 
                     )
                 },
             )?;
-        } else {
+        } else if cx.rec().keeps_version(remote_size(expected)) {
             let (item, moved) = cx.rec().preserve_remote(
                 &entry.rel,
                 expected,
@@ -1283,6 +1304,9 @@ fn execute_removal(cx: &Cx, entry: &Entry, step: Removal) -> Result<(), String> 
                 // preserved, and stays visible as a conflict copy.
                 keep_displaced_remote(cx, &entry.rel, &item, &moved, &op)?;
             }
+        } else {
+            rclone::sync::delete(&pair.remote.name, &pair.remote_path(&entry.rel))
+                .map_err(|err| err.error)?;
         }
     }
     if deletion {
@@ -1332,6 +1356,12 @@ fn execute(cx: &Cx, entry: &Entry, decision: &Decision) -> Result<(), String> {
         },
         _ => Ok(()),
     }
+}
+
+/// The size of a remote item, `0` when the remote does not report one: an
+/// unknown size is always small enough to keep a copy of.
+fn remote_size(meta: &RemoteMeta) -> u64 {
+    u64::try_from(meta.size).unwrap_or(0)
 }
 
 /// Folder times change whenever their contents do; a folder is compared by
@@ -1400,7 +1430,13 @@ fn fresh_entry(rel: &str, local: Option<LocalMeta>, remote: Option<RemoteMeta>) 
 /// shared hash the bytes are uploaded from a snapshot instead.
 fn upload(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
     let pair = cx.pair;
-    expect_local(cx, entry)?;
+    // A pair that synchronizes on an interval uploads the file as it was
+    // observed when the pass started, so it does not stop because the file
+    // kept changing since. Everything else re-checks that the file is still
+    // what was decided on.
+    if !pair.coarse() {
+        expect_local(cx, entry)?;
+    }
     let replaced = if entry.remote.present().is_some_and(|remote| remote.is_dir) {
         // The folder this file replaces was emptied and removed first.
         if pair.stat_remote(&entry.rel)?.is_some() {
@@ -1414,15 +1450,20 @@ fn upload(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), String> {
     let destination = pair.remote_path(&entry.rel);
     let op = recovery::random_id();
     let rec = cx.rec();
-    let snapshot = pair
-        .caps
-        .preferred_hash()
-        .is_none()
-        .then(|| rec.staging_rel(&op));
+    // Without a provider hash there is nothing rclone can verify the upload
+    // against, so the bytes are uploaded from a snapshot. An interval pair
+    // always uploads a snapshot: rclone refuses a source whose size or
+    // modification time changes while it is read, which a file written every
+    // few minutes would always do.
+    let hashless = pair.caps.preferred_hash().is_none();
+    let snapshot = (hashless || pair.coarse()).then(|| rec.staging_rel(&op));
     // Only a replacement has something to undo after an interruption: the
     // previous remote version it moves aside. A new file's snapshot is in
-    // staging, which the next start empties.
-    let journaled = replaced.is_some();
+    // staging, which the next start empties. A version too big to keep is
+    // never moved aside, so it is never journaled either.
+    let journaled = replaced
+        .as_ref()
+        .is_some_and(|remote| rec.keeps_version(remote_size(remote)));
     if journaled {
         rec.begin(
             &op,
@@ -1469,7 +1510,19 @@ fn upload_steps(
     let source_rel = match snapshot {
         Some(snapshot) => {
             let snapshot_path = cx.root.path().join(snapshot);
-            fs::copy(pair.local_path(&entry.rel), &snapshot_path).map_err(|err| err.to_string())?;
+            let copied = fs::copy(pair.local_path(&entry.rel), &snapshot_path)
+                .map_err(|err| err.to_string())?;
+            if pair.coarse() && copied > local.size {
+                // The upload is pinned to the version observed when the pass
+                // started: a file that grew under the copy is truncated to
+                // the observed size, and one that shrank is uploaded as it is
+                // rather than padded with nulls.
+                fs::File::options()
+                    .write(true)
+                    .open(&snapshot_path)
+                    .and_then(|file| file.set_len(local.size))
+                    .map_err(|err| err.to_string())?;
+            }
             // The upload carries the original modification time.
             if let Some(time) = local.mtime.to_datetime() {
                 fs::File::options()
@@ -1478,9 +1531,10 @@ fn upload_steps(
                     .and_then(|file| file.set_modified(time.into()))
                     .map_err(|err| err.to_string())?;
             }
-            if !cx
-                .stat_local(&entry.rel)?
-                .is_some_and(|now| now.same_tuple(local))
+            if !pair.coarse()
+                && !cx
+                    .stat_local(&entry.rel)?
+                    .is_some_and(|now| now.same_tuple(local))
             {
                 return Err(tr::tr!("The local file changed while it was read."));
             }
@@ -1491,7 +1545,7 @@ fn upload_steps(
     let source = cx.root.path().join(&source_rel);
     let source = source.to_str().ok_or(observe::NON_UTF8)?;
     let preserved = match &replaced {
-        Some(expected) => {
+        Some(expected) if cx.rec().keeps_version(remote_size(expected)) => {
             let (item, moved) = cx.rec().preserve_remote(
                 &entry.rel,
                 expected,
@@ -1514,6 +1568,9 @@ fn upload_steps(
             )?;
             Some(item)
         }
+        // Bigger than this pair keeps a copy of: the upload replaces it
+        // without one.
+        Some(_) => None,
         None => None,
     };
     failpoint::hit("upload:before_transfer");
@@ -1533,15 +1590,24 @@ fn upload_steps(
     }
     failpoint::hit("upload:after_transfer");
     // Acknowledge only the bytes that were read: if the file changed while
-    // it was uploaded, the next pass uploads it again.
-    let after = cx
+    // it was uploaded, the next pass uploads it again. An interval pair
+    // accepts the change: the remote holds the version observed when the pass
+    // started, so that observation is what is recorded.
+    let observed = cx
         .stat_local(&entry.rel)?
-        .filter(|after| after.same_tuple(local))
-        .ok_or_else(|| tr::tr!("The local file changed while it was uploaded."))?;
+        .filter(|after| after.same_tuple(local));
+    let (acknowledged, stands_still) = match observed {
+        Some(after) => (after, true),
+        None if pair.coarse() => (*local, false),
+        None => return Err(tr::tr!("The local file changed while it was uploaded.")),
+    };
     let remote = pair
         .stat_remote(&entry.rel)?
         .ok_or_else(|| tr::tr!("The remote item disappeared after it was uploaded."))?;
-    save(pair, &entry.rel, &after, &remote, None)
+    // A file that changed during its upload is not claimed to hold what the
+    // remote has: no fingerprint is recorded, so the next pass compares it
+    // again instead of trusting the history.
+    save_impl(pair, &entry.rel, &acknowledged, &remote, None, stands_still)
 }
 
 /// Download into the internal staging folder, then commit with an atomic
@@ -1645,13 +1711,19 @@ fn download_steps(
                 .stat_local(stage)?
                 .ok_or_else(|| tr::tr!("The previous version disappeared."))?;
             if displaced.same_after_rename(&expected) {
-                cx.rec().preserve_path(
-                    stage,
-                    &entry.rel,
-                    &expected,
-                    &tr::tr!("Replaced by the remote version"),
-                    op,
-                )?;
+                if cx.rec().keeps_version(expected.size) {
+                    cx.rec().preserve_path(
+                        stage,
+                        &entry.rel,
+                        &expected,
+                        &tr::tr!("Replaced by the remote version"),
+                        op,
+                    )?;
+                } else {
+                    // Bigger than this pair keeps a copy of: the version it
+                    // replaces is discarded with the staging file.
+                    cx.root.unlink(stage).map_err(|err| err.to_string())?;
+                }
             } else {
                 let copy = recovery::conflict_rel(&entry.rel, "local", op, observe::Stamp::now());
                 cx.root
@@ -1686,14 +1758,20 @@ fn create_remote_dir(cx: &Cx, entry: &Entry, local: &LocalMeta) -> Result<(), St
     if let Some(remote) = expect_remote(pair, entry)? {
         if !remote.is_dir {
             let op = recovery::random_id();
-            cx.rec().preserve_remote(
-                &entry.rel,
-                &remote,
-                &tr::tr!("Replaced by a local folder"),
-                &op,
-                &pair.list_options(),
-                pair.caps.preferred_hash(),
-            )?;
+            if cx.rec().keeps_version(remote_size(&remote)) {
+                cx.rec().preserve_remote(
+                    &entry.rel,
+                    &remote,
+                    &tr::tr!("Replaced by a local folder"),
+                    &op,
+                    &pair.list_options(),
+                    pair.caps.preferred_hash(),
+                )?;
+            } else {
+                // Bigger than this pair keeps a copy of: it is removed
+                // without one.
+                rclone::sync::delete(&pair.remote.name, &path).map_err(|err| err.error)?;
+            }
         }
     }
     rclone::sync::mkdir(&pair.remote.name, &path).map_err(|err| err.error)?;
@@ -1713,12 +1791,16 @@ fn create_local_dir(cx: &Cx, entry: &Entry, remote: &RemoteMeta) -> Result<(), S
     if let Some(local) = expect_local(cx, entry)? {
         if !local.is_dir {
             let op = recovery::random_id();
-            cx.rec().preserve_local(
-                &entry.rel,
-                &local,
-                &tr::tr!("Replaced by a remote folder"),
-                &op,
-            )?;
+            if cx.rec().keeps_version(local.size) {
+                cx.rec().preserve_local(
+                    &entry.rel,
+                    &local,
+                    &tr::tr!("Replaced by a remote folder"),
+                    &op,
+                )?;
+            } else {
+                cx.root.unlink(&entry.rel).map_err(|err| err.to_string())?;
+            }
         }
     }
     ensure_local_parent(cx, &entry.rel)?;
@@ -1954,7 +2036,22 @@ fn save(
     remote: &RemoteMeta,
     known: Option<Fingerprint>,
 ) -> Result<(), String> {
-    let fingerprint = if local.is_dir {
+    save_impl(pair, rel, local, remote, known, true)
+}
+
+/// Record both sides as holding the same contents. `fingerprint = false`
+/// records no content fingerprint: the pair uploaded a version of the file it
+/// cannot claim the local file still has, so the next pass compares the two
+/// again instead of trusting the history.
+fn save_impl(
+    pair: &Pair,
+    rel: &str,
+    local: &LocalMeta,
+    remote: &RemoteMeta,
+    known: Option<Fingerprint>,
+    fingerprint: bool,
+) -> Result<(), String> {
+    let fingerprint = if local.is_dir || !fingerprint {
         None
     } else {
         match known
@@ -2158,19 +2255,28 @@ pub fn delete_everywhere(pair: &Pair, rel: &str, token: &str) -> Result<(), Stri
     let op = recovery::random_id();
     let reason = tr::tr!("Deleted on request after a deletion met an edit");
     if let Some(meta) = &local {
-        cx.rec().preserve_local(rel, meta, &reason, &op)?;
+        if cx.rec().keeps_version(meta.size) {
+            cx.rec().preserve_local(rel, meta, &reason, &op)?;
+        } else {
+            cx.root.unlink(rel).map_err(|err| err.to_string())?;
+        }
     }
     if let Some(meta) = &remote {
-        let (item, moved) = cx.rec().preserve_remote(
-            rel,
-            meta,
-            &reason,
-            &op,
-            &pair.list_options(),
-            pair.caps.preferred_hash(),
-        )?;
-        if !same_remote(meta, &moved) {
-            keep_displaced_remote(&cx, rel, &item, &moved, &op)?;
+        if cx.rec().keeps_version(remote_size(meta)) {
+            let (item, moved) = cx.rec().preserve_remote(
+                rel,
+                meta,
+                &reason,
+                &op,
+                &pair.list_options(),
+                pair.caps.preferred_hash(),
+            )?;
+            if !same_remote(meta, &moved) {
+                keep_displaced_remote(&cx, rel, &item, &moved, &op)?;
+            }
+        } else {
+            rclone::sync::delete(&pair.remote.name, &pair.remote_path(rel))
+                .map_err(|err| err.error)?;
         }
     }
     if let Some(base) = store::load_baselines(pair.db, pair.dir)
@@ -2233,7 +2339,12 @@ pub fn restore(pair: &Pair, id: i64) -> Result<String, String> {
                     .stat_local(&stage)?
                     .ok_or_else(|| tr::tr!("The previous version disappeared."))?;
                 if displaced.same_after_rename(&expected) {
-                    rec.preserve_path(&stage, &rel, &expected, &reason, &op)?;
+                    if cx.rec().keeps_version(expected.size) {
+                        rec.preserve_path(&stage, &rel, &expected, &reason, &op)?;
+                    } else {
+                        // Bigger than this pair keeps a copy of.
+                        cx.root.unlink(&stage).map_err(|err| err.to_string())?;
+                    }
                 } else {
                     // An edit landed after the check: keep it visible.
                     let copy = recovery::conflict_rel(&rel, "local", &op, observe::Stamp::now());
@@ -2268,7 +2379,7 @@ pub fn restore(pair: &Pair, id: i64) -> Result<String, String> {
         }
         let destination = pair.remote_path(&rel);
         let preserved = match &current {
-            Some(expected) => {
+            Some(expected) if cx.rec().keeps_version(remote_size(expected)) => {
                 let (kept, moved) = cx.rec().preserve_remote(
                     &rel,
                     expected,
@@ -2282,7 +2393,10 @@ pub fn restore(pair: &Pair, id: i64) -> Result<String, String> {
                 }
                 Some(kept)
             }
-            None => None,
+            // Too big to keep a copy of: the current version is left where it
+            // is. The copy below replaces it, so a failure still leaves it in
+            // place rather than an empty path that would look like a deletion.
+            _ => None,
         };
         failpoint::hit("restore:before_copy");
         if let Err(err) =

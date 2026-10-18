@@ -62,6 +62,11 @@ pub struct DirState {
     pub paused: bool,
     /// How many days preserved versions are kept; 0 keeps them for good.
     pub keep_days: i64,
+    /// The largest file the pair keeps a preserved copy of; 0 keeps none.
+    pub recovery_max_bytes: i64,
+    /// How long the pair waits between passes; 0 synchronizes as changes are
+    /// detected.
+    pub sync_interval_secs: i64,
 }
 
 impl DirState {
@@ -74,6 +79,8 @@ impl DirState {
             recent: Vec::new(),
             paused: false,
             keep_days: 30,
+            recovery_max_bytes: super::store::DEFAULT_RECOVERY_MAX_BYTES,
+            sync_interval_secs: 0,
         }
     }
 
@@ -289,6 +296,30 @@ impl Model {
         }
     }
 
+    pub fn set_recovery_max_bytes(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        bytes: i64,
+    ) {
+        if let Some(dir) = self.dir_mut(remote, local, remote_path) {
+            dir.recovery_max_bytes = bytes;
+        }
+    }
+
+    pub fn set_sync_interval_secs(
+        &mut self,
+        remote: &str,
+        local: &str,
+        remote_path: &str,
+        secs: i64,
+    ) {
+        if let Some(dir) = self.dir_mut(remote, local, remote_path) {
+            dir.sync_interval_secs = secs;
+        }
+    }
+
     pub fn set_recent(
         &mut self,
         remote: &str,
@@ -387,6 +418,8 @@ impl Model {
                             "exclusions": read_exclusions(local),
                             "recovery": dir.recovery,
                             "keepDays": dir.keep_days,
+                            "recoveryMaxBytes": dir.recovery_max_bytes,
+                            "syncIntervalSecs": dir.sync_interval_secs,
                             "recent": dir.recent,
                         })
                     })

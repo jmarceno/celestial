@@ -85,6 +85,8 @@ struct Schedule {
     /// Bytes the person approved uploading despite too little free space
     /// on the remote, by pair.
     space_approved: HashMap<i32, u64>,
+    /// When a pair that synchronizes on an interval is next due, by pair.
+    intervals: HashMap<i32, Instant>,
 }
 
 impl Schedule {
@@ -92,6 +94,24 @@ impl Schedule {
     fn wake(&mut self, id: i32) {
         self.remote_checks.forget(id);
         self.retries.insert(id, store::now());
+    }
+
+    /// Whether a pair that synchronizes on an interval may run a pass now.
+    /// A pair that has never run one is due at once.
+    fn interval_due(&self, id: i32) -> bool {
+        self.intervals
+            .get(&id)
+            .is_none_or(|at| *at <= Instant::now())
+    }
+
+    /// The pair ran (or could not run) a pass: wait `wait` before the next.
+    fn interval_after(&mut self, id: i32, wait: Duration) {
+        self.intervals.insert(id, Instant::now() + wait);
+    }
+
+    /// Forget the pair's schedule, so a changed setting takes effect now.
+    fn interval_forget(&mut self, id: i32) {
+        self.intervals.remove(&id);
     }
 }
 
@@ -349,9 +369,16 @@ fn sync_pair(
     schedule: &mut Schedule,
 ) {
     let id = sync_dir.id;
+    // A pair that synchronizes on an interval runs a pass on its own
+    // schedule: local events, which a continuously written file raises every
+    // few seconds, and the remote check do not start one.
+    let interval = sync_dir.sync_interval_secs.max(0);
+    let coarse = interval > 0;
+    let interval_wait = Duration::from_secs(u64::try_from(interval).unwrap_or(u64::MAX));
+    let interval_wait = interval_wait.min(MAX_SYNC_INTERVAL);
     // Let a burst of writes (an atomic save, an unpacked archive) finish
     // before scanning, up to a maximum delay.
-    if watcher.settling(id, Instant::now()) {
+    if !coarse && watcher.settling(id, Instant::now()) {
         schedule.settling = true;
         return;
     }
@@ -363,12 +390,23 @@ fn sync_pair(
         .retries
         .get(&id)
         .is_some_and(|at| *at <= store::now());
-    if local_quiet && !schedule.remote_checks.due(id) && !retry_due {
+    if retry_due {
+        schedule.interval_forget(id);
+    } else if coarse {
+        if !schedule.interval_due(id) {
+            return;
+        }
+    } else if local_quiet && !schedule.remote_checks.due(id) {
         return;
     }
     if !pair_roots_available(db, remote, sync_dir, model, shared) {
         schedule.remote_checks.done(id);
         schedule.local_trees.remove(&id);
+        // An unavailable folder is checked again soon, not a whole interval
+        // from now: the drive may still be mounting.
+        if coarse {
+            schedule.interval_after(id, interval_wait.min(REMOTE_CHECK_INTERVAL));
+        }
         return;
     }
     let names = (&sync_dir.local_path, &sync_dir.remote_path);
@@ -415,6 +453,12 @@ fn sync_pair(
     shared.progress.end(id);
     rclone::delete_group_stats(&group);
     schedule.remote_checks.done_after(id, started.elapsed());
+    if coarse {
+        // The next pass is due a whole interval from now, however long this
+        // one took: a file that takes hours to upload does not queue the
+        // next pass behind it.
+        schedule.interval_after(id, interval_wait);
+    }
     let waiting_for_space = matches!(&result, Ok(report) if report.space.is_some());
     if let Ok(Some((name, _))) = store::internal_dir(db, id) {
         watcher.ignore_internal(id, Path::new(&sync_dir.local_path).join(name));
@@ -536,6 +580,28 @@ fn refresh_recovery(model: &mut Model, pair: &Pair) {
             );
         }
         Err(err) => tracing::warn!("could not read how long versions are kept: {err}"),
+    }
+    match store::recovery_max_bytes(pair.db, pair.dir.id) {
+        Ok(bytes) => {
+            model.set_recovery_max_bytes(
+                &pair.remote.name,
+                &pair.dir.local_path,
+                &pair.dir.remote_path,
+                bytes,
+            );
+        }
+        Err(err) => tracing::warn!("could not read the preserved-version size limit: {err}"),
+    }
+    match store::sync_interval_secs(pair.db, pair.dir.id) {
+        Ok(secs) => {
+            model.set_sync_interval_secs(
+                &pair.remote.name,
+                &pair.dir.local_path,
+                &pair.dir.remote_path,
+                secs,
+            );
+        }
+        Err(err) => tracing::warn!("could not read the synchronization interval: {err}"),
     }
 }
 
@@ -679,6 +745,18 @@ fn reload_model(db: &DatabaseConnection, model: &mut Model) -> Result<(), DbErr>
                 &dir.local_path,
                 &dir.remote_path,
                 paused.contains(&dir.id),
+            );
+            model.set_recovery_max_bytes(
+                &remote.name,
+                &dir.local_path,
+                &dir.remote_path,
+                dir.recovery_max_bytes,
+            );
+            model.set_sync_interval_secs(
+                &remote.name,
+                &dir.local_path,
+                &dir.remote_path,
+                dir.sync_interval_secs,
             );
             let recent = store::recent_activity(db, dir.id, model::RECENT_SHOWN as i64)?
                 .iter()
@@ -1157,6 +1235,50 @@ fn apply_between_passes(
                     shared.dialog("error", tr::tr!("The setting was not saved"), err);
                 }
             }
+            Command::SetRecoveryMax {
+                remote,
+                local,
+                remote_path,
+                megabytes,
+            } => {
+                let result = find_pair(db, &remote, &local, &remote_path)
+                    .ok_or_else(|| tr::tr!("The synced folder no longer exists."))
+                    .and_then(|(_, dir)| {
+                        let bytes = megabytes.max(0).saturating_mul(1_000_000);
+                        store::set_recovery_max_bytes(db, dir.id, bytes)
+                            .map_err(|err| err.to_string())?;
+                        model.set_recovery_max_bytes(&remote, &local, &remote_path, bytes);
+                        Ok(())
+                    });
+                if let Err(err) = result {
+                    shared.dialog("error", tr::tr!("The setting was not saved"), err);
+                }
+            }
+            Command::SetSyncInterval {
+                remote,
+                local,
+                remote_path,
+                seconds,
+            } => {
+                let result = find_pair(db, &remote, &local, &remote_path)
+                    .ok_or_else(|| tr::tr!("The synced folder no longer exists."))
+                    .and_then(|(_, dir)| {
+                        let secs = seconds
+                            .max(0)
+                            .min(i64::try_from(MAX_SYNC_INTERVAL.as_secs()).unwrap_or(i64::MAX));
+                        store::set_sync_interval_secs(db, dir.id, secs)
+                            .map_err(|err| err.to_string())?;
+                        model.set_sync_interval_secs(&remote, &local, &remote_path, secs);
+                        // The new schedule takes effect now: the pair is
+                        // checked once and then waits its interval.
+                        schedule.interval_forget(dir.id);
+                        schedule.wake(dir.id);
+                        Ok(())
+                    });
+                if let Err(err) = result {
+                    shared.dialog("error", tr::tr!("The setting was not saved"), err);
+                }
+            }
             Command::StatsDir { remote, local, remote_path } => {
                 super::measure::request(shared, remote, local, remote_path);
             }
@@ -1594,6 +1716,10 @@ pub(super) fn pair_roots_available(
 /// How often a pair with no local changes lists its remote folder. Local
 /// changes are still picked up on the next pass.
 const REMOTE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The longest a pair may wait between passes, whatever it asks for, so its
+/// schedule cannot overflow and a folder cannot be forgotten for good.
+pub const MAX_SYNC_INTERVAL: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// When each pair's remote folder was last checked, and how long to wait
 /// before the next check.

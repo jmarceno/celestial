@@ -2712,3 +2712,196 @@ fn unavailable_local_root_waits_before_reporting() {
     assert!(waiting_for_local_root(id, Duration::from_secs(60)));
     local_root_returned(id);
 }
+
+#[test]
+fn a_file_bigger_than_the_limit_is_replaced_without_a_preserved_copy() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join("big.bin"), "0123456789abcdefghij").unwrap();
+    set_time(&f.local.join("big.bin"), 1_700_000_000);
+    f.seed("small.txt");
+    // Files up to 8 bytes keep a copy; the 20-byte one does not.
+    f.set_limits(8, 0);
+    fs::write(f.local.join("big.bin"), "a local edit over the limit").unwrap();
+    fs::write(f.remote_file("small.txt"), "remote edit").unwrap();
+    set_time(&f.remote_file("small.txt"), 1_700_000_100);
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_remote("big.bin"), "a local edit over the limit");
+    assert_eq!(f.read_local("small.txt"), "remote edit");
+    let items = recovered(&f);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].rel, "small.txt");
+}
+
+#[test]
+fn a_file_bigger_than_the_limit_is_deleted_without_a_preserved_copy() {
+    let mut f = Fixture::new();
+    fs::write(f.local.join("big.bin"), "0123456789abcdefghij").unwrap();
+    set_time(&f.local.join("big.bin"), 1_700_000_000);
+    // Seeding the neighbour uploads the 20-byte file with it.
+    f.seed("neighbor.txt");
+    f.set_limits(8, 0);
+    // The deletion reaches the other side: nothing is kept on either one.
+    fs::remove_file(f.remote_file("big.bin")).unwrap();
+    f.pass();
+    f.assert_no_errors();
+    assert!(!f.local.join("big.bin").exists());
+    assert!(f.remote_file("neighbor.txt").exists());
+    assert!(recovered(&f).is_empty(), "{:?}", recovered(&f));
+}
+
+#[test]
+fn a_limit_of_zero_keeps_no_preserved_copies_at_all() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.set_limits(0, 0);
+    fs::write(f.remote_file("file.txt"), "remote edit").unwrap();
+    set_time(&f.remote_file("file.txt"), 1_700_000_100);
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_local("file.txt"), "remote edit");
+    assert!(recovered(&f).is_empty(), "{:?}", recovered(&f));
+}
+
+#[test]
+fn a_scheduled_pair_uploads_a_file_that_changes_during_the_pass() {
+    let mut f = Fixture::new();
+    f.set_limits(100_000_000, 3600);
+    f.seed("file.txt");
+    fs::write(f.local.join("file.txt"), "first edit").unwrap();
+    let path = f.local.join("file.txt");
+    f.pass_with(|_| {
+        let _ = fs::write(&path, "second edit!!");
+    });
+    f.assert_no_errors();
+    // The upload finished instead of failing and retrying.
+    assert!(item_states(&f).is_empty(), "{:?}", item_states(&f));
+    // The remote holds the version observed when the pass started: the file
+    // grew while it was copied, so the upload is pinned to that size.
+    assert_eq!(f.read_remote("file.txt"), "second edi");
+    let baseline = &store::load_baselines(&f.db, &f.dir).unwrap()["file.txt"];
+    assert_eq!(baseline.size, Some(10));
+    assert!(baseline.fingerprint.is_none(), "{baseline:?}");
+    // The next pass compares the two again and uploads the newer version.
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_remote("file.txt"), "second edit!!");
+    let baseline = &store::load_baselines(&f.db, &f.dir).unwrap()["file.txt"];
+    assert!(baseline.fingerprint.is_some(), "{baseline:?}");
+}
+
+#[test]
+fn restoring_over_a_version_bigger_than_the_limit_leaves_nothing_behind() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    fs::write(f.local.join("file.txt"), "a newer local version").unwrap();
+    set_time(&f.local.join("file.txt"), 1_700_000_100);
+    f.pass();
+    f.assert_no_errors();
+    let items = recovered(&f);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].side, "remote");
+    assert_eq!(f.read_remote("file.txt"), "a newer local version");
+    // With no copies kept, restoring replaces the current remote version
+    // without preserving it, and leaves no new version behind.
+    f.set_limits(0, 0);
+    let pair = f.pair();
+    pass::restore(&pair, items[0].id).unwrap();
+    assert_eq!(f.read_remote("file.txt"), "original");
+    assert_eq!(recovered(&f).len(), 1);
+    // The next pass propagates the restored version instead of treating the
+    // path as a deletion.
+    f.pass();
+    f.assert_no_errors();
+    assert_eq!(f.read_local("file.txt"), "original");
+}
+
+#[test]
+fn a_scheduled_pair_does_not_wait_for_a_file_still_being_written() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    // The quiet age is off by default in tests; turn it on now so the edit
+    // below is as fresh as one a writer would leave behind.
+    crate::sync::writers::enable_for_test(crate::sync::writers::QUIET_SECS);
+    fs::write(f.local.join("file.txt"), "an edit in flight").unwrap();
+    f.set_limits(100_000_000, 3600);
+    f.pass();
+    f.assert_no_errors();
+    // A pair that synchronizes as changes arrive would defer it (see
+    // `a_just_modified_file_waits_for_the_quiet_age`); this one uploads it.
+    assert!(item_states(&f).is_empty(), "{:?}", item_states(&f));
+    assert_eq!(f.read_remote("file.txt"), "an edit in flight");
+}
+
+#[test]
+fn an_interval_pair_ignores_local_changes_until_it_is_due() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.set_limits(100_000_000, 3600);
+    let (_, rx) = crossbeam_channel::unbounded::<Command>();
+    let mut queue = VecDeque::new();
+    let mut watcher = watch::LocalWatcher::new();
+    let mut schedule = Schedule::default();
+    let shared = f.shared.clone();
+    let remote = f.remote.clone();
+    let dir = f.dir.clone();
+    let caps = f.caps.clone();
+    // The first pass runs, then the pair waits its interval.
+    sync_pair(
+        &shared,
+        &f.db,
+        &mut f.model,
+        &rx,
+        &mut queue,
+        &remote,
+        &dir,
+        &caps,
+        &mut watcher,
+        &mut schedule,
+    );
+    assert!(!schedule.interval_due(dir.id));
+    fs::write(f.local.join("file.txt"), "local edit").unwrap();
+    set_time(&f.local.join("file.txt"), 1_700_000_100);
+    sync_pair(
+        &shared,
+        &f.db,
+        &mut f.model,
+        &rx,
+        &mut queue,
+        &remote,
+        &dir,
+        &caps,
+        &mut watcher,
+        &mut schedule,
+    );
+    assert_eq!(f.read_remote("file.txt"), "original");
+    // A due pair picks the change up.
+    schedule.interval_forget(dir.id);
+    sync_pair(
+        &shared,
+        &f.db,
+        &mut f.model,
+        &rx,
+        &mut queue,
+        &remote,
+        &dir,
+        &caps,
+        &mut watcher,
+        &mut schedule,
+    );
+    assert_eq!(f.read_remote("file.txt"), "local edit");
+    assert!(!schedule.interval_due(dir.id));
+}
+
+#[test]
+fn the_interval_schedule_waits_and_can_be_forgotten() {
+    let mut schedule = Schedule::default();
+    assert!(schedule.interval_due(7));
+    schedule.interval_after(7, Duration::from_secs(3600));
+    assert!(!schedule.interval_due(7));
+    schedule.interval_after(7, Duration::ZERO);
+    assert!(schedule.interval_due(7));
+    schedule.interval_after(7, Duration::from_secs(3600));
+    schedule.interval_forget(7);
+    assert!(schedule.interval_due(7));
+}
