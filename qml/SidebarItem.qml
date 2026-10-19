@@ -6,9 +6,9 @@ Button {
     id: root
     property CelestialTheme theme: CelestialTheme {}
     property bool selected: false
-    implicitHeight: 38
-    leftPadding: 14
-    rightPadding: 12
+    implicitHeight: 30
+    leftPadding: 10
+    rightPadding: 8
     background: Rectangle {
         radius: root.theme.radiusSm
         color: root.selected ? root.theme.accentSoft : (root.hovered ? root.theme.cardBgRaised : "transparent")
@@ -18,10 +18,10 @@ Button {
     contentItem: Label {
         text: root.text
         color: root.selected ? root.theme.textPrimary : root.theme.textSecondary
-        font.pixelSize: 13
+        font.pixelSize: 12
         font.bold: root.selected
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideRight
-        leftPadding: 4
+        leftPadding: 6
     }
 }

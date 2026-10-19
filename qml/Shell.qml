@@ -385,10 +385,11 @@ ApplicationWindow {
                 Item { Layout.preferredHeight: 8 }
                 ListView {
                     id: serverList
+                    objectName: "serverList"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
-                    spacing: 4
+                    spacing: 3
                     boundsBehavior: Flickable.StopAtBounds
                     model: root.remotes().length
                     ScrollBar.vertical: VScrollBar { theme: root.theme }
@@ -483,6 +484,7 @@ ApplicationWindow {
                 }
                 Flickable {
                     id: dirFlick
+                    objectName: "dirFlick"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     contentHeight: dirCol.implicitHeight
@@ -491,8 +493,9 @@ ApplicationWindow {
                     ScrollBar.vertical: VScrollBar { theme: root.theme }
                     Column {
                         id: dirCol
+                        objectName: "dirCol"
                         width: dirFlick.width - (dirFlick.ScrollBar.vertical.visible ? 14 : 0)
-                        spacing: 8
+                        spacing: 6
                         Repeater {
                             model: (root.selectedRemote() ? root.selectedRemote().dirs : []).length
                             Rectangle {
@@ -501,26 +504,32 @@ ApplicationWindow {
                                 readonly property var entry: (root.selectedRemote() ? root.selectedRemote().dirs : [])[index] || ({})
                                 property var live: root.progressFor(root.selectedName, entry)
                                 width: dirCol.width
-                                height: live ? 112 : 72
+                                // Compact two-line rows: 54 px idle, 84 px while a
+                                // progress bar is shown.
+                                height: live ? 84 : 54
                                 radius: root.theme.radius
                                 color: root.theme.cardBg
                                 border.color: root.theme.borderSubtle
                                 border.width: 1
                                 RowLayout {
                                     anchors.fill: parent
-                                    anchors.margins: 14
-                                    spacing: 12
+                                    anchors.leftMargin: 12
+                                    anchors.rightMargin: 10
+                                    anchors.topMargin: 7
+                                    anchors.bottomMargin: 7
+                                    spacing: 10
                                     // Above the card's MouseArea so the start button gets its clicks.
                                     z: 1
                                     Rectangle {
-                                        width: 10
-                                        height: 10
-                                        radius: 5
+                                        width: 8
+                                        height: 8
+                                        radius: 4
                                         color: root.phaseColor(entry.phase)
+                                        Layout.alignment: Qt.AlignVCenter
                                     }
                                     ColumnLayout {
                                         Layout.fillWidth: true
-                                        spacing: 2
+                                        spacing: 0
                                         Label {
                                             text: entry.localDisplay + "   →   " + entry.remoteDisplay
                                             color: root.theme.textPrimary
@@ -531,7 +540,7 @@ ApplicationWindow {
                                         Label {
                                             text: (entry.errorStatus ? entry.errorStatus + " " : "") + (entry.status || "")
                                             color: entry.errorStatus ? root.theme.danger : root.theme.textMuted
-                                            font.pixelSize: 12
+                                            font.pixelSize: 11
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
                                         }
@@ -539,8 +548,11 @@ ApplicationWindow {
                                             visible: dirCard.live !== null
                                             live: dirCard.live
                                             theme: root.theme
+                                            // The status line above already names the
+                                            // current file; do not repeat it.
+                                            showCurrent: false
                                             Layout.fillWidth: true
-                                            Layout.topMargin: 4
+                                            Layout.topMargin: 2
                                         }
                                     }
                                     PrimaryButton {
@@ -548,7 +560,12 @@ ApplicationWindow {
                                         visible: dirCard.entry.paused === true
                                         onClicked: root.resumeDir(dirCard.entry)
                                     }
-                                    Label { text: "›"; color: root.theme.textDim; font.pixelSize: 18 }
+                                    Label {
+                                        text: "›"
+                                        color: root.theme.textDim
+                                        font.pixelSize: 16
+                                        Layout.alignment: Qt.AlignVCenter
+                                    }
                                 }
                                 MouseArea {
                                     anchors.fill: parent
@@ -563,6 +580,7 @@ ApplicationWindow {
 
             Flickable {
                 id: detailFlick
+                objectName: "detailFlick"
                 anchors.fill: parent
                 visible: root.detail !== null
                 clip: true
@@ -571,15 +589,9 @@ ApplicationWindow {
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: VScrollBar { theme: root.theme }
 
-                function ensureVisible(item, rect) {
-                    var top = item.mapToItem(detailFlick.contentItem, rect.x, rect.y).y
-                    var bottom = top + rect.height
-                    if (top < contentY) contentY = Math.max(0, top - 12)
-                    else if (bottom > contentY + height) contentY = Math.min(contentHeight - height, bottom - height + 12)
-                }
-
                 ColumnLayout {
                     id: detailCol
+                    objectName: "detailCol"
                     x: 22
                     y: 22
                     width: detailFlick.width - 44 - (detailFlick.ScrollBar.vertical.visible ? 10 : 0)
@@ -643,7 +655,7 @@ ApplicationWindow {
                         color: root.theme.textSecondary
                         font.pixelSize: 12
                         font.bold: true
-                        visible: root.detail && root.estimate.local === root.detail.localPath && root.estimate.remotePath === root.detail.remotePath && root.estimate.done
+                        visible: !!root.detail && root.estimate.local === root.detail.localPath && root.estimate.remotePath === root.detail.remotePath && root.estimate.done
                     }
                     Label {
                         text: root.estimate.text ? root.estimate.text : ""
@@ -651,14 +663,14 @@ ApplicationWindow {
                         font.pixelSize: 13
                         wrapMode: Text.WordWrap
                         Layout.fillWidth: true
-                        visible: root.detail && root.estimate.local === root.detail.localPath && root.estimate.remotePath === root.detail.remotePath && root.estimate.done
+                        visible: !!root.detail && root.estimate.local === root.detail.localPath && root.estimate.remotePath === root.detail.remotePath && root.estimate.done
                     }
                     Label {
                         text: "Recent changes"
                         color: root.theme.textSecondary
                         font.pixelSize: 12
                         font.bold: true
-                        visible: root.detail && root.detail.recent && root.detail.recent.length > 0
+                        visible: !!root.detail && !!root.detail.recent && root.detail.recent.length > 0
                     }
                     ListView {
                         Layout.fillWidth: true
@@ -707,7 +719,7 @@ ApplicationWindow {
                                 anchors.margins: 6
                                 spacing: 1
                                 Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 12; wrapMode: Text.WordWrap; width: errorCol.width }
-                                Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
+                                Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: !!entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
                             }
                             MouseArea {
                                 anchors.fill: parent
@@ -749,7 +761,7 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     spacing: 1
                                     Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 12; wrapMode: Text.WordWrap; width: parent.width }
-                                    Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: parent.width }
+                                    Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: !!entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: parent.width }
                                 }
                                 Button {
                                     text: "Dismiss"
@@ -766,7 +778,7 @@ ApplicationWindow {
                         color: root.theme.textSecondary
                         font.pixelSize: 13
                         font.bold: true
-                        visible: root.detail && root.detail.recovery && root.detail.recovery.length > 0
+                        visible: !!root.detail && !!root.detail.recovery && root.detail.recovery.length > 0
                     }
                     Repeater {
                         model: (root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : []).length
@@ -817,7 +829,7 @@ ApplicationWindow {
                     Button {
                         text: "Delete all preserved versions"
                         flat: true
-                        visible: root.detail && root.detail.recovery && root.detail.recovery.length > 0
+                        visible: !!root.detail && !!root.detail.recovery && root.detail.recovery.length > 0
                         contentItem: Label { text: parent.text; color: root.theme.textMuted; font.pixelSize: 13 }
                         background: Rectangle { color: "transparent" }
                         onClicked: {
@@ -966,25 +978,69 @@ ApplicationWindow {
                         wrapMode: Text.WordWrap
                         Layout.fillWidth: true
                     }
-                    // Grows with its rules; the page scrolls, so every line stays reachable.
-                    TextArea {
-                        id: exclusionArea
+                    // Fixed-height editor with its own scroll bar: a long
+                    // exclusion list must not stretch the settings page.
+                    Rectangle {
+                        id: exclusionFrame
                         Layout.fillWidth: true
-                        Layout.preferredHeight: Math.max(160, implicitHeight)
-                        color: root.theme.textPrimary
-                        wrapMode: TextEdit.WrapAnywhere
-                        font.family: "monospace"
-                        font.pixelSize: 13
-                        selectByMouse: true
-                        padding: 10
-                        background: Rectangle { color: root.theme.inputBg; radius: root.theme.radiusSm; border.color: exclusionArea.activeFocus ? root.theme.accent : root.theme.borderSubtle }
-                        // Keep the caret visible while typing near the bottom of the page.
-                        onCursorRectangleChanged: if (activeFocus) detailFlick.ensureVisible(exclusionArea, cursorRectangle)
+                        Layout.preferredHeight: 200
+                        color: root.theme.inputBg
+                        radius: root.theme.radiusSm
+                        border.width: 1
+                        border.color: exclusionArea.activeFocus ? root.theme.accent : root.theme.borderSubtle
+                        clip: true
+
+                        // Keep the caret visible inside the box instead of scrolling the page.
+                        function ensureVisible(item, rect) {
+                            var top = item.mapToItem(exclusionFlick.contentItem, rect.x, rect.y).y
+                            var bottom = top + rect.height
+                            if (top < exclusionFlick.contentY) exclusionFlick.contentY = Math.max(0, top - 10)
+                            else if (bottom > exclusionFlick.contentY + exclusionFlick.height) exclusionFlick.contentY = Math.min(exclusionFlick.contentHeight - exclusionFlick.height, bottom - exclusionFlick.height + 10)
+                        }
+
+                        Flickable {
+                            id: exclusionFlick
+                            objectName: "exclusionFlick"
+                            anchors.fill: parent
+                            anchors.margins: 1
+                            clip: true
+                            contentWidth: width
+                            contentHeight: exclusionArea.implicitHeight + 2
+                            boundsBehavior: Flickable.StopAtBounds
+                            ScrollBar.vertical: VScrollBar { theme: root.theme }
+                            TextArea {
+                                id: exclusionArea
+                                objectName: "exclusionArea"
+                                // Always leave room for the scroll bar so wrapping
+                                // does not toggle its own visibility.
+                                width: exclusionFlick.width - 8
+                                color: root.theme.textPrimary
+                                wrapMode: TextEdit.WrapAnywhere
+                                font.family: "monospace"
+                                font.pixelSize: 13
+                                selectByMouse: true
+                                padding: 10
+                                background: null
+                                onCursorRectangleChanged: if (activeFocus) exclusionFrame.ensureVisible(exclusionArea, cursorRectangle)
+                            }
+                        }
                     }
-                    PrimaryButton {
-                        text: "Save exclusions"
+                    RowLayout {
+                        Layout.fillWidth: true
                         Layout.bottomMargin: 22
-                        onClicked: root.controller.saveExclusions(root.detail.localPath, exclusionArea.text)
+                        spacing: 10
+                        Label {
+                            objectName: "exclusionCount"
+                            Layout.fillWidth: true
+                            text: exclusionArea.text.split("\n").filter(function (line) { return line.trim().length > 0 }).length
+                                  + " rules · scroll inside the box to see them all"
+                            color: root.theme.textDim
+                            font.pixelSize: 11
+                        }
+                        PrimaryButton {
+                            text: "Save exclusions"
+                            onClicked: root.controller.saveExclusions(root.detail.localPath, exclusionArea.text)
+                        }
                     }
                 }
             }
@@ -1219,7 +1275,7 @@ ApplicationWindow {
                 }
                 PrimaryButton {
                     text: "Delete everywhere"
-                    visible: root.popupMode === "conflict-info" && root.popupRef && root.popupRef.canDelete === true
+                    visible: root.popupMode === "conflict-info" && !!root.popupRef && root.popupRef.canDelete === true
                     onClicked: {
                         root.controller.confirmDeletion(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.conflictId, root.popupRef.token)
                         root.closeDialog()
