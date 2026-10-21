@@ -193,6 +193,11 @@ mod qobject {
             seconds: i64,
         );
 
+        /// Synchronize the pair now, ignoring its interval.
+        #[qinvokable]
+        #[cxx_name = "syncNow"]
+        fn sync_now(self: Pin<&mut Self>, remote: &QString, local: &QString, remote_path: &QString);
+
         #[qinvokable]
         #[cxx_name = "deleteVersion"]
         fn delete_version(
@@ -596,6 +601,14 @@ impl qobject::AppController {
             local: local.to_string(),
             remote_path: remote_path.to_string(),
             seconds,
+        });
+    }
+
+    fn sync_now(self: Pin<&mut Self>, remote: &QString, local: &QString, remote_path: &QString) {
+        self.send(Command::SyncNow {
+            remote: remote.to_string(),
+            local: local.to_string(),
+            remote_path: remote_path.to_string(),
         });
     }
 

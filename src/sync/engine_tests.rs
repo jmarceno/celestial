@@ -2940,6 +2940,58 @@ fn an_interval_pair_ignores_local_changes_until_it_is_due() {
 }
 
 #[test]
+fn sync_now_runs_an_interval_pair_before_it_is_due() {
+    let mut f = Fixture::new();
+    f.seed("file.txt");
+    f.set_limits(100_000_000, 3600);
+    let (_, rx) = crossbeam_channel::unbounded::<Command>();
+    let mut queue = VecDeque::new();
+    let mut watcher = watch::LocalWatcher::new();
+    let mut schedule = Schedule::default();
+    let mut capabilities = HashMap::new();
+    let shared = f.shared.clone();
+    let remote = f.remote.clone();
+    let dir = f.dir.clone();
+    let caps = f.caps.clone();
+    let mut run = |f: &mut Fixture, queue: &mut VecDeque<Command>, schedule: &mut Schedule| {
+        sync_pair(
+            &shared,
+            &f.db,
+            &mut f.model,
+            &rx,
+            queue,
+            &remote,
+            &dir,
+            &caps,
+            &mut watcher,
+            schedule,
+        );
+    };
+    run(&mut f, &mut queue, &mut schedule);
+    fs::write(f.local.join("file.txt"), "local edit").unwrap();
+    set_time(&f.local.join("file.txt"), 1_700_000_100);
+    run(&mut f, &mut queue, &mut schedule);
+    assert_eq!(f.read_remote("file.txt"), "original");
+    queue.push_back(Command::SyncNow {
+        remote: f.remote.name.clone(),
+        local: f.dir.local_path.clone(),
+        remote_path: f.dir.remote_path.clone(),
+    });
+    apply_between_passes(
+        &f.shared.clone(),
+        &f.db,
+        &mut f.model,
+        &mut queue,
+        &mut schedule,
+        &mut capabilities,
+    );
+    run(&mut f, &mut queue, &mut schedule);
+    assert_eq!(f.read_remote("file.txt"), "local edit");
+    // The next scheduled pass is a whole interval after the requested one.
+    assert!(!schedule.interval_due(dir.id));
+}
+
+#[test]
 fn the_interval_schedule_waits_and_can_be_forgotten() {
     let mut schedule = Schedule::default();
     assert!(schedule.interval_due(7));

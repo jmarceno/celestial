@@ -67,6 +67,11 @@ mounts late is not ignored for hours. The schedule lives in the worker
 (`Schedule::intervals`) and is not persisted: after a restart the folder is
 synchronized once and then waits its interval again.
 
+**Sync now.** A coarse folder shows a "Sync now" button on its card and in the
+folder view. It sends `Command::SyncNow`, which forgets the pair's interval and
+wakes it (`Schedule::sync_now`), so the next loop runs a pass; the following
+pass is due a whole interval after that one.
+
 **Moving sources.** A coarse pass uploads the version of the file it observed
 when the pass started:
 
@@ -95,6 +100,7 @@ when the pass started:
 - `a_file_bigger_than_the_limit_is_replaced_without_a_preserved_copy`,
   `a_file_bigger_than_the_limit_is_deleted_without_a_preserved_copy`,
   `a_limit_of_zero_keeps_no_preserved_copies_at_all`.
+- `sync_now_runs_an_interval_pair_before_it_is_due`.
 - `a_scheduled_pair_uploads_a_file_that_changes_during_the_pass` (the upload
   finishes, the remote holds the observed version, no fingerprint is recorded,
   the next pass uploads the newer version).

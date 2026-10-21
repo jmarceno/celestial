@@ -113,6 +113,13 @@ impl Schedule {
     fn interval_forget(&mut self, id: i32) {
         self.intervals.remove(&id);
     }
+
+    /// The person asked for a pass now: run one on the next loop even if the
+    /// pair's interval or remote check is not due.
+    fn sync_now(&mut self, id: i32) {
+        self.interval_forget(id);
+        self.wake(id);
+    }
 }
 
 fn worker(shared: &Shared, rx: crossbeam_channel::Receiver<Command>) -> Result<(), String> {
@@ -1290,6 +1297,22 @@ fn apply_between_passes(
                     shared.dialog("error", tr::tr!("The setting was not saved"), err);
                 }
             }
+            Command::SyncNow {
+                remote,
+                local,
+                remote_path,
+            } => match find_pair(db, &remote, &local, &remote_path) {
+                Some((_, dir)) => {
+                    schedule.sync_now(dir.id);
+                    // Other pairs may run first: show the request was taken.
+                    model.set_status(&remote, &local, &remote_path, tr::tr!("Waiting to sync..."));
+                }
+                None => shared.dialog(
+                    "error",
+                    tr::tr!("Nothing was synchronized"),
+                    tr::tr!("The synced folder no longer exists."),
+                ),
+            },
             Command::StatsDir { remote, local, remote_path } => {
                 super::measure::request(shared, remote, local, remote_path);
             }

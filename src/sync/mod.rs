@@ -99,6 +99,13 @@ pub enum Command {
         remote_path: String,
         seconds: i64,
     },
+    /// Run a pass on the pair now, whatever its interval says; the next
+    /// scheduled pass is a whole interval after this one.
+    SyncNow {
+        remote: String,
+        local: String,
+        remote_path: String,
+    },
     /// Delete a preserved version for good.
     DiscardVersion {
         remote: String,

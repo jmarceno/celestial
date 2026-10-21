@@ -181,6 +181,25 @@ ApplicationWindow {
         })
         root.controller.resumeDir(remote, local, remotePath)
     }
+    // A folder on a schedule synchronizes now; the request is taken once the
+    // worker shows the pair waiting for or running its pass.
+    function syncNow(entry) {
+        var remote = root.selectedName
+        var local = entry.localPath
+        var remotePath = entry.remotePath
+        var before = entry.status
+        root.setPending(root.pairKey("syncnow", remote, local, remotePath), {
+            settled: function () {
+                var dir = root.findDir(remote, local, remotePath)
+                return !dir || dir.paused === true || dir.phase === "syncing" || dir.status !== before
+            }
+        })
+        root.controller.syncNow(remote, local, remotePath)
+    }
+    function syncNowBusy(entry) {
+        return !!entry && (entry.phase === "syncing"
+            || root.isPending(root.pairKey("syncnow", root.selectedName, entry.localPath, entry.remotePath)))
+    }
     function stopDir(remote, local, remotePath) {
         root.setPending(root.pairKey("stop", remote, local, remotePath), {
             settled: function () { return !root.findDir(remote, local, remotePath) }
@@ -734,6 +753,12 @@ ApplicationWindow {
                                         visible: dirCard.entry.paused === true && !dirCard.stopping
                                         onClicked: root.resumeDir(dirCard.entry)
                                     }
+                                    PrimaryButton {
+                                        text: root.syncNowBusy(dirCard.entry) ? "Syncing…" : "⟳  Sync now"
+                                        busy: root.syncNowBusy(dirCard.entry)
+                                        visible: dirCard.entry.paused !== true && (dirCard.entry.syncIntervalSecs || 0) > 0 && !dirCard.stopping
+                                        onClicked: root.syncNow(dirCard.entry)
+                                    }
                                     Label {
                                         text: "›"
                                         color: root.theme.textDim
@@ -791,6 +816,12 @@ ApplicationWindow {
                                     root.saveExclusions(root.detail.localPath, exclusionArea.text)
                                 root.resumeDir(root.detail)
                             }
+                        }
+                        PrimaryButton {
+                            text: root.syncNowBusy(root.detail) ? "Syncing…" : "⟳  Sync now"
+                            busy: root.syncNowBusy(root.detail)
+                            visible: root.detail !== null && root.detail.paused !== true && (root.detail.syncIntervalSecs || 0) > 0
+                            onClicked: root.syncNow(root.detail)
                         }
                         PrimaryButton {
                             text: "Stop syncing"
