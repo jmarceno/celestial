@@ -242,8 +242,9 @@ mod qobject {
         fn list_dirs(self: Pin<&mut Self>, remote: &QString, path: &QString);
 
         /// Open the system folder chooser. The choice arrives as a
-        /// `local-folder` notice, or `local-folder-fallback` when the
-        /// desktop has no portal chooser.
+        /// `local-folder` notice, `local-folder-cancelled` when there is
+        /// none, or `local-folder-fallback` when the desktop has no portal
+        /// chooser.
         #[qinvokable]
         #[cxx_name = "pickLocalFolder"]
         fn pick_local_folder(self: Pin<&mut Self>, start: &QString);
@@ -676,7 +677,7 @@ impl qobject::AppController {
                     Ok(Picked::Folder(path)) => {
                         shared.dialog("local-folder", "", path.to_string_lossy())
                     }
-                    Ok(Picked::Cancelled) => {}
+                    Ok(Picked::Cancelled) => shared.dialog("local-folder-cancelled", "", ""),
                     Err(err) => {
                         tracing::info!("portal folder chooser unavailable: {err}");
                         shared.dialog("local-folder-fallback", "", "");

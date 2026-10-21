@@ -627,6 +627,7 @@ impl pass::Hooks for WorkerHooks<'_> {
     fn checkpoint(&mut self) -> bool {
         pump(self.rx, self.queue);
         let mut kept = VecDeque::new();
+        let mut resumed = false;
         while let Some(cmd) = self.queue.pop_front() {
             match cmd {
                 Command::DeleteRemote(name) => self.model.remote_deletions.push(name),
@@ -636,16 +637,41 @@ impl pass::Hooks for WorkerHooks<'_> {
                     remote_path,
                 } => self.model.dir_deletions.push((remote, local, remote_path)),
                 Command::SaveExclusions { local, text } => {
-                    if let Err(err) = model::write_exclusions(&local, &text) {
-                        self.shared
-                            .dialog("error", tr::tr!("File/Folder Exclusions"), err);
-                    }
+                    save_exclusions(self.shared, &local, &text);
+                }
+                // Start the pair now so the window shows it waiting, not
+                // paused, until this pass ends. The command stays queued:
+                // between passes it wakes the pair.
+                Command::ResumeDir {
+                    remote,
+                    local,
+                    remote_path,
+                } => {
+                    resumed |= resume_pair(
+                        self.shared,
+                        self.db,
+                        self.model,
+                        &remote,
+                        &local,
+                        &remote_path,
+                    )
+                    .is_some();
+                    kept.push_back(Command::ResumeDir {
+                        remote,
+                        local,
+                        remote_path,
+                    });
                 }
                 other => kept.push_back(other),
             }
         }
         *self.queue = kept;
+        let deleted =
+            !self.model.dir_deletions.is_empty() || !self.model.remote_deletions.is_empty();
         process_deletions(self.model, self.db, self.shared);
+        if resumed || deleted {
+            self.shared.publish(self.model);
+        }
         // Stop before any further write once the pair is gone.
         matches!(self.sync_dir.exists(self.db), Ok(true))
     }
@@ -1018,29 +1044,14 @@ fn apply_between_passes(
                 model.dir_deletions.push((remote, local, remote_path));
                 process_deletions(model, db, shared);
             }
-            Command::SaveExclusions { local, text } => {
-                if let Err(err) = model::write_exclusions(&local, &text) {
-                    shared.dialog("error", tr::tr!("File/Folder Exclusions"), err);
-                }
-            }
+            Command::SaveExclusions { local, text } => save_exclusions(shared, &local, &text),
             Command::ResumeDir {
                 remote,
                 local,
                 remote_path,
             } => {
-                let Some((_, dir)) = find_pair(db, &remote, &local, &remote_path) else {
-                    continue;
-                };
-                match store::set_paused(db, dir.id, false) {
-                    Ok(()) => {
-                        model.set_paused(&remote, &local, &remote_path, false);
-                        schedule.wake(dir.id);
-                    }
-                    Err(err) => shared.dialog(
-                        "error",
-                        tr::tr!("Unable to start synchronization"),
-                        err.to_string(),
-                    ),
+                if let Some(id) = resume_pair(shared, db, model, &remote, &local, &remote_path) {
+                    schedule.wake(id);
                 }
             }
             Command::ListDirs { remote, path } => {
@@ -1284,6 +1295,40 @@ fn apply_between_passes(
             }
         }
         shared.publish(model);
+    }
+}
+
+/// Write a pair's exclusions; the window says when they are saved.
+fn save_exclusions(shared: &Shared, local: &str, text: &str) {
+    match model::write_exclusions(local, text) {
+        Ok(()) => shared.dialog("exclusions-saved", "", local),
+        Err(err) => shared.dialog("error", tr::tr!("File/Folder Exclusions"), err),
+    }
+}
+
+/// Start a pair that was added paused. Returns its id once it is started.
+fn resume_pair(
+    shared: &Shared,
+    db: &DatabaseConnection,
+    model: &mut Model,
+    remote: &str,
+    local: &str,
+    remote_path: &str,
+) -> Option<i32> {
+    let (_, dir) = find_pair(db, remote, local, remote_path)?;
+    match store::set_paused(db, dir.id, false) {
+        Ok(()) => {
+            model.set_paused(remote, local, remote_path, false);
+            Some(dir.id)
+        }
+        Err(err) => {
+            shared.dialog(
+                "error",
+                tr::tr!("Unable to start synchronization"),
+                err.to_string(),
+            );
+            None
+        }
     }
 }
 

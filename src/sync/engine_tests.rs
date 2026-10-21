@@ -2068,6 +2068,52 @@ fn paused_pairs_stay_paused_until_started() {
 }
 
 #[test]
+fn a_pair_started_during_another_pass_shows_started_at_once() {
+    let mut f = Fixture::new();
+    let other = util::await_future(
+        SyncDirsActiveModel {
+            remote_id: ActiveValue::Set(f.remote.id),
+            local_path: ActiveValue::Set(f.dir.local_path.clone()),
+            remote_path: ActiveValue::Set("other".into()),
+            ..Default::default()
+        }
+        .insert(&f.db),
+    )
+    .unwrap();
+    store::set_paused(&f.db, other.id, true).unwrap();
+    reload_model(&f.db, &mut f.model).unwrap();
+    let resume = Command::ResumeDir {
+        remote: f.remote.name.clone(),
+        local: other.local_path.clone(),
+        remote_path: other.remote_path.clone(),
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    tx.send(resume).unwrap();
+    let mut queue = VecDeque::new();
+    let mut hooks = WorkerHooks {
+        shared: &f.shared,
+        db: &f.db,
+        model: &mut f.model,
+        rx: &rx,
+        queue: &mut queue,
+        remote_name: &f.remote.name,
+        sync_dir: &f.dir,
+        last_progress: None,
+        space_approved: 0,
+    };
+    assert!(pass::Hooks::checkpoint(&mut hooks));
+    assert!(store::paused_pairs(&f.db).unwrap().is_empty());
+    let dir = f
+        .model
+        .dir(&f.remote.name, &other.local_path, &other.remote_path)
+        .unwrap();
+    assert!(!dir.paused);
+    assert!(f.shared.bus.load().1.contains("Awaiting sync check"));
+    // Still queued, so the pair is woken once the running pass ends.
+    assert!(matches!(queue.front(), Some(Command::ResumeDir { .. })));
+}
+
+#[test]
 fn versions_of_unresolved_conflicts_are_never_pruned() {
     let mut f = Fixture::new();
     f.seed("file.txt");

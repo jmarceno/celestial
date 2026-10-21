@@ -47,6 +47,58 @@ ApplicationWindow {
     readonly property var warningEntries: (root.detail && root.detail.errors ? root.detail.errors : [])
         .filter(function (e) { return e.warning === true })
 
+    // Clicks the sync worker has not applied yet, by key. The worker may
+    // be in the middle of a pass, so a click shows here at once and the
+    // snapshot or a notice clears it. Each entry is { settled, byNotice,
+    // label }: `settled()` says the new snapshot shows the result,
+    // `byNotice` clears it on the next dialog notice. An error clears all.
+    property var pending: ({})
+    readonly property bool detailStarting: !!root.detail
+        && root.isPending(root.pairKey("resume", root.selectedName, root.detail.localPath, root.detail.remotePath))
+
+    function setPending(key, entry) {
+        var next = Object.assign({}, root.pending)
+        if (entry) next[key] = entry
+        else delete next[key]
+        root.pending = next
+    }
+    function isPending(key) {
+        return root.pending[key] !== undefined
+    }
+    function pairKey(kind, remote, local, remotePath) {
+        return kind + "|" + remote + "|" + local + "|" + remotePath
+    }
+    function settlePending(byNotice, everything) {
+        var next = {}
+        var changed = false
+        for (var key in root.pending) {
+            var entry = root.pending[key]
+            var done = everything || (byNotice && entry.byNotice)
+                || (!!entry.settled && entry.settled())
+            if (done) changed = true
+            else next[key] = entry
+        }
+        if (changed) root.pending = next
+    }
+    function findRemote(name) {
+        var list = root.remotes()
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].name === name) return list[i]
+        }
+        return null
+    }
+    function findDir(remote, local, remotePath) {
+        var entry = root.findRemote(remote)
+        var dirs = entry ? (entry.dirs || []) : []
+        for (var i = 0; i < dirs.length; i++) {
+            if (dirs[i].localPath === local && dirs[i].remotePath === remotePath) return dirs[i]
+        }
+        return null
+    }
+    function hasId(list, id) {
+        return (list || []).some(function (item) { return item.id === id })
+    }
+
     function parse(value, fallback) {
         try { return JSON.parse(value) } catch (error) { return fallback }
     }
@@ -58,7 +110,11 @@ ApplicationWindow {
         for (var i = 0; i < list.length; i++) {
             if (list[i].name === root.selectedName) return list[i]
         }
-        return list.length > 0 ? list[0] : null
+        // A server being removed is not shown in its own place.
+        for (var j = 0; j < list.length; j++) {
+            if (!root.isPending("remove|" + list[j].name)) return list[j]
+        }
+        return null
     }
     function openDetail(entry) {
         root.detail = entry
@@ -114,7 +170,66 @@ ApplicationWindow {
         }
     }
     function resumeDir(entry) {
-        root.controller.resumeDir(root.selectedName, entry.localPath, entry.remotePath)
+        var remote = root.selectedName
+        var local = entry.localPath
+        var remotePath = entry.remotePath
+        root.setPending(root.pairKey("resume", remote, local, remotePath), {
+            settled: function () {
+                var dir = root.findDir(remote, local, remotePath)
+                return !dir || dir.paused !== true
+            }
+        })
+        root.controller.resumeDir(remote, local, remotePath)
+    }
+    function stopDir(remote, local, remotePath) {
+        root.setPending(root.pairKey("stop", remote, local, remotePath), {
+            settled: function () { return !root.findDir(remote, local, remotePath) }
+        })
+        root.controller.stopDir(remote, local, remotePath)
+    }
+    function deleteRemote(name) {
+        root.setPending("remove|" + name, {
+            settled: function () { return !root.findRemote(name) }
+        })
+        root.controller.deleteRemote(name)
+    }
+    // Dismissing, retrying, or acknowledging one sync issue.
+    function dismissError(remote, local, remotePath, id) {
+        root.setPending(root.pairKey("error", remote, local, remotePath) + "|" + id, {
+            settled: function () {
+                var dir = root.findDir(remote, local, remotePath)
+                return !dir || !root.hasId(dir.errors, id)
+            }
+        })
+        root.controller.dismissError(remote, local, remotePath, id)
+    }
+    // Opening a sync issue asks the worker for its dialog.
+    function activateError(remote, local, remotePath, id) {
+        var key = root.pairKey("error", remote, local, remotePath) + "|" + id
+        if (root.isPending(key)) return
+        root.setPending(key, {
+            byNotice: true,
+            settled: function () {
+                var dir = root.findDir(remote, local, remotePath)
+                return !dir || !root.hasId(dir.errors, id)
+            }
+        })
+        root.controller.activateError(remote, local, remotePath, id)
+    }
+    function saveExclusions(local, text) {
+        root.exclusionsSavedTimer.stop()
+        root.setPending("exclusions|" + local, { byNotice: true })
+        root.controller.saveExclusions(local, text)
+    }
+    function errorPending(id) {
+        return !!root.detail && root.isPending(root.pairKey("error", root.selectedName, root.detail.localPath, root.detail.remotePath) + "|" + id)
+    }
+    function allVersionsPending() {
+        return !!root.detail && root.isPending(root.pairKey("versions", root.selectedName, root.detail.localPath, root.detail.remotePath))
+    }
+    function versionPending(id) {
+        return root.allVersionsPending() || (!!root.detail
+            && root.isPending(root.pairKey("version", root.selectedName, root.detail.localPath, root.detail.remotePath) + "|" + id))
     }
     function phaseColor(phase) {
         if (phase === "done") return root.theme.statusGreen
@@ -188,6 +303,11 @@ ApplicationWindow {
                 root.controller.estimateDir(root.selectedName, localField.text, remoteField.text)
         }
     }
+    // Shows "Saved" beside the exclusions button for a moment.
+    property Timer exclusionsSavedTimer: Timer {
+        interval: 2500
+    }
+
     function estimateCurrent() {
         return root.popupMode === "add" && root.estimate.local === localField.text
             && root.estimate.remotePath === remoteField.text && root.estimate.remote === root.selectedName
@@ -202,8 +322,9 @@ ApplicationWindow {
         target: root.controller
         function onSnapshot_jsonChanged() {
             root.snapshot = root.parse(root.controller.snapshot_json, { remotes: [] })
-            if (root.selectedName.length === 0 && root.remotes().length > 0)
-                root.selectedName = root.remotes()[0].name
+            root.settlePending(false, false)
+            if (root.selectedName.length === 0 && root.selectedRemote())
+                root.selectedName = root.selectedRemote().name
             root.openPendingDetail()
             if (!root.detail)
                 return
@@ -236,12 +357,15 @@ ApplicationWindow {
             root.browseLoading = false
         }
         function onNotice(kind, title, body) {
-            if (kind === "local-folder") {
-                localField.text = body
+            if (kind.indexOf("local-folder") === 0) {
+                root.setPending("pick", null)
+                if (kind === "local-folder") localField.text = body
+                if (kind === "local-folder-fallback") folderDialog.open()
                 return
             }
-            if (kind === "local-folder-fallback") {
-                folderDialog.open()
+            root.settlePending(true, kind === "error" || kind === "fatal")
+            if (kind === "exclusions-saved") {
+                if (root.detail && root.detail.localPath === body) exclusionsSavedTimer.restart()
                 return
             }
             if (kind === "login") {
@@ -397,8 +521,11 @@ ApplicationWindow {
                         required property int index
                         // Counted, not a list: an update keeps the items instead of recreating them
                         readonly property var entry: root.remotes()[index] || ({})
+                        readonly property bool removing: root.isPending("remove|" + entry.name)
                         theme: root.theme
-                        text: entry.name
+                        text: removing ? entry.name + "  · removing…" : entry.name
+                        enabled: !removing
+                        opacity: removing ? 0.5 : 1
                         selected: entry.name === root.selectedName
                         width: serverList.width - (serverList.ScrollBar.vertical.visible ? 10 : 0)
                         onClicked: {
@@ -496,6 +623,47 @@ ApplicationWindow {
                         objectName: "dirCol"
                         width: dirFlick.width - (dirFlick.ScrollBar.vertical.visible ? 14 : 0)
                         spacing: 6
+                        // The folder just added, while the worker checks it.
+                        Rectangle {
+                            id: addingCard
+                            readonly property var adding: root.selectedRemote() ? root.pending["add|" + root.selectedRemote().name] : undefined
+                            visible: adding !== undefined
+                            width: dirCol.width
+                            height: 54
+                            radius: root.theme.radius
+                            color: root.theme.cardBg
+                            border.color: root.theme.accentMuted
+                            border.width: 1
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 12
+                                anchors.rightMargin: 10
+                                spacing: 10
+                                BusyIndicator {
+                                    running: addingCard.visible
+                                    Layout.preferredWidth: 18
+                                    Layout.preferredHeight: 18
+                                    padding: 0
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 0
+                                    Label {
+                                        text: addingCard.adding ? addingCard.adding.label : ""
+                                        color: root.theme.textPrimary
+                                        font.pixelSize: 13
+                                        elide: Text.ElideMiddle
+                                        Layout.fillWidth: true
+                                    }
+                                    Label {
+                                        text: "Adding folder…"
+                                        color: root.theme.textMuted
+                                        font.pixelSize: 11
+                                        Layout.fillWidth: true
+                                    }
+                                }
+                            }
+                        }
                         Repeater {
                             model: (root.selectedRemote() ? root.selectedRemote().dirs : []).length
                             Rectangle {
@@ -503,7 +671,10 @@ ApplicationWindow {
                                 required property int index
                                 readonly property var entry: (root.selectedRemote() ? root.selectedRemote().dirs : [])[index] || ({})
                                 property var live: root.progressFor(root.selectedName, entry)
+                                readonly property bool stopping: root.isPending(root.pairKey("stop", root.selectedName, entry.localPath, entry.remotePath))
+                                readonly property bool starting: root.isPending(root.pairKey("resume", root.selectedName, entry.localPath, entry.remotePath))
                                 width: dirCol.width
+                                opacity: stopping ? 0.5 : 1
                                 // Compact two-line rows: 54 px idle, 84 px while a
                                 // progress bar is shown.
                                 height: live ? 84 : 54
@@ -538,8 +709,10 @@ ApplicationWindow {
                                             Layout.fillWidth: true
                                         }
                                         Label {
-                                            text: (entry.errorStatus ? entry.errorStatus + " " : "") + (entry.status || "")
-                                            color: entry.errorStatus ? root.theme.danger : root.theme.textMuted
+                                            text: dirCard.stopping ? "Stopping synchronization…"
+                                                : (dirCard.starting ? "Starting synchronization…"
+                                                : (entry.errorStatus ? entry.errorStatus + " " : "") + (entry.status || ""))
+                                            color: entry.errorStatus && !dirCard.stopping && !dirCard.starting ? root.theme.danger : root.theme.textMuted
                                             font.pixelSize: 11
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
@@ -556,8 +729,9 @@ ApplicationWindow {
                                         }
                                     }
                                     PrimaryButton {
-                                        text: "▶  Start"
-                                        visible: dirCard.entry.paused === true
+                                        text: dirCard.starting ? "Starting…" : "▶  Start"
+                                        busy: dirCard.starting
+                                        visible: dirCard.entry.paused === true && !dirCard.stopping
                                         onClicked: root.resumeDir(dirCard.entry)
                                     }
                                     Label {
@@ -569,6 +743,7 @@ ApplicationWindow {
                                 }
                                 MouseArea {
                                     anchors.fill: parent
+                                    enabled: !dirCard.stopping
                                     cursorShape: Qt.PointingHandCursor
                                     onClicked: root.openDetail(dirCard.entry)
                                 }
@@ -607,12 +782,13 @@ ApplicationWindow {
                         }
                         Item { Layout.fillWidth: true }
                         PrimaryButton {
-                            text: "▶  Start syncing"
+                            text: root.detailStarting ? "Starting…" : "▶  Start syncing"
+                            busy: root.detailStarting
                             visible: root.detail !== null && root.detail.paused === true
                             onClicked: {
                                 // Unsaved exclusion edits apply before the first pass.
                                 if (exclusionArea.text !== (root.detail.exclusions || []).join("\n"))
-                                    root.controller.saveExclusions(root.detail.localPath, exclusionArea.text)
+                                    root.saveExclusions(root.detail.localPath, exclusionArea.text)
                                 root.resumeDir(root.detail)
                             }
                         }
@@ -636,7 +812,7 @@ ApplicationWindow {
                         wrapMode: Text.WrapAnywhere
                     }
                     Label {
-                        text: root.detail ? root.detail.status : ""
+                        text: root.detailStarting ? "Starting synchronization…" : (root.detail ? root.detail.status : "")
                         color: root.theme.textMuted
                         font.pixelSize: 13
                         wrapMode: Text.WordWrap
@@ -708,6 +884,7 @@ ApplicationWindow {
                             readonly property var entry: root.errorEntries[index] || ({})
                             width: ListView.view.width
                             implicitHeight: errorCol.implicitHeight + 8
+                            opacity: root.errorPending(entry.id) ? 0.5 : 1
                             radius: root.theme.radiusSm
                             color: root.theme.cardBg
                             border.color: root.theme.borderSubtle
@@ -721,10 +898,20 @@ ApplicationWindow {
                                 Label { text: entry.title; color: root.theme.textPrimary; font.pixelSize: 12; wrapMode: Text.WordWrap; width: errorCol.width }
                                 Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: !!entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: errorCol.width }
                             }
+                            BusyIndicator {
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.rightMargin: 6
+                                width: 16
+                                height: 16
+                                padding: 0
+                                visible: root.errorPending(entry.id)
+                                running: visible
+                            }
                             MouseArea {
                                 anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: root.controller.activateError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
+                                cursorShape: root.errorPending(entry.id) ? Qt.BusyCursor : Qt.PointingHandCursor
+                                onClicked: root.activateError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
                             }
                         }
                     }
@@ -747,6 +934,7 @@ ApplicationWindow {
                             readonly property var entry: root.warningEntries[index] || ({})
                             width: ListView.view.width
                             implicitHeight: warningRow.implicitHeight + 8
+                            opacity: root.errorPending(entry.id) ? 0.5 : 1
                             radius: root.theme.radiusSm
                             color: root.theme.warningBg
                             border.color: root.theme.warning
@@ -764,11 +952,12 @@ ApplicationWindow {
                                     Label { text: entry.detail; color: root.theme.textMuted; font.pixelSize: 11; visible: !!entry.detail && entry.detail.length > 0; wrapMode: Text.WordWrap; width: parent.width }
                                 }
                                 Button {
-                                    text: "Dismiss"
+                                    text: root.errorPending(entry.id) ? "Dismissing…" : "Dismiss"
                                     flat: true
-                                    contentItem: Label { text: parent.text; color: root.theme.warning; font.pixelSize: 12 }
+                                    enabled: !root.errorPending(entry.id)
+                                    contentItem: Label { text: parent.text; color: parent.enabled ? root.theme.warning : root.theme.textMuted; font.pixelSize: 12 }
                                     background: Rectangle { color: "transparent" }
-                                    onClicked: root.controller.dismissError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
+                                    onClicked: root.dismissError(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
                                 }
                             }
                         }
@@ -783,10 +972,14 @@ ApplicationWindow {
                     Repeater {
                         model: (root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : []).length
                         Rectangle {
+                            id: versionRow
                             required property int index
                             readonly property var entry: (root.detail && root.detail.recovery ? root.detail.recovery.slice(0, 8) : [])[index] || ({})
                             Layout.fillWidth: true
+                            readonly property bool restoring: !!root.detail && root.isPending(root.pairKey("restore", root.selectedName, root.detail.localPath, root.detail.remotePath) + "|" + entry.id)
+                            readonly property bool deleting: root.versionPending(entry.id)
                             implicitHeight: recoveryRow.implicitHeight + 16
+                            opacity: deleting ? 0.5 : 1
                             radius: root.theme.radiusSm
                             color: root.theme.cardBg
                             border.color: root.theme.borderSubtle
@@ -804,15 +997,20 @@ ApplicationWindow {
                                     Label { text: entry.reason + " · " + entry.when; color: root.theme.textMuted; font.pixelSize: 12; elide: Text.ElideRight; width: parent.width }
                                 }
                                 Button {
-                                    text: "Restore"
+                                    text: versionRow.restoring ? "Restoring…" : "Restore"
                                     flat: true
-                                    contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
+                                    enabled: !versionRow.restoring && !versionRow.deleting
+                                    contentItem: Label { text: parent.text; color: parent.enabled ? root.theme.accentStrong : root.theme.textMuted; font.pixelSize: 13 }
                                     background: Rectangle { color: "transparent" }
-                                    onClicked: root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
+                                    onClicked: {
+                                        root.setPending(root.pairKey("restore", root.selectedName, root.detail.localPath, root.detail.remotePath) + "|" + entry.id, { byNotice: true })
+                                        root.controller.restoreVersion(root.selectedName, root.detail.localPath, root.detail.remotePath, entry.id)
+                                    }
                                 }
                                 Button {
-                                    text: "Delete"
+                                    text: versionRow.deleting ? "Deleting…" : "Delete"
                                     flat: true
+                                    enabled: !versionRow.restoring && !versionRow.deleting
                                     contentItem: Label { text: parent.text; color: root.theme.textMuted; font.pixelSize: 13 }
                                     background: Rectangle { color: "transparent" }
                                     onClicked: {
@@ -827,7 +1025,8 @@ ApplicationWindow {
                         }
                     }
                     Button {
-                        text: "Delete all preserved versions"
+                        text: root.allVersionsPending() ? "Deleting all preserved versions…" : "Delete all preserved versions"
+                        enabled: !root.allVersionsPending()
                         flat: true
                         visible: !!root.detail && !!root.detail.recovery && root.detail.recovery.length > 0
                         contentItem: Label { text: parent.text; color: root.theme.textMuted; font.pixelSize: 13 }
@@ -1037,9 +1236,17 @@ ApplicationWindow {
                             color: root.theme.textDim
                             font.pixelSize: 11
                         }
+                        Label {
+                            text: "Saved"
+                            visible: root.exclusionsSavedTimer.running
+                            color: root.theme.statusGreen
+                            font.pixelSize: 12
+                        }
                         PrimaryButton {
-                            text: "Save exclusions"
-                            onClicked: root.controller.saveExclusions(root.detail.localPath, exclusionArea.text)
+                            readonly property bool saving: !!root.detail && root.isPending("exclusions|" + root.detail.localPath)
+                            text: saving ? "Saving…" : "Save exclusions"
+                            busy: saving
+                            onClicked: root.saveExclusions(root.detail.localPath, exclusionArea.text)
                         }
                     }
                 }
@@ -1176,8 +1383,12 @@ ApplicationWindow {
                             }
                             PrimaryButton {
                                 text: "Browse…"
+                                busy: root.isPending("pick")
                                 Layout.alignment: Qt.AlignBottom
-                                onClicked: root.controller.pickLocalFolder(localField.text)
+                                onClicked: {
+                                    root.setPending("pick", {})
+                                    root.controller.pickLocalFolder(localField.text)
+                                }
                             }
                         }
                         RowLayout {
@@ -1233,10 +1444,12 @@ ApplicationWindow {
                     onClicked: root.dismissDialog()
                 }
                 PrimaryButton {
-                    text: root.popupMode === "login" ? "Log in" : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : (root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions" ? "Delete" : "Confirm"))))
+                    busy: root.popupMode === "login" && root.isPending("login")
+                    text: root.popupMode === "login" ? (busy ? "Logging in…" : "Log in") : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : (root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions" ? "Delete" : "Confirm"))))
                     visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space" || root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions"
                     onClicked: {
                         if (root.popupMode === "login") {
+                            root.setPending("login", { byNotice: true })
                             root.controller.submitLogin(JSON.stringify({
                                 kind: root.loginKind,
                                 name: nameField.text,
@@ -1247,28 +1460,50 @@ ApplicationWindow {
                                 totpEnabled: root.totpEnabled
                             }))
                         } else if (root.popupMode === "add") {
+                            root.setPending("add|" + root.selectedName, {
+                                byNotice: true,
+                                label: localField.text + "   →   " + remoteField.text
+                            })
                             root.controller.addDir(root.selectedName, localField.text, remoteField.text)
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-remote") {
-                            root.controller.deleteRemote(root.selectedName)
+                            root.deleteRemote(root.selectedRemote().name)
                             root.selectedName = ""
                             root.detail = null
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-dir") {
-                            root.controller.stopDir(root.selectedName, root.detail.localPath, root.detail.remotePath)
+                            root.stopDir(root.selectedName, root.detail.localPath, root.detail.remotePath)
                             root.detail = null
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-dismiss" || root.popupMode === "confirm-space") {
-                            root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
+                            root.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-all-versions") {
-                            root.controller.deleteAllVersions(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath)
+                            var ref = root.popupRef
+                            var count = (root.findDir(ref.remote, ref.local, ref.remotePath) || {}).recovery
+                            count = count ? count.length : 0
+                            root.setPending(root.pairKey("versions", ref.remote, ref.local, ref.remotePath), {
+                                // Versions a conflict still needs are kept and reported.
+                                byNotice: true,
+                                settled: function () {
+                                    var dir = root.findDir(ref.remote, ref.local, ref.remotePath)
+                                    return !dir || (dir.recovery || []).length !== count
+                                }
+                            })
+                            root.controller.deleteAllVersions(ref.remote, ref.local, ref.remotePath)
                             root.closeDialog()
                         } else if (root.popupMode === "confirm-version") {
-                            root.controller.deleteVersion(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
+                            var version = root.popupRef
+                            root.setPending(root.pairKey("version", version.remote, version.local, version.remotePath) + "|" + version.id, {
+                                settled: function () {
+                                    var dir = root.findDir(version.remote, version.local, version.remotePath)
+                                    return !dir || !root.hasId(dir.recovery, version.id)
+                                }
+                            })
+                            root.controller.deleteVersion(version.remote, version.local, version.remotePath, version.id)
                             root.closeDialog()
                         } else if (root.popupMode === "conflict-info") {
-                            root.controller.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
+                            root.dismissError(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.id)
                             root.closeDialog()
                         }
                     }
@@ -1277,6 +1512,7 @@ ApplicationWindow {
                     text: "Delete everywhere"
                     visible: root.popupMode === "conflict-info" && !!root.popupRef && root.popupRef.canDelete === true
                     onClicked: {
+                        root.setPending(root.pairKey("error", root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath) + "|" + root.popupRef.id, { byNotice: true })
                         root.controller.confirmDeletion(root.popupRef.remote, root.popupRef.local, root.popupRef.remotePath, root.popupRef.conflictId, root.popupRef.token)
                         root.closeDialog()
                     }
