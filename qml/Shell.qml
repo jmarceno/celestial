@@ -15,6 +15,7 @@ ApplicationWindow {
     visible: false
     title: "Celestial"
     color: theme.windowBg
+    flags: Qt.Window | Qt.FramelessWindowHint
 
     property var snapshot: ({ remotes: [] })
     property var progress: ({ pairs: [], total: null })
@@ -467,8 +468,20 @@ ApplicationWindow {
         return root.browsePath
     }
 
+    TitleBar {
+        id: titleBar
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        window: root
+        onCloseRequested: root.controller.hideWindow()
+    }
+
     RowLayout {
-        anchors.fill: parent
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: titleBar.bottom
+        anchors.bottom: parent.bottom
         spacing: 0
 
         Rectangle {
@@ -481,24 +494,6 @@ ApplicationWindow {
                 anchors.fill: parent
                 anchors.margins: 14
                 spacing: 4
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.bottomMargin: 18
-                    spacing: 10
-                    Image {
-                        source: "qrc:/qt/qml/app/celestial/assets/com.unboundmark.Celestial-regular.svg"
-                        sourceSize: Qt.size(80, 80)
-                        Layout.preferredWidth: 40
-                        Layout.preferredHeight: 40
-                        fillMode: Image.PreserveAspectFit
-                    }
-                    Label {
-                        text: "Celestial"
-                        color: root.theme.textPrimary
-                        font.pixelSize: 19
-                        font.bold: true
-                    }
-                }
                 Label {
                     text: "SERVERS"
                     color: root.theme.textDim
@@ -1315,6 +1310,50 @@ ApplicationWindow {
                 }
             }
         }
+    }
+
+    // Resize handles (the window is frameless).
+    MouseArea {
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 12
+        width: 5
+        cursorShape: Qt.SizeHorCursor
+        onPressed: root.startSystemResize(Qt.RightEdge)
+    }
+    MouseArea {
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        width: 5
+        cursorShape: Qt.SizeHorCursor
+        onPressed: root.startSystemResize(Qt.LeftEdge)
+    }
+    MouseArea {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.rightMargin: 12
+        height: 5
+        cursorShape: Qt.SizeVerCursor
+        onPressed: root.startSystemResize(Qt.BottomEdge)
+    }
+    MouseArea {
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        width: 12
+        height: 12
+        cursorShape: Qt.SizeFDiagCursor
+        onPressed: root.startSystemResize(Qt.RightEdge | Qt.BottomEdge)
+    }
+
+    // Thin frame: frameless windows otherwise blend into dark desktops.
+    Rectangle {
+        anchors.fill: parent
+        color: "transparent"
+        border.width: 1
+        border.color: root.theme.borderSubtle
     }
 
     Popup {

@@ -14,6 +14,7 @@ fn main() {
         QmlFile::from("qml/TrayPopup.qml"),
         QmlFile::from("qml/VScrollBar.qml"),
         QmlFile::from("qml/CloseButton.qml"),
+        QmlFile::from("qml/TitleBar.qml"),
     ]))
     .files(["src/ui/controller.rs", "src/ui/branding.rs"])
     .qt_module("Quick")
