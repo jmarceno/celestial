@@ -747,17 +747,32 @@ ApplicationWindow {
                                             Layout.topMargin: 2
                                         }
                                     }
-                                    PrimaryButton {
-                                        text: dirCard.starting ? "Starting…" : "▶  Start"
-                                        busy: dirCard.starting
-                                        visible: dirCard.entry.paused === true && !dirCard.stopping
-                                        onClicked: root.resumeDir(dirCard.entry)
-                                    }
-                                    PrimaryButton {
-                                        text: root.syncNowBusy(dirCard.entry) ? "Syncing…" : "⟳  Sync now"
-                                        busy: root.syncNowBusy(dirCard.entry)
-                                        visible: dirCard.entry.paused !== true && (dirCard.entry.syncIntervalSecs || 0) > 0 && !dirCard.stopping
-                                        onClicked: root.syncNow(dirCard.entry)
+                                    // One slot that is always in the row and as wide as
+                                    // the button it shows: in Qt 6.4 the RowLayout does
+                                    // not always rearrange when a child appears.
+                                    Item {
+                                        readonly property bool showStart: dirCard.entry.paused === true && !dirCard.stopping
+                                        readonly property bool showSyncNow: dirCard.entry.paused !== true && (dirCard.entry.syncIntervalSecs || 0) > 0 && !dirCard.stopping
+                                        objectName: "dirCardActions"
+                                        Layout.preferredWidth: showStart ? cardStart.implicitWidth : (showSyncNow ? cardSyncNow.implicitWidth : 0)
+                                        Layout.preferredHeight: cardStart.implicitHeight
+                                        Layout.alignment: Qt.AlignVCenter
+                                        PrimaryButton {
+                                            id: cardStart
+                                            text: dirCard.starting ? "Starting…" : "▶  Start"
+                                            busy: dirCard.starting
+                                            visible: parent.showStart
+                                            anchors.fill: parent
+                                            onClicked: root.resumeDir(dirCard.entry)
+                                        }
+                                        PrimaryButton {
+                                            id: cardSyncNow
+                                            text: root.syncNowBusy(dirCard.entry) ? "Syncing…" : "⟳  Sync now"
+                                            busy: root.syncNowBusy(dirCard.entry)
+                                            visible: parent.showSyncNow
+                                            anchors.fill: parent
+                                            onClicked: root.syncNow(dirCard.entry)
+                                        }
                                     }
                                     Label {
                                         text: "›"
@@ -796,20 +811,31 @@ ApplicationWindow {
                     y: 22
                     width: detailFlick.width - 44 - (detailFlick.ScrollBar.vertical.visible ? 10 : 0)
                     spacing: 6
-                    RowLayout {
+                    // Anchored, not a RowLayout: in Qt 6.4 the layout does not
+                    // always rearrange when a button appears while the page is
+                    // hidden, which drew Sync now over Back or Stop syncing.
+                    Item {
+                        objectName: "detailHeader"
                         Layout.fillWidth: true
+                        implicitHeight: stopDirButton.implicitHeight
                         Button {
                             text: "‹  Back"
                             flat: true
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
                             contentItem: Label { text: parent.text; color: root.theme.accentStrong; font.pixelSize: 13 }
                             background: Rectangle { color: "transparent" }
                             onClicked: root.detail = null
                         }
-                        Item { Layout.fillWidth: true }
+                        // Start and Sync now never show together: one is for a
+                        // paused folder, the other for a running one.
                         PrimaryButton {
                             text: root.detailStarting ? "Starting…" : "▶  Start syncing"
                             busy: root.detailStarting
                             visible: root.detail !== null && root.detail.paused === true
+                            anchors.right: stopDirButton.left
+                            anchors.rightMargin: 8
+                            anchors.verticalCenter: parent.verticalCenter
                             onClicked: {
                                 // Unsaved exclusion edits apply before the first pass.
                                 if (exclusionArea.text !== (root.detail.exclusions || []).join("\n"))
@@ -821,11 +847,17 @@ ApplicationWindow {
                             text: root.syncNowBusy(root.detail) ? "Syncing…" : "⟳  Sync now"
                             busy: root.syncNowBusy(root.detail)
                             visible: root.detail !== null && root.detail.paused !== true && (root.detail.syncIntervalSecs || 0) > 0
+                            anchors.right: stopDirButton.left
+                            anchors.rightMargin: 8
+                            anchors.verticalCenter: parent.verticalCenter
                             onClicked: root.syncNow(root.detail)
                         }
                         PrimaryButton {
+                            id: stopDirButton
                             text: "Stop syncing"
                             danger: true
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
                             onClicked: {
                                 root.popupMode = "confirm-dir"
                                 root.popupTitle = "Stop syncing this directory?"
