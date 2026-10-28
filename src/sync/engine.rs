@@ -962,6 +962,93 @@ fn note_preserved(db: &DatabaseConnection, shared: &Shared, remote: &str, local:
     }
 }
 
+/// Give a server a new name. Its rclone configuration, its record, and the
+/// records that name it move together; the folders it syncs keep going,
+/// because they refer to the server by number, not by name.
+fn rename_remote(
+    shared: &Shared,
+    db: &DatabaseConnection,
+    model: &mut Model,
+    capabilities: &mut HashMap<String, Capabilities>,
+    from: &str,
+    to: &str,
+) {
+    if let Err(err) = login::validate::validate_rename(from, to) {
+        shared.dialog("error", tr::tr!("Could not rename the server"), err);
+        return;
+    }
+    let known = match util::await_future(RemotesEntity::find().all(db)) {
+        Ok(remotes) => remotes,
+        Err(err) => {
+            database_unavailable(shared, model, &err);
+            return;
+        }
+    };
+    let Some(remote) = known.iter().find(|remote| remote.name == from) else {
+        shared.dialog(
+            "error",
+            tr::tr!("Could not rename the server"),
+            tr::tr!("[{from}] is not one of your servers any more."),
+        );
+        return;
+    };
+    if known.iter().any(|other| other.name == to) {
+        shared.dialog(
+            "error",
+            tr::tr!("Could not rename the server"),
+            tr::tr!("Name already exists."),
+        );
+        return;
+    }
+    let remote_id = remote.id;
+    // The configuration moves first: a name rclone refuses costs nothing,
+    // while a database left half-renamed would leave the server unusable.
+    if let Err(err) = rclone::sync::rename_config(from, to) {
+        shared.dialog("error", tr::tr!("Could not rename the server"), err.error);
+        return;
+    }
+    let moved = store::in_transaction(db, |tx| {
+        store::exec(
+            tx,
+            "UPDATE remotes SET name = ? WHERE id = ?",
+            vec![to.into(), remote_id.into()],
+        )?;
+        // Records that name the server, not the row it points at.
+        for table in ["remote_capabilities", "recovery_items"] {
+            store::exec(
+                tx,
+                &format!("UPDATE {table} SET remote_name = ? WHERE remote_name = ?"),
+                vec![to.into(), from.into()],
+            )?;
+        }
+        Ok(())
+    });
+    match moved {
+        Ok(()) => {
+            model.rename_remote(from, to);
+            if let Some(caps) = capabilities.remove(from) {
+                capabilities.insert(to.to_owned(), caps);
+            }
+            shared.publish(model);
+            shared.dialog("rename-ok", "", to.to_owned());
+        }
+        Err(err) => {
+            // The records kept the old name, so the configuration must too.
+            if let Err(restore) = rclone::sync::rename_config(to, from) {
+                tracing::error!(
+                    "could not put the name [{from}] back on a server that failed to rename: {}",
+                    restore.error
+                );
+            }
+            shared.dialog(
+                "error",
+                tr::tr!("Could not rename the server"),
+                err.to_string(),
+            );
+        }
+    }
+}
+
 async fn forget_pair_state(tx: &DatabaseTransaction, sync_dir_id: i32) -> Result<(), DbErr> {
     // Recovery records and incomplete operations are kept: they are keyed by
     // the pair's identity so preserved versions are never silently dropped.
@@ -1042,6 +1129,9 @@ fn apply_between_passes(
             Command::DeleteRemote(name) => {
                 model.remote_deletions.push(name);
                 process_deletions(model, db, shared);
+            }
+            Command::RenameRemote { from, to } => {
+                rename_remote(shared, db, model, capabilities, &from, &to);
             }
             Command::StopDir {
                 remote,

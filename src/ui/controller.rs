@@ -97,6 +97,11 @@ mod qobject {
         #[cxx_name = "deleteRemote"]
         fn delete_remote(self: Pin<&mut Self>, name: &QString);
 
+        /// Rename a server, keeping its folders and their settings.
+        #[qinvokable]
+        #[cxx_name = "renameRemote"]
+        fn rename_remote(self: Pin<&mut Self>, from: &QString, to: &QString);
+
         #[qinvokable]
         #[cxx_name = "stopDir"]
         fn stop_dir(self: Pin<&mut Self>, remote: &QString, local: &QString, remote_path: &QString);
@@ -451,6 +456,13 @@ impl qobject::AppController {
 
     fn delete_remote(self: Pin<&mut Self>, name: &QString) {
         self.send(Command::DeleteRemote(name.to_string()));
+    }
+
+    fn rename_remote(self: Pin<&mut Self>, from: &QString, to: &QString) {
+        self.send(Command::RenameRemote {
+            from: from.to_string(),
+            to: to.to_string(),
+        });
     }
 
     fn stop_dir(self: Pin<&mut Self>, remote: &QString, local: &QString, remote_path: &QString) {

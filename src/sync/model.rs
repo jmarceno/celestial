@@ -139,6 +139,19 @@ impl Model {
         self.remotes.shift_remove(name);
     }
 
+    /// Rename a server, keeping its folders and its place in the list.
+    /// Nothing is done when the name is unknown or already taken.
+    pub fn rename_remote(&mut self, from: &str, to: &str) {
+        if from == to || !self.remotes.contains_key(from) || self.remotes.contains_key(to) {
+            return;
+        }
+        let listed = std::mem::take(&mut self.remotes);
+        for (name, dirs) in listed {
+            let name = if name == from { to.to_owned() } else { name };
+            self.remotes.insert(name, dirs);
+        }
+    }
+
     pub fn remove_dir(&mut self, remote: &str, local: &str, remote_path: &str) {
         if let Some(dirs) = self.remotes.get_mut(remote) {
             dirs.shift_remove(&(local.to_owned(), remote_path.to_owned()));
@@ -735,6 +748,32 @@ mod tests {
         assert!(!bus.tray_changed("a", "done"));
         assert!(bus.tray_changed("a", "syncing"));
         assert_eq!(bus.tray_updates.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn renaming_a_server_keeps_its_place_and_its_folders() {
+        let mut model = Model::new();
+        model.ensure_dir("beta", "/one", "a");
+        model.ensure_dir("alpha", "/two", "b");
+        model.set_status("beta", "/one", "a", tr::tr!("Files are synced."));
+        model.rename_remote("beta", "gamma");
+        let names: Vec<&str> = model.remotes.keys().map(String::as_str).collect();
+        // The renamed server keeps the slot it had in the list.
+        assert_eq!(names, vec!["gamma", "alpha"]);
+        assert_eq!(
+            model.dir("gamma", "/one", "a").unwrap().status,
+            tr::tr!("Files are synced.")
+        );
+        assert!(model.dir("beta", "/one", "a").is_none());
+        // A name that is not there changes nothing.
+        model.rename_remote("nope", "other");
+        assert_eq!(model.remotes.len(), 2);
+        // Neither does a name the list already uses.
+        model.rename_remote("alpha", "gamma");
+        assert_eq!(
+            model.remotes.keys().collect::<Vec<&String>>(),
+            vec!["gamma", "alpha"]
+        );
     }
 
     #[test]

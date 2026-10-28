@@ -10,6 +10,12 @@ ColumnLayout {
     property alias text: field.text
     property bool password: false
     property string placeholder: ""
+    /// Enter was pressed in the field, so a dialog can confirm.
+    signal accepted()
+    /// Select the whole value, so the person can type over it.
+    function selectValue() {
+        field.selectAll()
+    }
     spacing: 6
     implicitHeight: labelItem.implicitHeight + field.implicitHeight + 6
 
@@ -25,6 +31,7 @@ ColumnLayout {
         id: field
         Layout.fillWidth: true
         placeholderText: root.placeholder
+        onAccepted: root.accepted()
         echoMode: root.password ? TextInput.Password : TextInput.Normal
         color: root.theme.textPrimary
         placeholderTextColor: root.theme.textDim

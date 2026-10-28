@@ -213,6 +213,33 @@ ApplicationWindow {
         })
         root.controller.deleteRemote(name)
     }
+    // Renaming only moves the name: the folders, their settings, and the
+    // remote side are untouched, so nothing is re-checked or re-transferred.
+    function renameRemote(from, to) {
+        root.setPending("rename|" + from, {
+            byNotice: true,
+            settled: function () { return !root.findRemote(from) }
+        })
+        root.controller.renameRemote(from, to)
+    }
+    // An empty name or one the server already has leaves everything alone.
+    function confirmRename() {
+        var entry = root.selectedRemote()
+        if (!entry) return
+        var name = (renameField.text || "").trim()
+        if (name.length === 0 || name === entry.name) return
+        root.renameRemote(entry.name, name)
+        root.closeDialog()
+    }
+    function openRename() {
+        var entry = root.selectedRemote()
+        if (!entry) return
+        renameField.text = entry.name
+        root.popupMode = "rename"
+        root.popupTitle = "Rename server"
+        root.popupBody = "This is the name the server is listed under here. Its folders keep syncing, and nothing on the server changes."
+        dialog.open()
+    }
     // Dismissing, retrying, or acknowledging one sync issue.
     function dismissError(remote, local, remotePath, id) {
         root.setPending(root.pairKey("error", remote, local, remotePath) + "|" + id, {
@@ -398,6 +425,11 @@ ApplicationWindow {
                 root.closeDialog()
                 return
             }
+            if (kind === "rename-ok") {
+                // Keep the window on the server that just changed its name.
+                root.selectedName = body
+                return
+            }
             if (kind === "auth") {
                 root.popupMode = "auth"
                 root.popupTitle = title
@@ -536,10 +568,12 @@ ApplicationWindow {
                         // Counted, not a list: an update keeps the items instead of recreating them
                         readonly property var entry: root.remotes()[index] || ({})
                         readonly property bool removing: root.isPending("remove|" + entry.name)
+                        readonly property bool renaming: root.isPending("rename|" + entry.name)
                         theme: root.theme
-                        text: removing ? entry.name + "  · removing…" : entry.name
+                        text: removing ? entry.name + "  · removing…"
+                            : (renaming ? entry.name + "  · renaming…" : entry.name)
                         enabled: !removing
-                        opacity: removing ? 0.5 : 1
+                        opacity: removing || renaming ? 0.5 : 1
                         selected: entry.name === root.selectedName
                         width: serverList.width - (serverList.ScrollBar.vertical.visible ? 10 : 0)
                         onClicked: {
@@ -597,6 +631,11 @@ ApplicationWindow {
                             root.popupMode = "add"
                             dialog.open()
                         }
+                    }
+                    PrimaryButton {
+                        text: "Rename"
+                        visible: root.selectedRemote() !== null
+                        onClicked: root.openRename()
                     }
                     PrimaryButton {
                         text: "Remove server"
@@ -1366,6 +1405,13 @@ ApplicationWindow {
         height: Math.min(implicitHeight, root.height - 40)
         // Escape goes through dismissDialog() so it does what Close does.
         closePolicy: Popup.NoAutoClose
+        // A form is typed in: the first field takes the keyboard.
+        onOpened: {
+            if (root.popupMode === "rename") {
+                renameField.forceActiveFocus()
+                renameField.selectValue()
+            }
+        }
         background: Rectangle {
             color: root.theme.cardBg
             radius: root.theme.radius
@@ -1529,6 +1575,19 @@ ApplicationWindow {
                             Layout.fillWidth: true
                         }
                     }
+
+                    ColumnLayout {
+                        visible: root.popupMode === "rename"
+                        Layout.fillWidth: true
+                        spacing: 10
+                        Field {
+                            id: renameField
+                            label: "Server name"
+                            placeholder: "My Nextcloud"
+                            Layout.fillWidth: true
+                            onAccepted: root.confirmRename()
+                        }
+                    }
                 }
             }
 
@@ -1547,8 +1606,8 @@ ApplicationWindow {
                 }
                 PrimaryButton {
                     busy: root.popupMode === "login" && root.isPending("login")
-                    text: root.popupMode === "login" ? (busy ? "Logging in…" : "Log in") : (root.popupMode === "add" ? "Add" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : (root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions" ? "Delete" : "Confirm"))))
-                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space" || root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions"
+                    text: root.popupMode === "login" ? (busy ? "Logging in…" : "Log in") : (root.popupMode === "add" ? "Add" : (root.popupMode === "rename" ? "Rename" : (root.popupMode === "conflict-info" ? "Acknowledge" : (root.popupMode === "confirm-space" ? "Sync anyway" : (root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions" ? "Delete" : "Confirm")))))
+                    visible: root.popupMode === "login" || root.popupMode === "add" || root.popupMode === "rename" || root.popupMode === "confirm-remote" || root.popupMode === "confirm-dir" || root.popupMode === "confirm-dismiss" || root.popupMode === "conflict-info" || root.popupMode === "confirm-space" || root.popupMode === "confirm-version" || root.popupMode === "confirm-all-versions"
                     onClicked: {
                         if (root.popupMode === "login") {
                             root.setPending("login", { byNotice: true })
@@ -1568,6 +1627,8 @@ ApplicationWindow {
                             })
                             root.controller.addDir(root.selectedName, localField.text, remoteField.text)
                             root.closeDialog()
+                        } else if (root.popupMode === "rename") {
+                            root.confirmRename()
                         } else if (root.popupMode === "confirm-remote") {
                             root.deleteRemote(root.selectedRemote().name)
                             root.selectedName = ""

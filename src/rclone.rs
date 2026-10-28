@@ -275,6 +275,65 @@ pub mod sync {
         run("config/delete", json!({ "name": remote_name })).map(|_| ())
     }
 
+    /// Every setting of one remote as the config file holds it: a flat object
+    /// of the provider's keys, with the server type under `type`, and with
+    /// secrets in their stored (obscured) form. An unknown remote is empty.
+    pub fn get_config(remote_name: &str) -> Result<Value, RcloneError> {
+        let reply = run("config/get", json!({ "name": remote_name }))?;
+        serde_json::from_str(&reply).map_err(|err| RcloneError::new(err.to_string()))
+    }
+
+    /// Write one remote's configuration under `name`. `parameters` are taken
+    /// as they are given, so values already obscured stay as they are.
+    fn create_config(name: &str, kind: &str, parameters: &Value) -> Result<(), RcloneError> {
+        run(
+            "config/create",
+            json!({
+                "name": name,
+                "type": kind,
+                "parameters": parameters,
+                "opt": { "noObscure": true },
+            }),
+        )
+        .map(|_| ())
+    }
+
+    /// Give a remote's configuration a new name. Every setting is copied as it
+    /// is stored, so a login token, a client key, and an obscured password all
+    /// survive the change. The new section is written before the old one is
+    /// removed, so a name rclone refuses leaves the remote exactly as it was.
+    pub fn rename_config(from: &str, to: &str) -> Result<(), RcloneError> {
+        let section = get_config(from)?;
+        let kind = section
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| !kind.is_empty())
+            .ok_or_else(|| RcloneError::new(format!("[{from}] is not configured")))?
+            .to_owned();
+        let settings = match &section {
+            Value::Object(fields) => {
+                let mut fields = fields.clone();
+                fields.remove("type");
+                Value::Object(fields)
+            }
+            _ => return Err(RcloneError::new(format!("[{from}] is not configured"))),
+        };
+        create_config(to, &kind, &settings)?;
+        let listed = super::get_remotes().map_err(RcloneError::new)?;
+        if !listed.iter().any(|name| name == to) {
+            let _ = delete_config(to);
+            return Err(RcloneError::new(format!("[{to}] was not accepted")));
+        }
+        if let Err(err) = delete_config(from) {
+            // Both names are configured now, which is safe: the app uses the
+            // new one; the old section is left unused in the config file.
+            return Err(RcloneError::new(format!(
+                "{err} The settings are kept under [{to}] as well as [{from}]."
+            )));
+        }
+        Ok(())
+    }
+
     fn list_opt(recursive: bool, filter: &RcloneListFilter, options: &ListOptions) -> Value {
         let mut opt = json!({ "recurse": recursive });
         if matches!(filter, RcloneListFilter::Dirs) {

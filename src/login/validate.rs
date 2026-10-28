@@ -15,11 +15,8 @@ pub struct LoginRequest {
     pub totp_enabled: bool,
 }
 
-pub fn validate_name(name: &str) -> Result<(), String> {
-    let existing = rclone::get_remotes()?;
-    if existing.iter().any(|n| n == name) {
-        return Err(tr::tr!("Name already exists."));
-    }
+/// The shape rclone accepts for a remote name.
+fn name_shape(name: &str) -> Result<(), String> {
     let ok = Regex::new(r"^[0-9a-zA-Z_.][0-9a-zA-Z_. -]*[0-9a-zA-Z_.-]$")
         .unwrap()
         .is_match(name);
@@ -29,6 +26,27 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub fn validate_name(name: &str) -> Result<(), String> {
+    let existing = rclone::get_remotes()?;
+    if existing.iter().any(|n| n == name) {
+        return Err(tr::tr!("Name already exists."));
+    }
+    name_shape(name)
+}
+
+/// The new name of an existing server: the same shape as a new one, and not
+/// the name of any server, including the one being renamed.
+pub fn validate_rename(from: &str, to: &str) -> Result<(), String> {
+    if to == from {
+        return Err(tr::tr!("The server already has that name."));
+    }
+    let existing = rclone::get_remotes()?;
+    if existing.iter().any(|n| n == to) {
+        return Err(tr::tr!("Name already exists."));
+    }
+    name_shape(to)
 }
 
 pub fn validate_url(text: &str, disallow_nextcloud_suffix: bool) -> Result<(), String> {

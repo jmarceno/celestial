@@ -28,6 +28,12 @@ use std::sync::atomic::AtomicBool;
 pub enum Command {
     SubmitLogin(LoginRequest),
     DeleteRemote(String),
+    /// Give a server a new name: its rclone configuration, its record, and
+    /// every record naming it. The folders it syncs keep working.
+    RenameRemote {
+        from: String,
+        to: String,
+    },
     StopDir {
         remote: String,
         local: String,

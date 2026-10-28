@@ -3003,3 +3003,68 @@ fn the_interval_schedule_waits_and_can_be_forgotten() {
     schedule.interval_forget(7);
     assert!(schedule.interval_due(7));
 }
+
+#[test]
+fn renaming_a_remote_keeps_every_setting_and_the_same_folder() {
+    let f = Fixture::new();
+    let before = rclone::sync::get_config(&f.remote.name).unwrap();
+    assert_eq!(before["type"], json!("alias"));
+    let renamed = format!("{} moved", f.remote.name);
+    rclone::sync::rename_config(&f.remote.name, &renamed).unwrap();
+    let names = rclone::get_remotes().unwrap();
+    assert!(names.iter().any(|name| name == &renamed));
+    assert!(!names.iter().any(|name| name == &f.remote.name));
+    // The settings came along unchanged, so the same folder is reachable:
+    // a login token, a client key, and an obscured password all live here.
+    assert_eq!(rclone::sync::get_config(&renamed).unwrap(), before);
+    let item = rclone::sync::stat(&renamed, "sandbox").unwrap().unwrap();
+    assert!(item.is_dir);
+}
+
+#[test]
+fn a_refused_new_name_leaves_the_remote_exactly_as_it_was() {
+    let f = Fixture::new();
+    // rclone rejects a name with a colon, and the copy is asked for first,
+    // so the section that works is never removed.
+    assert!(rclone::sync::rename_config(&f.remote.name, "bad:name").is_err());
+    let names = rclone::get_remotes().unwrap();
+    assert!(names.iter().any(|name| name == &f.remote.name));
+    assert!(
+        rclone::sync::stat(&f.remote.name, "sandbox")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        rclone::get_remotes()
+            .unwrap()
+            .iter()
+            .all(|n| n != "bad:name")
+    );
+}
+
+#[test]
+fn a_new_server_name_is_checked_before_anything_moves() {
+    let f = Fixture::new();
+    assert!(login::validate::validate_rename(&f.remote.name, "A fresh name").is_ok());
+    // The name it already has, and the name of another server, are both out.
+    assert!(login::validate::validate_rename(&f.remote.name, &f.remote.name).is_err());
+    assert!(login::validate::validate_rename(&f.remote.name, "work").is_ok());
+    for taken in ["", "-leading", "trailing ", "bad:name", ":"] {
+        assert!(
+            login::validate::validate_rename(&f.remote.name, taken).is_err(),
+            "{taken} should not be accepted"
+        );
+    }
+}
+
+#[test]
+fn renaming_a_remote_that_has_no_configuration_is_an_error() {
+    let f = Fixture::new();
+    assert!(rclone::sync::rename_config("no-such-server", "whatever").is_err());
+    assert!(
+        rclone::get_remotes()
+            .unwrap()
+            .iter()
+            .any(|n| n == &f.remote.name)
+    );
+}
